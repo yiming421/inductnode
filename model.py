@@ -1,17 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-import numpy as np
 from torch_geometric.nn import GCNConv, GINConv
-from torch_geometric.nn import MessagePassing
-from torch_geometric.nn.conv.gcn_conv import gcn_norm
-from torch_sparse import matmul, SparseTensor
 from torch_sparse.matmul import spmm_add
-from torch import Tensor
-import math
-from torch_geometric.utils import negative_sampling
-from torch_scatter import scatter_add, scatter_softmax
+from torch_scatter import scatter_softmax
 from utils import process_node_features
 
 class PureGCNConv(nn.Module):
@@ -86,13 +78,13 @@ class MLP(nn.Module):
         for _ in range(num_layers - 2):
             self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
             if norm:
-                self.lins.append(nn.LayerNorm(hidden_channels), elementwise_affine=norm_affine)
+                self.lins.append(nn.LayerNorm(hidden_channels, elementwise_affine=norm_affine))
             self.lins.append(nn.ReLU())
             if dropout > 0:
                 self.lins.append(nn.Dropout(dropout))
         self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
         if tailact:
-            self.lins.append(nn.LayerNorm(out_channels), elementwise_affine=norm_affine)
+            self.lins.append(nn.LayerNorm(out_channels, elementwise_affine=norm_affine))
             self.lins.append(nn.ReLU())
             self.lins.append(nn.Dropout(dropout))
 
@@ -112,11 +104,11 @@ class GCN(nn.Module):
             for _ in range(prop_step):
                 if use_gin:
                     self.convs.append(GINConv(MLP(h_feats, h_feats, h_feats, 2, dropout, norm, 
-                                                  norm_affine)))
+                                                  False, norm_affine)))
                 self.convs.append(GCNConv(h_feats, h_feats))
         else:
             if use_gin:
-                self.conv = GINConv(MLP(h_feats, h_feats, h_feats, 2, dropout, norm, norm_affine))
+                self.conv = GINConv(MLP(h_feats, h_feats, h_feats, 2, dropout, norm, False, norm_affine))
             else:
                 self.conv = GCNConv(h_feats, h_feats)
         self.norm = norm
@@ -434,8 +426,10 @@ class PFNPredictorNodeCls(nn.Module):
             logits = torch.matmul(target_label_emb, class_emb.t())
         elif self.sim == 'mlp':
             target_label_emb = self.sim_mlp(target_label_emb)
-            class_emb = self.mlp(class_emb)
+            class_emb = self.sim_mlp(class_emb)
             logits = torch.matmul(target_label_emb, class_emb.t())
+        else:
+            raise ValueError("Invalid similarity type. Choose 'dot', 'cos', or 'mlp'.")
         return logits
     
 class AttentionPool(nn.Module):

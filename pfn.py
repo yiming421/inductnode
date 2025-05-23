@@ -52,7 +52,8 @@ def parse():
     parser.add_argument('--mlp_norm_affine', type=str2bool, default=False)
     parser.add_argument('--relu', type=str2bool, default=False)
     parser.add_argument('--res', type=str2bool, default=False)
-    parser.add_argument('--optimizer', 
+    parser.add_argument('--optimizer', type=str, default='adam')
+    parser.add_argument('--clip_grad', type=float, default=1.0)
 
     parser.add_argument('--transformer_layers', type=int, default=1)
     parser.add_argument('--nhead', type=int, default=4)
@@ -64,7 +65,7 @@ def parse():
     parser.add_argument('--att_pool', type=str2bool, default=False)
     parser.add_argument('--mlp_pool', type=str2bool, default=False)
     parser.add_argument('--orthogonal_push', type=float, default=0.0)
-    parser.add_argument('--normalize_class_h', type=str2bool, default=False)
+    parser.add_argument('--normalize_class_h', type=str2bool, default=True)
     parser.add_argument('--sign_normalize', type=str2bool, default=False)
 
     parser.add_argument('--use_gin', type=str2bool, default=False)
@@ -73,7 +74,7 @@ def parse():
     return parser.parse_args()
 
 def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None, 
-          scheduler=None, orthogonal_push=0.0, normalize_class_h=False):
+          orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0):
     st = time.time()
 
     model.train()
@@ -108,15 +109,13 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
         optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        nn.utils.clip_grad_norm_(pred.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+        nn.utils.clip_grad_norm_(pred.parameters(), clip_grad)
         if att is not None:
-            nn.utils.clip_grad_norm_(att.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(att.parameters(), clip_grad)
         if mlp is not None:
-            nn.utils.clip_grad_norm_(mlp.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad)
         optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
         total_loss += loss.item()
 
     en = time.time()
@@ -125,12 +124,12 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     return total_loss / len(dataloader)
 
 def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, degree=False, att=None,
-              mlp=None, scheduler=None, orthogonal_push=0.0, normalize_class_h=False):
+              mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0):
     tot_loss = 0
     for data, split_idx in zip(data_list, split_idx_list):
         train_idx = split_idx['train']
-        loss = train(model, data, train_idx, optimizer, pred, batch_size, degree, att, mlp, scheduler,
-                     orthogonal_push, normalize_class_h)
+        loss = train(model, data, train_idx, optimizer, pred, batch_size, degree, att, mlp,
+                     orthogonal_push, normalize_class_h, clip_grad)
         print(f"Dataset {data.name} Loss: {loss}", flush=True)
         tot_loss += loss
     return tot_loss / (len(data_list))
@@ -238,14 +237,14 @@ def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, deg
     return train_metric_list, valid_metric_list, test_metric_list
 
 def select_k_shot_context(data, k, index):
-    # debug:
     classes = data.y.unique()
     context_samples = []
     mask = torch.zeros(data.y.size(0), dtype=torch.bool, device=data.y.device)
-    mask[index] = True
     for c in classes:
-        class_mask = (data.y == c) & mask
-
+        print(f"Class {c}", flush=True)
+        #class_mask = (data.y == c) & mask
+        class_mask = (data.y == c) # debug
+        print(class_mask.sum(), flush=True)
         class_indices = torch.nonzero(class_mask, as_tuple=False).squeeze()
         selected_indices = torch.randperm(class_indices.size(0))[:k]
         selected_indices = class_indices[selected_indices]
@@ -315,13 +314,12 @@ def run(args):
     att, mlp = None, None
 
     if args.att_pool:
-        att = AttentionPool(args.hidden, args.hidden // 4, args.nhead, args.dp)
+        att = AttentionPool(args.hidden, args.hidden // args.nhead, args.nhead, args.dp)
         att = att.to(device)
     if args.mlp_pool:
         mlp = MLP(args.hidden, args.hidden, args.hidden, 2, args.dp, args.norm, False, args.mlp_norm_affine)
         mlp = mlp.to(device)
 
-        
     if args.model == 'PureGCN':
         model = PureGCN(args.num_layers)
     elif args.model == 'PureGCN_v1':
@@ -350,11 +348,18 @@ def run(args):
     if args.mlp_pool:
         parameters += list(mlp.parameters())
 
-    optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == 'adam':
+        optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        raise NotImplementedError
+
     if args.schedule == 'cosine':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     elif args.schedule == 'step':
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+        step_size = args.epochs // 5
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
     elif args.schedule == 'warmup':
         warmup_steps = args.epochs // 10
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=args.epochs)
@@ -374,7 +379,9 @@ def run(args):
         st = time.time()
         print(f"Epoch {epoch}", flush=True)
         loss = train_all(model, data_list, split_idx_list, optimizer, predictor, args.batch_size,
-                         args.degree, att, mlp, scheduler, args.orthogonal_push, args.normalize_class_h)
+                         args.degree, att, mlp, args.orthogonal_push, args.normalize_class_h)
+        if scheduler is not None:
+            scheduler.step()
         train_metric, valid_metric, test_metric = \
         test_all(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
                  att, mlp, args.normalize_class_h)
