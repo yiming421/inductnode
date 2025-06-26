@@ -1,5 +1,5 @@
-from model import PureGCN_v1, PureGCN, PFNPredictorNodeCls, GCN, AttentionPool, MLP
-from data import load_all_data, load_all_data_train
+from model import PureGCN_v1, PureGCN, PFNPredictorBinaryCls, GCN
+from data import load_all_data
 import argparse
 import torch
 from torch_geometric.data import DataLoader
@@ -9,7 +9,6 @@ import time
 import wandb
 import copy
 import numpy as np
-from utils import process_node_features
 from transformers import get_cosine_schedule_with_warmup
 
 def str2bool(v):
@@ -30,53 +29,45 @@ def acc(y_true, y_pred):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog')
-    parser.add_argument('--test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS')
+    parser.add_argument('--train_dataset', type=str, default='ogbn-arxiv')
+    parser.add_argument('--test_dataset', type=str, default='Cora')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--batch_size', type=int, default=4096)
     parser.add_argument('--test_batch_size', type=int, default=131072)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=0)
-    parser.add_argument('--schedule', type=str, default='none')
-    parser.add_argument("--hidden", default=32, type=int)
-    parser.add_argument("--dp", default=0.5, type=float)
+    parser.add_argument('--schedule', type=str, default='warmup')
+    parser.add_argument("--hidden", default=127, type=int)
+    parser.add_argument("--dp", default=0.2, type=float)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--norm', type=str2bool, default=True)
-    parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--runs', type=int, default=3)
+    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--runs', type=int, default=5)
     parser.add_argument('--model', type=str, default='PureGCN_v1')
     parser.add_argument('--predictor', type=str, default='PFN')
     parser.add_argument('--sweep', type=str2bool, default=False)
     parser.add_argument('--mlp_layers', type=int, default=2)
     parser.add_argument('--gnn_norm_affine', type=str2bool, default=False)
-    parser.add_argument('--mlp_norm_affine', type=str2bool, default=False)
+    parser.add_argument('--mlp_norm_affine', type=str2bool, default=True)
     parser.add_argument('--relu', type=str2bool, default=False)
     parser.add_argument('--res', type=str2bool, default=False)
     parser.add_argument('--optimizer', type=str, default='adam')
     parser.add_argument('--clip_grad', type=float, default=1.0)
+    parser.add_argument('--sign_normalize', type=str2bool, default=False)
+    parser.add_argument('--scale', type=str2bool, default=False)
+    parser.add_argument('--output_target', type=str2bool, default=True)
+    parser.add_argument('--loss_type', type=str, default='bce')
 
     parser.add_argument('--transformer_layers', type=int, default=1)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--context_num', type=int, default=5)
-    parser.add_argument('--seperate', type=str2bool, default=False)
-    parser.add_argument('--degree', type=str2bool, default=False)
-    parser.add_argument('--padding', type=str, default='zero')
-    parser.add_argument('--sim', type=str, default='dot')
-    parser.add_argument('--att_pool', type=str2bool, default=False)
-    parser.add_argument('--mlp_pool', type=str2bool, default=False)
-    parser.add_argument('--orthogonal_push', type=float, default=0.0)
-    parser.add_argument('--normalize_class_h', type=str2bool, default=True)
-    parser.add_argument('--sign_normalize', type=str2bool, default=False)
-    parser.add_argument('--use_full_pca', type=str2bool, default=True)
-    parser.add_argument('--normalize_data', type=str2bool, default=False)   
-
+    parser.add_argument('--padding', type=str, default='zeros')
     parser.add_argument('--use_gin', type=str2bool, default=False)
     parser.add_argument('--multilayer', type=str2bool, default=False)
 
     return parser.parse_args()
 
-def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None, 
-          orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0):
+def train(model, data, train_idx, optimizer, pred, batch_size, clip_grad=1.0, loss_type='bce'):
     st = time.time()
 
     model.train()
@@ -91,118 +82,135 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
         context_h = h[data.context_sample]
         context_y = data.y[data.context_sample]
-        
-        class_h = process_node_features(context_h, data, degree_normalize=degree,attention_pool_module=att, 
-                                        mlp_module=mlp, normalize=normalize_class_h)
 
         target_h = h[train_perm_idx]
-        score = pred(data, context_h, target_h, context_y, class_h)
-        score = F.log_softmax(score, dim=1)
-        label = data.y[train_perm_idx].squeeze()
+        target_y = data.y[train_perm_idx]
+        if loss_type == 'bce':
+            batch_loss = 0
 
-        class_h = data.final_class_h
-        class_h = F.normalize(class_h, p=2, dim=1)
-        class_matrix = class_h @ class_h.T
-        class_matrix = class_matrix - torch.eye(class_matrix.size(0), device=class_matrix.device,
-                                                dtype=class_matrix.dtype)
-        orthogonal_loss = torch.sum(class_matrix**2)
+            for c in range(context_y.max().item() + 1):
+                context_pos = (context_y == c)
+                context_neg = (context_y != c)
+                score = pred(context_h[context_pos], context_h[context_neg], target_h)
+                target_y_binary = (target_y == c).float()
 
-        loss = F.nll_loss(score, label) + orthogonal_push * orthogonal_loss
+                num_pos = target_y_binary.sum().item()
+                num_neg = target_y_binary.size(0) - num_pos
+                pos_weight = num_neg / (num_pos + 1e-8)
 
+                loss = F.binary_cross_entropy_with_logits(score, target_y_binary, 
+                                                        pos_weight=torch.tensor(pos_weight, 
+                                                                                device=score.device))
+                batch_loss += loss
+            batch_loss /= (context_y.max().item() + 1)
+        elif loss_type == 'nll':
+            batch_loss = 0
+            scores = []
+            for c in range(context_y.max().item() + 1):
+                context_pos = (context_y == c)
+                context_neg = (context_y != c)
+                score = pred(context_h[context_pos], context_h[context_neg], target_h)
+                scores.append(score)
+            scores = torch.stack(scores, dim=1)
+            scores = scores.log_softmax(dim=1)
+            target_y = target_y.view(-1, 1)
+            batch_loss = F.nll_loss(scores)
+        total_loss += batch_loss.item()
         optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-        nn.utils.clip_grad_norm_(pred.parameters(), clip_grad)
-        if att is not None:
-            nn.utils.clip_grad_norm_(att.parameters(), clip_grad)
-        if mlp is not None:
-            nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad)
+        batch_loss.backward()
+        if clip_grad > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            nn.utils.clip_grad_norm_(pred.parameters(), clip_grad)
         optimizer.step()
-        total_loss += loss.item()
 
-    en = time.time()
-    print(f"Train time: {en-st}", flush=True)
-
+    print(f"Train time: {time.time()-st:.4f}s", flush=True)
     return total_loss / len(dataloader)
 
-def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, degree=False, att=None,
-              mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0):
+def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, clip_grad=1.0):
     tot_loss = 0
     for data, split_idx in zip(data_list, split_idx_list):
         train_idx = split_idx['train']
-        loss = train(model, data, train_idx, optimizer, pred, batch_size, degree, att, mlp,
-                     orthogonal_push, normalize_class_h, clip_grad)
+        loss = train(model, data, train_idx, optimizer, pred, batch_size, clip_grad)
         print(f"Dataset {data.name} Loss: {loss}", flush=True)
         tot_loss += loss
     return tot_loss / (len(data_list))
 
 @torch.no_grad()
-def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False, 
-         att=None, mlp=None, normalize_class_h=False):
+def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, num_classes=None):
     st = time.time()
     model.eval()
     predictor.eval()
 
+    if num_classes is None:
+        num_classes = data.y.max().item() + 1
+        
     h = model(data.x, data.adj_t)
 
     context_h = h[data.context_sample]
     context_y = data.y[data.context_sample]
 
-    class_h = process_node_features(context_h, data, degree_normalize=degree, attention_pool_module=att, 
-                                    mlp_module=mlp, normalize=normalize_class_h)
-
-    # class_h = F.normalize(class_h, p=2, dim=1)
-
-    # predict
-    # break into mini-batches for large edge sets
     train_loader = DataLoader(range(train_idx.size(0)), batch_size, shuffle=False)
     valid_loader = DataLoader(range(valid_idx.size(0)), batch_size, shuffle=False)
     test_loader = DataLoader(range(test_idx.size(0)), batch_size, shuffle=False)
 
-    valid_score = []
-    for idx in valid_loader:
-        target_h = h[valid_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
-        out = out.argmax(dim=1).flatten()
-        valid_score.append(out)
-    valid_score = torch.cat(valid_score, dim=0)
-    # print(valid_score[:100], flush=True)
-    # print(data.y[valid_idx][:100], flush=True)
+    # --- Predict for Validation Set ---
+    all_valid_logits = []
+    for c in range(num_classes):
+        context_pos_mask = (context_y == c)
+        context_neg_mask = (context_y != c)
+        
+        class_c_logits = []
+        for idx in valid_loader:
+            target_h = h[valid_idx[idx]]
+            # Use the predictor signature consistent with the train loop
+            score = predictor(context_h[context_pos_mask], context_h[context_neg_mask], target_h)
+            class_c_logits.append(score.squeeze(-1))
+        all_valid_logits.append(torch.cat(class_c_logits, dim=0))
+    # Combine logits from all classes and get the final prediction via argmax
+    valid_score = torch.stack(all_valid_logits, dim=1).argmax(dim=1)
 
-    train_score = []
-    for idx in train_loader:
-        target_h = h[train_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
-        out = out.argmax(dim=1).flatten()
-        train_score.append(out)
-    train_score = torch.cat(train_score, dim=0)
-    # print(train_score[:100], flush=True)
-    # print(data.y[train_idx][:100], flush=True)
+    # --- Predict for Train Set ---
+    all_train_logits = []
+    for c in range(num_classes):
+        context_pos_mask = (context_y == c)
+        context_neg_mask = (context_y != c)
+        
+        class_c_logits = []
+        for idx in train_loader:
+            target_h = h[train_idx[idx]]
+            score = predictor(context_h[context_pos_mask], context_h[context_neg_mask], target_h)
+            class_c_logits.append(score.squeeze(-1))
+        all_train_logits.append(torch.cat(class_c_logits, dim=0))
+    train_score = torch.stack(all_train_logits, dim=1).argmax(dim=1)
 
-    test_score = []
-    for idx in test_loader:
-        target_h = h[test_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
-        out = out.argmax(dim=1).flatten()
-        test_score.append(out)
-    test_score = torch.cat(test_score, dim=0)
-    # print(test_score[:100], flush=True)
-    # print(data.y[test_idx][:100], flush=True)
+    # --- Predict for Test Set ---
+    all_test_logits = []
+    for c in range(num_classes):
+        context_pos_mask = (context_y == c)
+        context_neg_mask = (context_y != c)
+        
+        class_c_logits = []
+        for idx in test_loader:
+            target_h = h[test_idx[idx]]
+            score = predictor(context_h[context_pos_mask], context_h[context_neg_mask], target_h)
+            class_c_logits.append(score.squeeze(-1))
+        all_test_logits.append(torch.cat(class_c_logits, dim=0))
+    test_score = torch.stack(all_test_logits, dim=1).argmax(dim=1)
 
-    # calculate valid metric
+    # --- Calculate metrics ---
     valid_y = data.y[valid_idx]
     valid_results = acc(valid_y, valid_score)
+    
     train_y = data.y[train_idx]
     train_results = acc(train_y, train_score)
+    
     test_y = data.y[test_idx]
     test_results = acc(test_y, test_score)
 
-    print(f"Test time: {time.time()-st}", flush=True)
+    print(f"Test time: {time.time()-st:.4f}s", flush=True)
     return train_results, valid_results, test_results
 
-
-def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=False, att=None, 
-             mlp=None, normalize_class_h=False):
+def test_all(model, predictor, data_list, split_idx_list, batch_size):
     tot_train_metric, tot_valid_metric, tot_test_metric = 1, 1, 1
     for data, split_idx in zip(data_list, split_idx_list):
         train_idx = split_idx['train']
@@ -210,8 +218,7 @@ def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=Fal
         test_idx = split_idx['test']
 
         train_metric, valid_metric, test_metric = \
-        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
-             normalize_class_h)
+        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size)
         print(f"Dataset {data.name}")
         print(f"Train {train_metric}, Valid {valid_metric}, Test {test_metric}", flush=True)
         tot_train_metric *= train_metric
@@ -220,8 +227,7 @@ def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=Fal
     return tot_train_metric ** (1/(len(data_list))), tot_valid_metric ** (1/(len(data_list))), \
            tot_test_metric ** (1/(len(data_list)))
 
-def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, degree=False, 
-                    att=None, mlp=None, normalize_class_h=False):
+def test_all_induct(model, predictor, data_list, split_idx_list, batch_size):
     train_metric_list, valid_metric_list, test_metric_list = [], [], []
     for data, split_idx in zip(data_list, split_idx_list):
         train_idx = split_idx['train']
@@ -229,8 +235,7 @@ def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, deg
         test_idx = split_idx['test']
 
         train_metric, valid_metric, test_metric = \
-        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp, 
-             normalize_class_h)
+        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size)
         print(f"Dataset {data.name}")
         print(f"Train {train_metric}, Valid {valid_metric}, Test {test_metric}", flush=True)
         train_metric_list.append(train_metric)
@@ -252,8 +257,19 @@ def select_k_shot_context(data, k, index):
     context_samples = torch.cat(context_samples)
     return context_samples
 
-def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use_full_pca=False, normalize_data=False):
+def process_data(data, split_idx, hidden, context_num, prop_model, sign_normalize=False):
     device = data.x.device
+    if data.x.size(1) < hidden:
+        if hidden % data.x.size(1) != 0:
+            num_repeats = hidden // data.x.size(1) + 1
+        else:
+            num_repeats = hidden // data.x.size(1)
+        xs = [data.x]
+        h = data.x
+        for _ in range(num_repeats - 1):
+            h = prop_model(h, data.adj_t).detach()
+            xs.append(h)
+        data.x = torch.cat(xs, dim=1).to(device)
     split_idx['train'] = split_idx['train'].to(device)
     split_idx['valid'] = split_idx['valid'].to(device)
     split_idx['test'] = split_idx['test'].to(device)
@@ -263,12 +279,9 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     st = time.time()
     #debug
     # data.x = data.x - data.x.mean(dim=0, keepdim=True)
-    if use_full_pca:
-        U, S, V = torch.svd(data.x)
-        U = U[:, :hidden]
-        S = S[:hidden]
-    else:
-        U, S, V = torch.pca_lowrank(data.x, q=hidden)
+    U, S, V = torch.svd(data.x)
+    U = U[:, :hidden]
+    S = S[:hidden]
 
     # normalize the eigenvectors direction
     if sign_normalize:
@@ -279,15 +292,6 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
                 U[:, i] = -U[:, i]
 
     data.x = torch.mm(U, torch.diag(S)).to(device)
-
-    if data.x.size(1) < hidden:
-        data.x = torch.cat([data.x, torch.zeros(data.x.size(0), hidden - data.x.size(1), \
-                            device=device)], dim=1)
-                                
-    # normalize the data
-    if normalize_data:
-        data.x = F.normalize(data.x, p=2, dim=1)
-
     # print(f'name: {data.name}', flush=True)
     # print(f'pca_data_mean: {data.x.mean(dim=0)}', flush=True)
     print(f"PCA time: {time.time()-st}", flush=True)
@@ -304,22 +308,14 @@ def run(args):
     device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
 
     train_dataset = args.train_dataset.split(',')
-    data_list, split_idx_list = load_all_data_train(train_dataset)
+    data_list, split_idx_list = load_all_data(train_dataset)
+    prop_model = PureGCN(1).to(device)
 
     for data, split_idx in zip(data_list, split_idx_list):
         data.x = data.x.to(device)
         data.adj_t = data.adj_t.to(device)
         data.y = data.y.to(device)
-        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, args.normalize_data)
-
-    att, mlp = None, None
-
-    if args.att_pool:
-        att = AttentionPool(args.hidden, args.hidden // args.nhead, args.nhead, args.dp)
-        att = att.to(device)
-    if args.mlp_pool:
-        mlp = MLP(args.hidden, args.hidden, args.hidden, 2, args.dp, args.norm, False, args.mlp_norm_affine)
-        mlp = mlp.to(device)
+        process_data(data, split_idx, args.hidden, args.context_num, prop_model, args.sign_normalize)
 
     if args.model == 'PureGCN':
         model = PureGCN(args.num_layers)
@@ -333,10 +329,9 @@ def run(args):
         raise NotImplementedError
 
     if args.predictor == 'PFN':
-        predictor = PFNPredictorNodeCls(args.hidden, args.nhead, args.transformer_layers, 
-                                        args.mlp_layers, args.dp, args.norm, args.seperate, 
-                                        args.degree, att, mlp, args.sim, args.padding, 
-                                        args.mlp_norm_affine, args.normalize_class_h)
+        predictor = PFNPredictorBinaryCls(args.hidden, args.nhead, args.transformer_layers, 
+                                          args.mlp_layers, args.dp, args.norm, args.scale, 
+                                          args.padding, args.output_target, args.mlp_norm_affine)
     else:
         raise NotImplementedError
 
@@ -344,10 +339,6 @@ def run(args):
     predictor = predictor.to(device)
 
     parameters = list(model.parameters()) + list(predictor.parameters())
-    if args.att_pool:
-        parameters += list(att.parameters())
-    if args.mlp_pool:
-        parameters += list(mlp.parameters())
 
     if args.optimizer == 'adam':
         optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay)
@@ -379,13 +370,11 @@ def run(args):
     for epoch in range(args.epochs):
         st = time.time()
         print(f"Epoch {epoch}", flush=True)
-        loss = train_all(model, data_list, split_idx_list, optimizer, predictor, args.batch_size,
-                         args.degree, att, mlp, args.orthogonal_push, args.normalize_class_h)
+        loss = train_all(model, data_list, split_idx_list, optimizer, predictor, args.batch_size)
         if scheduler is not None:
             scheduler.step()
         train_metric, valid_metric, test_metric = \
-        test_all(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
-                 att, mlp, args.normalize_class_h)
+        test_all(model, predictor, data_list, split_idx_list, args.test_batch_size)
         wandb.log({'train_loss': loss, 'train_metric': train_metric, 'valid_metric': valid_metric, 
                    'test_metric': test_metric})
         en = time.time()
@@ -415,13 +404,12 @@ def run(args):
         data.x = data.x.to(device)
         data.y = data.y.to(device)
         data.adj_t = data.adj_t.to(device)
-        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, args.normalize_data)
+        process_data(data, split_idx, args.hidden, args.context_num, prop_model)
 
     st_total = time.time()
     st = time.time()
     train_metric_list, valid_metric_list, test_metric_list = \
-    test_all_induct(model, predictor, data_list, split_idx_list, args.test_batch_size, 
-                    args.degree, att, mlp, args.normalize_class_h)
+    test_all_induct(model, predictor, data_list, split_idx_list, args.test_batch_size)
     print(f"Test time: {time.time()-st}", flush=True)
     for i, data in enumerate(data_list):
         print(f"Dataset {data.name}")

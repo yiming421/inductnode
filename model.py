@@ -432,6 +432,87 @@ class PFNPredictorNodeCls(nn.Module):
             raise ValueError("Invalid similarity type. Choose 'dot', 'cos', or 'mlp'.")
         return logits
     
+class PFNPredictorBinaryCls(nn.Module):
+    def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2, norm=False, scale=False, 
+                padding='zeros', output_target=False, norm_affine=True):
+        super(PFNPredictorBinaryCls, self).__init__()
+        # Store original hidden_dim for feature splitting
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # MLP for initial edge prediction (outputs 1 dimension for label prediction)
+        if padding == 'mlp':
+            self.mlp = MLP(hidden_dim, hidden_dim, 1, 2, dropout, norm, False, norm_affine)
+        
+        # Feature scaling
+        self.scale = nn.LayerNorm(hidden_dim) if scale else None
+        
+        # Shared transformer components (dimension = hidden_dim + 1 for label concatenation)
+
+        self.transformer_row = nn.ModuleList([
+            PFNTransformerLayer(hidden_dim + 1, n_head=nhead, mlp_layers=2, dropout=dropout, 
+                                norm=norm, norm_affine=norm_affine)
+            for _ in range(num_layers)
+        ])
+
+        # Final prediction head
+        self.head = MLP(
+            in_channels=hidden_dim + 1,
+            hidden_channels=hidden_dim + 1,
+            out_channels=1,
+            num_layers=mlp_layers,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+        self.padding = padding
+        self.output_target = output_target
+        self._weight_init()
+
+    def _weight_init(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, context_pos_x, context_neg_x, target_x):
+        # Feature normalization
+        if self.scale is not None:
+            context_pos_x = self.scale(context_pos_x)
+            context_neg_x = self.scale(context_neg_x)
+            target_x = self.scale(target_x)
+        
+        # 2. Label Concatenation ----------------------------------------------
+        # Add label indicators to context
+        context_pos_x = torch.cat([
+            context_pos_x, 
+            torch.ones(context_pos_x.size(0), 1, device=context_pos_x.device)
+        ], dim=-1)
+        context_neg_x = torch.cat([
+            context_neg_x, 
+            torch.zeros(context_neg_x.size(0), 1, device=context_neg_x.device)
+        ], dim=-1)
+
+        if self.padding == 'mlp':
+            target_x_label = self.mlp(target_x).unsqueeze(-1)  # Predict label for target edges
+        elif self.padding == 'zeros':
+            target_x_label = torch.zeros(target_x.size(0), 1, device=target_x.device)
+        else:
+            raise ValueError('Unknown padding method:', self.padding)
+
+        target_x = torch.cat([target_x, target_x_label], dim=-1)  # [num_edges, hidden_dim+1]
+        context_x = torch.cat([context_pos_x, context_neg_x], dim=0)  # [num_context, hidden_dim+1]
+
+        for layer in self.transformer_row:
+            context_x, target_x = layer(context_x, target_x)
+
+        if self.output_target:
+            return target_x.squeeze(1)[:, -1].squeeze(-1)
+        else:
+            return self.head(target_x.squeeze(1)).squeeze(-1)
+        
 class AttentionPool(nn.Module):
     def __init__(self, in_channels, out_channels, nhead=1, dp=0.2):
         super(AttentionPool, self).__init__()
