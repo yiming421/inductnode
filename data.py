@@ -1,625 +1,453 @@
-from model import PureGCN_v1, PureGCN, PFNPredictorNodeCls, GCN, AttentionPool, MLP
-from data import load_all_data, load_all_data_train
-import argparse
+from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, Twitch, FacebookPagePage
+from torch_geometric.data import Data
+from ogb.nodeproppred import PygNodePropPredDataset
+from torch_sparse import SparseTensor
 import torch
-from torch_geometric.data import DataLoader
-import torch.nn as nn
-import torch.nn.functional as F
-import time
-import wandb
-import copy
-import numpy as np
-from utils import process_node_features
-from transformers import get_cosine_schedule_with_warmup
+from collections import defaultdict
+# Fix for PyTorch 2.6+ weights_only compatibility with PyG
+import torch.serialization
+from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr, TensorAttr
+from torch_geometric.data.storage import GlobalStorage, NodeStorage, EdgeStorage
+import pickle
+import os
 
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
+# Add safe globals for PyTorch Geometric
+torch.serialization.add_safe_globals([
+    DataEdgeAttr,
+    DataTensorAttr, 
+    TensorAttr,
+    Data,
+    GlobalStorage,
+    NodeStorage,
+    EdgeStorage,
+    # Add other PyG classes that might be needed
+])
 
-def acc(y_true, y_pred):
-    y_true = y_true.cpu().numpy().flatten()
-    y_pred = y_pred.cpu().numpy().flatten()
-    correct = y_true == y_pred
-    return float(np.sum(correct)) / len(correct)
+def load_ogbn_data(dataset):
+    name = dataset
+    dataset = PygNodePropPredDataset(name=dataset)
+    data = dataset[0]
+    data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+    data.adj_t = data.adj_t.to_symmetric().coalesce()
+    split_idx = dataset.get_idx_split()
+    data.name = name
+    data.y = data.y.squeeze()
+    return data, split_idx
 
-def apply_final_pca(projected_features, target_dim, use_full_pca=False):
-    """Apply PCA to projected features to get them in proper PCA form"""
-    if use_full_pca:
-        U, S, V = torch.svd(projected_features)
-        U = U[:, :target_dim]
-        S = S[:target_dim]
-    else:
-        U, S, V = torch.pca_lowrank(projected_features, q=target_dim)
+def load_ogbn_data_train(dataset):
+    name = dataset
+    dataset = PygNodePropPredDataset(name=dataset)
+    data = dataset[0]
+    data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+    data.adj_t = data.adj_t.to_symmetric().coalesce()
+    split_idx = dataset.get_idx_split()
+    data.name = name
+    data.y = data.y.squeeze()
+    train_idx = torch.cat([split_idx['train'], split_idx['valid']])
+    valid_idx = split_idx['test']
+    test_idx = split_idx['test']
+    split_idx = {'train': train_idx, 'valid': valid_idx, 'test': test_idx}
+    return data, split_idx
+
+def load_text_enhanced_dataset(dataset_name: str):
+    """Load text-enhanced datasets with Qwen-generated node features"""
+    dataset_path = f'dataset/{dataset_name}'
     
-    return torch.mm(U, torch.diag(S))
-
-def parse():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--train_dataset', type=str, default='ogbn-arxiv,Products,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage')
-    parser.add_argument('--test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS')
-    parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--test_batch_size', type=int, default=131072)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--weight_decay', type=float, default=0)
-    parser.add_argument('--schedule', type=str, default='none')
-    parser.add_argument("--hidden", default=128, type=int)
-    parser.add_argument("--dp", default=0.5, type=float)
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--norm', type=str2bool, default=True)
-    parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--runs', type=int, default=3)
-    parser.add_argument('--model', type=str, default='PureGCN_v1')
-    parser.add_argument('--predictor', type=str, default='PFN')
-    parser.add_argument('--sweep', type=str2bool, default=False)
-    parser.add_argument('--mlp_layers', type=int, default=2)
-    parser.add_argument('--gnn_norm_affine', type=str2bool, default=False)
-    parser.add_argument('--mlp_norm_affine', type=str2bool, default=False)
-    parser.add_argument('--relu', type=str2bool, default=False)
-    parser.add_argument('--res', type=str2bool, default=False)
-    parser.add_argument('--optimizer', type=str, default='adam')
-    parser.add_argument('--clip_grad', type=float, default=1.0)
-
-    parser.add_argument('--transformer_layers', type=int, default=1)
-    parser.add_argument('--nhead', type=int, default=4)
-    parser.add_argument('--context_num', type=int, default=20)
-    parser.add_argument('--seperate', type=str2bool, default=True)
-    parser.add_argument('--degree', type=str2bool, default=False)
-    parser.add_argument('--padding', type=str, default='zero')
-    parser.add_argument('--sim', type=str, default='dot')
-    parser.add_argument('--att_pool', type=str2bool, default=False)
-    parser.add_argument('--mlp_pool', type=str2bool, default=False)
-    parser.add_argument('--orthogonal_push', type=float, default=0.0)
-    parser.add_argument('--normalize_class_h', type=str2bool, default=True)
-    parser.add_argument('--sign_normalize', type=str2bool, default=False)
-    parser.add_argument('--use_full_pca', type=str2bool, default=True)
-    parser.add_argument('--normalize_data', type=str2bool, default=False)   
-
-    parser.add_argument('--use_gin', type=str2bool, default=False)
-    parser.add_argument('--multilayer', type=str2bool, default=True)
-
-    # Learnable projector arguments
-    parser.add_argument('--use_projector', type=str2bool, default=False)
-    parser.add_argument('--min_pca_dim', type=int, default=64)
-    parser.add_argument('--skip_datasets', type=str2bool, default=False)    
-
-    return parser.parse_args()
-
-def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None, 
-          orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None):
-    st = time.time()
-
-    model.train()
-    pred.train()
-    if att is not None:
-        att.train()
-    if mlp is not None:
-        mlp.train()
-    if projector is not None:
-        projector.train()
-
-    dataloader = DataLoader(range(train_idx.size(0)), batch_size, shuffle=True)
-    total_loss = 0
-
-    for perm in dataloader:
-        train_perm_idx = train_idx[perm]
+    if not os.path.exists(dataset_path):
+        raise ValueError(f"Text-enhanced dataset {dataset_name} not found at {dataset_path}")
+    
+    # Try to load from raw .pt file first
+    pt_file = os.path.join(dataset_path, 'raw', f'{dataset_name}.pt')
+    if os.path.exists(pt_file):
+        print(f"Loading text-enhanced dataset {dataset_name} from {pt_file}")
+        data = torch.load(pt_file, map_location='cpu', weights_only=False)
         
-        # Apply projector if needed
-        if hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
-            projected_features = projector(data.x)
-            # Apply final PCA to get features in proper PCA form
-            if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
-                x_input = apply_final_pca(projected_features, projected_features.size(1))
-            else:
-                x_input = projected_features
+        # Convert masks from lists to tensors if needed
+        if hasattr(data, 'train_masks') and isinstance(data.train_masks, list):
+            # Use the first mask (index 0) if multiple masks exist
+            data.train_mask = data.train_masks[0].clone().detach() if len(data.train_masks) > 0 else torch.zeros(data.num_nodes, dtype=torch.bool)
+        if hasattr(data, 'val_masks') and isinstance(data.val_masks, list):
+            data.val_mask = data.val_masks[0].clone().detach() if len(data.val_masks) > 0 else torch.zeros(data.num_nodes, dtype=torch.bool)
+        if hasattr(data, 'test_masks') and isinstance(data.test_masks, list):
+            data.test_mask = data.test_masks[0].clone().detach() if len(data.test_masks) > 0 else torch.zeros(data.num_nodes, dtype=torch.bool)
+        
+        print(f"Loaded text-enhanced {dataset_name}: {data.num_nodes} nodes, {data.num_edges} edges, feature dim: {data.x.shape[1] if data.x is not None else 'None'}")
+        return data
+    else:
+        raise ValueError(f"Data file not found for text-enhanced dataset {dataset_name} at {pt_file}")
+
+def load_data_train(dataset_name: str):
+    
+    # --- 1. Check if this is a text-enhanced dataset (lowercase or LLaMA variants) ---
+    if dataset_name in ['cora', 'wikics', 'pubmed', 'cora_llama_8b', 'cora_llama_13b']:
+        data = load_text_enhanced_dataset(dataset_name)
+        # Text-enhanced datasets already have proper splits, return directly
+        split_idx = {
+            'train': data.train_mask.nonzero(as_tuple=False).reshape(-1),
+            'valid': data.val_mask.nonzero(as_tuple=False).reshape(-1),
+            'test': data.test_mask.nonzero(as_tuple=False).reshape(-1)
+        }
+        return data, split_idx
+    # --- 2. Load the dataset using its specific loader ---
+    elif dataset_name in ['Cora', 'Citeseer', 'Pubmed']:
+        dataset = Planetoid(root='dataset', name=dataset_name)
+    elif dataset_name == 'WikiCS':
+        dataset = WikiCS(root='dataset/WikiCS')
+    elif dataset_name in ['CS', 'Physics']:
+        dataset = Coauthor(root='dataset/Coauthor', name=dataset_name)
+    elif dataset_name in ['Computers', 'Photo']:
+        dataset = Amazon(root='dataset/Amazon', name=dataset_name)
+    elif dataset_name == 'Reddit':
+        dataset = Reddit(root='dataset/Reddit')
+    elif dataset_name == 'Flickr':
+        dataset = Flickr(root='dataset/Flickr')
+    elif dataset_name == 'AmazonProducts':
+        dataset = AmazonProducts(root='dataset/AmazonProducts')
+    elif dataset_name in ['USA','Brazil', 'Europe']:
+        dataset = Airports(root='dataset/Airports', name=dataset_name)
+    elif dataset_name in ['Cornell', 'Texas', 'Wisconsin']:
+        dataset = WebKB(root='dataset/WebKB', name=dataset_name)
+    elif dataset_name in ['Chameleon', 'Squirrel']:
+        dataset = WikipediaNetwork(root='dataset/WikipediaNetwork', name=dataset_name, geom_gcn_preprocess=True)
+    elif dataset_name == 'Actor':
+        dataset = Actor(root='dataset/Actor')
+    elif dataset_name == 'DeezerEurope':
+        dataset = DeezerEurope(root='dataset/DeezerEurope')
+    elif dataset_name == 'LastFMAsia':
+        dataset = LastFMAsia(root='dataset/LastFMAsia')
+    elif dataset_name in ['Wiki', 'BlogCatalog', 'Facebook', 'TWeibo']:
+        dataset = AttributedGraphDataset(root='dataset/AttributedGraph', name=dataset_name)
+    elif dataset_name == 'EllipticBitcoin':
+        dataset = EllipticBitcoinDataset(root='dataset/EllipticBitcoin')
+    elif dataset_name in ['DBLP']:
+        dataset = CitationFull(root='dataset/CitationFull', name=dataset_name)
+    elif dataset_name.startswith('Twitch-'):
+        # Extract region from dataset name (e.g., 'Twitch-DE' -> 'DE')
+        region = dataset_name.split('-')[1]
+        dataset = Twitch(root='dataset/Twitch', name=region)
+    elif dataset_name == 'FacebookPagePage':
+        dataset = FacebookPagePage(root='dataset/FacebookPagePage')
+    elif dataset_name == 'MAG240M':
+        # Load MAG240M subset directly
+        data, split_idx = load_mag240m_subset()
+        data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+        data.adj_t = data.adj_t.to_symmetric().coalesce()
+        data.name = dataset_name
+        return data, split_idx
+    elif dataset_name == 'Products':
+        # Load Products subset directly
+        data, split_idx = load_products_subset()
+        data.name = dataset_name
+        return data, split_idx
+    else:
+        raise ValueError(f"Dataset {dataset_name} not supported.")
+        
+    data = dataset[0]
+
+    # --- 2. Create the new 90/10 stratified split ---
+    num_nodes = data.num_nodes
+    print(f"Number of nodes: {num_nodes}", flush=True)
+    print(f"Number of edges: {data.num_edges}", flush=True)
+    labels = data.y
+
+    # Group nodes by their class label
+    nodes_by_class = defaultdict(list)
+    for node_idx, label in enumerate(labels):
+        nodes_by_class[label.item()].append(node_idx)
+
+    train_idx = []
+    valid_idx = []
+
+    # Perform stratified sampling for each class
+    for class_label, indices in nodes_by_class.items():
+        class_indices = torch.tensor(indices)
+        num_class_nodes = len(class_indices)
+        
+        # Shuffle indices within the class
+        shuffled_indices = class_indices[torch.randperm(num_class_nodes)]
+        
+        # Split according to the 90/10 ratio
+        train_end = int(num_class_nodes * 0.9)
+        
+        train_idx.extend(shuffled_indices[:train_end])
+        valid_idx.extend(shuffled_indices[train_end:])
+
+    # Shuffle the combined training and validation indices
+    train_idx = torch.tensor(train_idx)[torch.randperm(len(train_idx))]
+    valid_idx = torch.tensor(valid_idx)[torch.randperm(len(valid_idx))]
+
+    # Create new boolean masks and attach them to the data object
+    data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.train_mask[train_idx] = True
+
+    data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    data.val_mask[valid_idx] = True
+
+    # Create an empty test mask to prevent downstream errors
+    data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+
+    # --- 3. Perform other processing (e.g., creating adjacency tensor) ---
+    data.adj_t = SparseTensor.from_edge_index(
+        data.edge_index, 
+        sparse_sizes=(data.num_nodes, data.num_nodes)
+    )
+    data.adj_t = data.adj_t.to_symmetric().coalesce()
+
+    # --- 4. Create the split_idx dictionary with the correct indices ---
+    split_idx = {
+        'train': train_idx,
+        'valid': valid_idx,
+        'test': valid_idx  
+    }
+
+    data.name = dataset_name
+    return data, split_idx
+
+def load_data(dataset):
+    name = dataset
+    
+    # Check if this is a text-enhanced dataset (including LLaMA variants)
+    if dataset in ['cora', 'wikics', 'pubmed', 'cora_llama_8b', 'cora_llama_13b']:
+        data = load_text_enhanced_dataset(dataset)
+        dataset = [data]
+    elif dataset in ['Cora', 'Citeseer', 'Pubmed']:
+        dataset = Planetoid(root='dataset', name=dataset)
+    elif dataset == 'WikiCS':
+        dataset = WikiCS(root='dataset/WikiCS')
+    elif dataset == 'Products':
+        # Load Products subset directly
+        data, split_idx = load_products_subset()
+        data.name = name
+        return data, split_idx
+    elif dataset == 'FacebookPagePage':
+        dataset = FacebookPagePage(root='dataset/FacebookPagePage')
+    elif dataset == 'MAG240M':
+        # Load MAG240M subset directly
+        data, split_idx = load_mag240m_subset()
+        data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+        data.adj_t = data.adj_t.to_symmetric().coalesce()
+        data.name = name
+        return data, split_idx
+    elif dataset == 'Products':
+        # Load Products subset directly
+        data, split_idx = load_products_subset()
+        data.name = name
+        return data, split_idx
+    else:
+        raise ValueError(f"Dataset {dataset} not supported.")
+    data = dataset[0]
+    data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
+    data.adj_t = data.adj_t.to_symmetric().coalesce()
+    split_idx = dict()
+    split_idx['train'] = data.train_mask.nonzero(as_tuple=False).reshape(-1)
+    split_idx['valid'] = data.val_mask.nonzero(as_tuple=False).reshape(-1)
+    split_idx['test'] = data.test_mask.nonzero(as_tuple=False).reshape(-1)
+    data.name = name
+    return data, split_idx
+
+def load_all_data(train_datasets):
+    data_list = []
+    split_idx_list = []
+    for dataset in train_datasets:
+        print(dataset, flush=True)
+        if dataset.startswith('ogbn-'):
+            data, split_edge = load_ogbn_data(dataset)
         else:
-            x_input = data.x
-        
-        # Standard forward pass (checkpointing can be added later if needed)
-        h = model(x_input, data.adj_t)
+            data, split_edge = load_data(dataset)
+        data_list.append(data)
+        split_idx_list.append(split_edge)
+    return data_list, split_idx_list
 
-        context_h = h[data.context_sample]
-        context_y = data.y[data.context_sample]
-        
-        # Fix type safety by properly handling None values
-        class_h = process_node_features(
-            context_h, data, 
-            degree_normalize=degree,
-            attention_pool_module=att if att is not None else None, 
-            mlp_module=mlp if mlp is not None else None, 
-            normalize=normalize_class_h
+def expand_dataset_names(train_datasets):
+    """Expand special dataset names like 'Twitch' into all regions"""
+    expanded_datasets = []
+    for dataset in train_datasets:
+        if dataset == 'Twitch':
+            # Expand Twitch into all 6 regions
+            twitch_regions = ['Twitch-DE', 'Twitch-EN', 'Twitch-ES', 'Twitch-FR', 'Twitch-PT', 'Twitch-RU']
+            expanded_datasets.extend(twitch_regions)
+            print(f"Expanded 'Twitch' into: {', '.join(twitch_regions)}")
+        else:
+            expanded_datasets.append(dataset)
+    return expanded_datasets
+
+def load_all_data_train(train_datasets):
+    # Expand any special dataset names first
+    expanded_datasets = expand_dataset_names(train_datasets)
+    
+    data_list = []
+    split_idx_list = []
+    for dataset in expanded_datasets:
+        print(dataset, flush=True)
+        if dataset.startswith('ogbn-'):
+            data, split_edge = load_ogbn_data_train(dataset)
+        else:
+            data, split_edge = load_data_train(dataset)
+        data_list.append(data)
+        split_idx_list.append(split_edge)
+    return data_list, split_idx_list
+
+def load_products_subset():
+    """Load Products subset dataset"""
+    print("Loading Products subset...")
+    
+    try:
+        dict_products = torch.load('dataset/products/raw/ogbn-products_subset.pt', map_location='cpu', weights_only=False)
+        data = Data(
+            x=dict_products['x'],
+            y=dict_products['y'].squeeze(),
+            train_mask=dict_products['train_mask'],
+            val_mask=dict_products['val_mask'],
+            test_mask=dict_products['test_mask'],
+            adj_t=dict_products['adj_t'],
         )
-
-        target_h = h[train_perm_idx]
-        score = pred(data, context_h, target_h, context_y, class_h)
-        score = F.log_softmax(score, dim=1)
-        label = data.y[train_perm_idx].squeeze()
-
-        # Store class_h in data for orthogonal loss calculation
-        data.final_class_h = class_h
+        data.edge_index = torch.stack([data.adj_t.coo()[0], data.adj_t.coo()[1]], dim=0)
         
-        # Compute orthogonal loss with better numerical stability
-        if orthogonal_push > 0 and hasattr(data, 'final_class_h'):
-            class_h_norm = F.normalize(data.final_class_h, p=2, dim=1)
-            class_matrix = class_h_norm @ class_h_norm.T
-            # Remove diagonal elements
-            mask = ~torch.eye(class_matrix.size(0), device=class_matrix.device, dtype=torch.bool)
-            orthogonal_loss = torch.sum(class_matrix[mask]**2)
-        else:
-            orthogonal_loss = torch.tensor(0.0, device=label.device)
+        print(f"Products subset loaded: {data.num_nodes} nodes, {data.num_edges} edges")
+        print(f"Feature dimension: {data.x.shape[1] if data.x is not None else 'None'}")
+        print(f"Train nodes: {data.train_mask.sum().item()}")
+        print(f"Val nodes: {data.val_mask.sum().item()}")
+        print(f"Test nodes: {data.test_mask.sum().item()}")
+        print(f"Number of classes: {data.y.max().item() + 1}")
         
-        nll_loss = F.nll_loss(score, label)
-        loss = nll_loss + orthogonal_push * orthogonal_loss
-
-        optimizer.zero_grad()
-        loss.backward()
+        # Create split_idx dictionary
+        split_idx = {
+            'train': data.train_mask.nonzero(as_tuple=False).reshape(-1),
+            'valid': data.val_mask.nonzero(as_tuple=False).reshape(-1),
+            'test': data.test_mask.nonzero(as_tuple=False).reshape(-1)
+        }
         
-        # Apply gradient clipping
-        if clip_grad > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            nn.utils.clip_grad_norm_(pred.parameters(), clip_grad)
-            if att is not None:
-                nn.utils.clip_grad_norm_(att.parameters(), clip_grad)
-            if mlp is not None:
-                nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad)
-            if projector is not None:
-                nn.utils.clip_grad_norm_(projector.parameters(), clip_grad)
+        return data, split_idx
         
-        optimizer.step()
-        total_loss += loss.item()
+    except Exception as e:
+        print(f"Error loading Products subset: {e}")
+        raise e
 
-    en = time.time()
-    print(f"Train time: {en-st:.2f}s", flush=True)
+def load_mag240m_subset():
+    """Load MAG240M subset dataset with ~5.9M nodes and ~52.8M edges"""
+    base_path = '/data/wangxiyuan/TAGDataset/mag240m/'
+    processed_path = os.path.join(base_path, 'processed')
+    raw_path = os.path.join(base_path, 'raw')
     
-    return total_loss / len(dataloader)
-
-def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, degree=False, att=None,
-              mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None):
-    tot_loss = 0
-    for data, split_idx in zip(data_list, split_idx_list):
-        train_idx = split_idx['train']
-        loss = train(model, data, train_idx, optimizer, pred, batch_size, degree, att, mlp,
-                     orthogonal_push, normalize_class_h, clip_grad, projector)
-        print(f"Dataset {data.name} Loss: {loss}", flush=True)
-        tot_loss += loss
-    return tot_loss / (len(data_list))
-
-@torch.no_grad()
-def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False, 
-         att=None, mlp=None, normalize_class_h=False, projector=None):
-    st = time.time()
-    model.eval()
-    predictor.eval()
-    if projector is not None:
-        projector.eval()
-
-    # Apply projector if needed
-    if hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
-        projected_features = projector(data.x)
-        # Apply final PCA to get features in proper PCA form
-        if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
-            x_input = apply_final_pca(projected_features, projected_features.size(1))
-        else:
-            x_input = projected_features
-    else:
-        x_input = data.x
-
-    h = model(x_input, data.adj_t)
-
-    context_h = h[data.context_sample]
-    context_y = data.y[data.context_sample]
-
-    class_h = process_node_features(context_h, data, degree_normalize=degree, attention_pool_module=att, 
-                                    mlp_module=mlp, normalize=normalize_class_h)
-
-    # class_h = F.normalize(class_h, p=2, dim=1)
-
-    # predict
-    # break into mini-batches for large edge sets
-    train_loader = DataLoader(range(train_idx.size(0)), batch_size, shuffle=False)
-    valid_loader = DataLoader(range(valid_idx.size(0)), batch_size, shuffle=False)
-    test_loader = DataLoader(range(test_idx.size(0)), batch_size, shuffle=False)
-
-    valid_score = []
-    for idx in valid_loader:
-        target_h = h[valid_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
-        out = out.argmax(dim=1).flatten()
-        valid_score.append(out)
-    valid_score = torch.cat(valid_score, dim=0)
-    # print(valid_score[:100], flush=True)
-    # print(data.y[valid_idx][:100], flush=True)
-
-    train_score = []
-    for idx in train_loader:
-        target_h = h[train_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
-        out = out.argmax(dim=1).flatten()
-        train_score.append(out)
-    train_score = torch.cat(train_score, dim=0)
-    # print(train_score[:100], flush=True)
-    # print(data.y[train_idx][:100], flush=True)
-
-    test_score = []
-    for idx in test_loader:
-        target_h = h[test_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
-        out = out.argmax(dim=1).flatten()
-        test_score.append(out)
-    test_score = torch.cat(test_score, dim=0)
-    # print(test_score[:100], flush=True)
-    # print(data.y[test_idx][:100], flush=True)
-
-    # calculate valid metric
-    valid_y = data.y[valid_idx]
-    valid_results = acc(valid_y, valid_score)
-    train_y = data.y[train_idx]
-    train_results = acc(train_y, train_score)
-    test_y = data.y[test_idx]
-    test_results = acc(test_y, test_score)
-
-    print(f"Test time: {time.time()-st}", flush=True)
-    return train_results, valid_results, test_results
-
-
-def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=False, att=None, 
-             mlp=None, normalize_class_h=False, projector=None):
-    tot_train_metric, tot_valid_metric, tot_test_metric = 1, 1, 1
-    for data, split_idx in zip(data_list, split_idx_list):
-        train_idx = split_idx['train']
-        valid_idx = split_idx['valid']
-        test_idx = split_idx['test']
-
-        train_metric, valid_metric, test_metric = \
-        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
-             normalize_class_h, projector)
-        print(f"Dataset {data.name}")
-        print(f"Train {train_metric}, Valid {valid_metric}, Test {test_metric}", flush=True)
-        tot_train_metric *= train_metric
-        tot_valid_metric *= valid_metric
-        tot_test_metric *= test_metric
-    return tot_train_metric ** (1/(len(data_list))), tot_valid_metric ** (1/(len(data_list))), \
-           tot_test_metric ** (1/(len(data_list)))
-
-def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, degree=False, 
-                    att=None, mlp=None, normalize_class_h=False, projector=None):
-    train_metric_list, valid_metric_list, test_metric_list = [], [], []
-    for data, split_idx in zip(data_list, split_idx_list):
-        train_idx = split_idx['train']
-        valid_idx = split_idx['valid']
-        test_idx = split_idx['test']
-
-        train_metric, valid_metric, test_metric = \
-        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp, 
-             normalize_class_h, projector)
-        print(f"Dataset {data.name}")
-        print(f"Train {train_metric}, Valid {valid_metric}, Test {test_metric}", flush=True)
-        train_metric_list.append(train_metric)
-        valid_metric_list.append(valid_metric)
-        test_metric_list.append(test_metric)
-    return train_metric_list, valid_metric_list, test_metric_list
-
-def select_k_shot_context(data, k, index):
-    classes = data.y.unique()
-    context_samples = []
-    mask = torch.zeros(data.y.size(0), dtype=torch.bool, device=data.y.device)
-    mask[index] = True  # only select context from training set
-    for c in classes:
-        class_mask = (data.y == c) & mask
-        class_indices = torch.nonzero(class_mask, as_tuple=False).squeeze()
+    print("Loading MAG240M subset...")
+    
+    try:
+        # Load edge index - try torch.load first, then pickle
+        try:
+            edge_index = torch.load(os.path.join(processed_path, 'edge_index_subset.pkl'), map_location='cpu', weights_only=False)
+        except:
+            with open(os.path.join(processed_path, 'edge_index_subset.pkl'), 'rb') as f:
+                edge_index = pickle.load(f)
         
-        # Handle case where class has no training examples
-        if class_indices.numel() == 0:
-            print(f"Warning: Class {c} has no training examples, skipping...")
-            continue
+        # Load node mapping to understand which nodes are in the subset
+        try:
+            node_map = torch.load(os.path.join(processed_path, 'node_map_subset.pkl'), map_location='cpu', weights_only=False)
+        except:
+            with open(os.path.join(processed_path, 'node_map_subset.pkl'), 'rb') as f:
+                node_map = pickle.load(f)
         
-        # Handle case where class_indices is 0-dimensional (single element)
-        if class_indices.dim() == 0:
-            class_indices = class_indices.unsqueeze(0)
+        # Load label mapping
+        try:
+            label_map = torch.load(os.path.join(processed_path, 'label_map_subset.pkl'), map_location='cpu', weights_only=False)
+        except:
+            with open(os.path.join(processed_path, 'label_map_subset.pkl'), 'rb') as f:
+                label_map = pickle.load(f)
         
-        # Select k samples (or all if fewer than k available)
-        num_available = class_indices.size(0)
-        num_to_select = min(k, num_available)
-        selected_indices = torch.randperm(num_available)[:num_to_select]
-        selected_indices = class_indices[selected_indices]
-        context_samples.append(selected_indices)
-    
-    if len(context_samples) == 0:
-        # If no classes have training examples, return empty tensor
-        return torch.tensor([], dtype=torch.long, device=data.y.device)
-    
-    context_samples = torch.cat(context_samples)
-    return context_samples
-
-def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use_full_pca=False, 
-                 normalize_data=False, use_projector=False, min_pca_dim=32):
-    device = data.x.device
-    split_idx['train'] = split_idx['train'].to(device)
-    split_idx['valid'] = split_idx['valid'].to(device)
-    split_idx['test'] = split_idx['test'].to(device)
-    data.context_sample = select_k_shot_context(data, context_num, split_idx['train'])
-    data.context_sample = data.context_sample.to(device)
-
-    st = time.time()
-    
-    # Determine PCA target dimension
-    original_dim = data.x.size(1)
-    
-    if original_dim >= hidden:
-        # Case 1: Enough features, just PCA to hidden (no padding/projection needed)
-        pca_target_dim = hidden
-        data.needs_projection = False
-        print(f"Dataset {data.name}: Sufficient features ({original_dim} >= {hidden}), PCA to {hidden}")
-    elif use_projector:
-        # Case 2a: Not enough features, use projector pathway
-        pca_target_dim = min(original_dim, min_pca_dim)
-        data.needs_projection = True
-        print(f"Dataset {data.name}: Using projector pathway ({original_dim} -> {pca_target_dim} -> {hidden})")
-    else:
-        # Case 2b: Not enough features, use zero padding
-        pca_target_dim = original_dim  # Use all available features
-        data.needs_projection = False
-        print(f"Dataset {data.name}: Using zero padding ({original_dim} -> zero-pad to {hidden})")
-    
-    # Apply PCA
-    if use_full_pca:
-        U, S, V = torch.svd(data.x)
-        U = U[:, :pca_target_dim]
-        S = S[:pca_target_dim]
-    else:
-        U, S, V = torch.pca_lowrank(data.x, q=pca_target_dim)
-
-    # normalize the eigenvectors direction
-    if sign_normalize:
-        for i in range(pca_target_dim):
-            feature_vector = U[:, i] * S[i]
-            max_idx = torch.argmax(torch.abs(feature_vector))
-            if feature_vector[max_idx] < 0:
-                U[:, i] = -U[:, i]
-
-    data.x_pca = torch.mm(U, torch.diag(S)).to(device)
-    
-    # Handle different pathways
-    if data.needs_projection:
-        # Will be projected by MLP projector during forward pass, then PCA again
-        data.x = data.x_pca  # Keep PCA features for projector input
-        data.needs_final_pca = True  # Flag to apply PCA after projection
-    else:
-        # Either sufficient features or zero padding needed
-        if data.x_pca.size(1) < hidden:
-            # Zero padding needed
-            data.x = torch.cat([data.x_pca, torch.zeros(data.x_pca.size(0), hidden - data.x_pca.size(1), 
-                               device=device)], dim=1)
-        else:
-            # Sufficient features, use as-is
-            data.x = data.x_pca
-        data.needs_final_pca = False
-                                
-    # normalize the data
-    if normalize_data:
-        data.x = F.normalize(data.x, p=2, dim=1)
-
-    print(f"PCA time: {time.time()-st:.2f}s", flush=True)
-
-def run(args):
-    if args.sweep:
-        wandb.init(project='inductnode')
-        config = wandb.config
-        for key in config.keys():
-            setattr(args, key, config[key])
-    else:
-        wandb.init(project='inductnode', config=args)
-
-    # Validate nhead and hidden dimension compatibility
-    if args.hidden % args.nhead != 0:
-        raise ValueError(f"Hidden dimension ({args.hidden}) must be divisible by number of heads ({args.nhead})")
-
-    # CONDITIONAL LR ADJUSTMENT - Prevent deep transformer + high LR disasters
-    if args.transformer_layers >= 3:
-        original_lr = args.lr
-        max_safe_lr = 0.0003  # Much lower for deep transformers
-        if args.lr > max_safe_lr:
-            args.lr = max_safe_lr
-            print(f"WARNING: Deep transformer ({args.transformer_layers} layers) + high LR detected!")
-            print(f"Automatically reducing LR from {original_lr} to {args.lr} for stability")
-            # Log the adjustment after wandb is initialized
-            wandb.log({'lr_auto_adjusted': True, 'original_lr': original_lr, 'adjusted_lr': args.lr})
-        else:
-            wandb.log({'lr_auto_adjusted': False})
-    else:
-        wandb.log({'lr_auto_adjusted': False})
-
-    device = f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu'
-
-    train_dataset = args.train_dataset.split(',')
-    data_list, split_idx_list = load_all_data_train(train_dataset)
-    if args.skip_datasets:
-        skip_idx = []
-
-    for i, (data, split_idx) in enumerate(zip(data_list, split_idx_list)):
-        data.x = data.x.to(device)
-        data.adj_t = data.adj_t.to(device)
-        data.y = data.y.to(device)
-        if args.skip_datasets and data.x.size(1) < args.hidden:
-            print(f"Skipping dataset {data.name} because it has less than {args.hidden} features")
-            skip_idx.append(i)
-            continue
-        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, 
-                     args.normalize_data, args.use_projector, args.min_pca_dim)
-
-    if args.skip_datasets:
-        data_list = [data for i, data in enumerate(data_list) if i not in skip_idx]
-        split_idx_list = [split_idx for i, split_idx in enumerate(split_idx_list) if i not in skip_idx]
-
-    att, mlp = None, None
-
-    if args.att_pool:
-        att = AttentionPool(args.hidden, args.hidden // args.nhead, args.nhead, args.dp)
-        att = att.to(device)
-    if args.mlp_pool:
-        mlp = MLP(args.hidden, args.hidden, args.hidden, 2, args.dp, args.norm, False, args.mlp_norm_affine)
-        mlp = mlp.to(device)
-    
-    # Initialize projector if needed
-    projector = None
-    if args.use_projector:
-        projector = MLP(args.min_pca_dim, args.hidden, args.hidden, 2, args.dp, args.norm, False, args.mlp_norm_affine)
-        projector = projector.to(device)
-        print(f"Created projector: {args.min_pca_dim} -> {args.hidden}")
-
-    if args.model == 'PureGCN':
-        model = PureGCN(args.num_layers)
-    elif args.model == 'PureGCN_v1':
-        model = PureGCN_v1(args.hidden, args.num_layers, args.hidden, args.dp, args.norm, args.res,
-                            args.relu, args.gnn_norm_affine)
-    elif args.model == 'GCN':
-        model = GCN(args.hidden, args.hidden, args.norm, args.relu, args.num_layers, args.dp,
-                    args.multilayer, args.use_gin, args.res, args.gnn_norm_affine)
-    else:
-        raise NotImplementedError
-
-    if args.predictor == 'PFN':
-        predictor = PFNPredictorNodeCls(args.hidden, args.nhead, args.transformer_layers, 
-                                        args.mlp_layers, args.dp, args.norm, args.seperate, 
-                                        args.degree, att, mlp, args.sim, args.padding, 
-                                        args.mlp_norm_affine, args.normalize_class_h)
-    else:
-        raise NotImplementedError
-
-    model = model.to(device)
-    predictor = predictor.to(device)
-
-    # Collect parameters, avoiding duplicates since predictor already includes att and mlp
-    parameters = list(model.parameters()) + list(predictor.parameters())
-    # Note: att and mlp parameters are already included in predictor.parameters()
-    # so we don't need to add them separately
-    
-    # Add projector parameters if using projector
-    if args.use_projector and projector is not None:
-        parameters += list(projector.parameters())
-        print(f"Added {sum(p.numel() for p in projector.parameters())} projector parameters")
-
-    if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay)
-    elif args.optimizer == 'adamw':
-        optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        raise NotImplementedError
-
-    if args.schedule == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    elif args.schedule == 'step':
-        step_size = args.epochs // 5
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
-    elif args.schedule == 'warmup':
-        warmup_steps = args.epochs // 10
-        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=args.epochs)
-    else:
-        scheduler = None
-
-    print(f'number of parameters: {sum(p.numel() for p in parameters)}', flush=True)
-
-    st_all = time.time()
-    best_valid = 0
-    final_test = 0
-    best_pred = predictor.state_dict()
-    best_model = model.state_dict()
-    best_epoch = 0
-
-    for epoch in range(args.epochs):
-        st = time.time()
-        print(f"Epoch {epoch}", flush=True)
-        loss = train_all(model, data_list, split_idx_list, optimizer, predictor, args.batch_size,
-                         args.degree, att, mlp, args.orthogonal_push, args.normalize_class_h, 
-                         args.clip_grad, projector)
-        if scheduler is not None:
-            scheduler.step()
-        train_metric, valid_metric, test_metric = \
-        test_all(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
-                 att, mlp, args.normalize_class_h, projector)
-        wandb.log({'train_loss': loss, 'train_metric': train_metric, 'valid_metric': valid_metric, 
-                   'test_metric': test_metric})
-        en = time.time()
-        print(f"Epoch time: {en-st}", flush=True)
-        if valid_metric >= best_valid:
-            best_valid = valid_metric
-            best_epoch = epoch
-            final_test = test_metric
-            best_pred = copy.deepcopy(predictor.state_dict())
-            best_model = copy.deepcopy(model.state_dict())
-
-        if epoch - best_epoch >= 200:
-            break
-
-    print(f"Memory: {torch.cuda.max_memory_allocated() / 1e9} GB", flush=True)
-    print(f"Total time: {time.time()-st_all}", flush=True)
-    wandb.log({'final_test': final_test})
-    print(f"Best epoch: {best_epoch}", flush=True)
-
-    model.load_state_dict(best_model)
-    predictor.load_state_dict(best_pred)
-    test_dataset = args.test_dataset.split(',')
-    data_list, split_idx_list = load_all_data(test_dataset)
-    prop_model = PureGCN(1).to(device)
-
-    for data, split_idx in zip(data_list, split_idx_list):
-        data.x = data.x.to(device)
-        data.y = data.y.to(device)
-        data.adj_t = data.adj_t.to(device)
-        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, 
-                     args.normalize_data, args.use_projector, args.min_pca_dim)
-
-    st_total = time.time()
-    st = time.time()
-    train_metric_list, valid_metric_list, test_metric_list = \
-    test_all_induct(model, predictor, data_list, split_idx_list, args.test_batch_size, 
-                    args.degree, att, mlp, args.normalize_class_h, projector)
-    print(f"Test time: {time.time()-st}", flush=True)
-    for i, data in enumerate(data_list):
-        print(f"Dataset {data.name}")
-        print(f"Train {train_metric_list[i]}")
-        print(f"Valid {valid_metric_list[i]}")
-        print(f"Test {test_metric_list[i]}")
-        wandb.log({f'{data.name}_train_metric': train_metric_list, 
-                   f'{data.name}_valid_metric': valid_metric_list[i], 
-                   f'{data.name}_test_metric': test_metric_list[i]})
-    train_metric = sum(train_metric_list) / len(train_metric_list)
-    valid_metric = sum(valid_metric_list) / len(valid_metric_list)
-    test_metric = sum(test_metric_list) / len(test_metric_list)
-    print(f'induct_train_metric: {train_metric}, induct_valid_metric: {valid_metric}, induct_test_metric: {test_metric}', flush=True)
-    wandb.log({'induct_train_metric': train_metric, 'induct_valid_metric': valid_metric, 
-               'induct_test_metric': test_metric})
-    print(f"Total time: {time.time()-st_total}", flush=True)
-
-    return train_metric, valid_metric, test_metric
-
-def main():
-    args = parse()
-    avg_train_metric = 0
-    avg_valid_metric = 0
-    avg_test_metric = 0
-    for _ in range(args.runs):
-        train_metric, valid_metric, test_metric = run(args)
-        avg_train_metric += train_metric
-        avg_valid_metric += valid_metric
-        avg_test_metric += test_metric
-    avg_train_metric /= args.runs
-    avg_valid_metric /= args.runs
-    avg_test_metric /= args.runs
-    print('Average Train Metric')
-    print(avg_train_metric)
-    print('Average Valid Metric')
-    print(avg_valid_metric)
-    print('Average Test Metric')
-    print(avg_test_metric)
-    wandb.init(project='inductlink')
-    wandb.log({'avg_train_metric': avg_train_metric, 'avg_valid_metric': avg_valid_metric, 'avg_test_metric': avg_test_metric})
-
-if __name__ == '__main__':
-    main()
+        # Load the actual processed numeric features from the original dataset
+        print("Loading processed 768-dim embeddings...")
+        import numpy as np
+        
+        # Load full features and extract subset
+        full_features = np.load(os.path.join(raw_path, 'processed/paper/node_feat.npy'), mmap_mode='r')
+        
+        # Extract features for nodes in our subset
+        subset_features = []
+        for node_id in node_map:
+            if node_id.item() < len(full_features):
+                subset_features.append(full_features[node_id.item()])
+            else:
+                # For non-paper nodes (authors, institutions), create zero features
+                subset_features.append(np.zeros(768, dtype=np.float16))
+        
+        # Convert to tensor
+        x = torch.from_numpy(np.stack(subset_features)).float()
+        print(f"Loaded {x.shape[0]} node features with dimension {x.shape[1]}")
+        
+        # Load split indices
+        split_dict = torch.load(os.path.join(raw_path, 'split_dict.pt'), map_location='cpu', weights_only=False)
+        
+        # Create labels tensor - MAG240M has 153 classes
+        # We need to map the global indices to subset indices
+        y = torch.full((len(node_map),), -1, dtype=torch.long)  # Initialize with -1 (unlabeled)
+        
+        # Map split indices to subset indices
+        subset_node_to_idx = {node_map[i].item(): i for i in range(len(node_map))}
+        
+        train_mask = torch.zeros(len(node_map), dtype=torch.bool)
+        val_mask = torch.zeros(len(node_map), dtype=torch.bool)
+        test_mask = torch.zeros(len(node_map), dtype=torch.bool)
+        
+        train_idx = []
+        val_idx = []
+        test_idx = []
+        
+        # Map original splits to subset indices
+        for orig_idx in split_dict['train']:
+            if orig_idx.item() in subset_node_to_idx:
+                subset_idx = subset_node_to_idx[orig_idx.item()]
+                train_mask[subset_idx] = True
+                train_idx.append(subset_idx)
+                # Set label for this node
+                y[subset_idx] = label_map[subset_idx]
+        
+        for orig_idx in split_dict['valid']:
+            if orig_idx.item() in subset_node_to_idx:
+                subset_idx = subset_node_to_idx[orig_idx.item()]
+                val_mask[subset_idx] = True
+                val_idx.append(subset_idx)
+                y[subset_idx] = label_map[subset_idx]
+        
+        for orig_idx in split_dict['test']:
+            if orig_idx.item() in subset_node_to_idx:
+                subset_idx = subset_node_to_idx[orig_idx.item()]
+                test_mask[subset_idx] = True
+                test_idx.append(subset_idx)
+                y[subset_idx] = label_map[subset_idx]
+        
+        # Features are already processed as tensor from numpy array
+        # No additional processing needed
+        
+        # Create the data object
+        data = Data(
+            x=x,
+            edge_index=edge_index,
+            y=y,
+            train_mask=train_mask,
+            val_mask=val_mask,
+            test_mask=test_mask,
+            num_nodes=len(node_map)
+        )
+        
+        # Store metadata about the features
+        data.feature_type = "processed_embeddings"  # 768-dim embeddings from language model
+        
+        print(f"MAG240M subset loaded: {data.num_nodes} nodes, {data.num_edges} edges")
+        print(f"Feature dimension: {data.x.shape[1] if data.x.dim() > 1 else 'None'}")
+        print(f"Train nodes: {train_mask.sum().item()}")
+        print(f"Val nodes: {val_mask.sum().item()}")
+        print(f"Test nodes: {test_mask.sum().item()}")
+        print(f"Labeled nodes: {(y >= 0).sum().item()}")
+        print(f"Number of classes: {y.max().item() + 1 if y.max() >= 0 else 'Unknown'}")
+        
+        # Create split_idx dictionary
+        split_idx = {
+            'train': torch.tensor(train_idx),
+            'valid': torch.tensor(val_idx),
+            'test': torch.tensor(test_idx)
+        }
+        
+        return data, split_idx
+        
+    except Exception as e:
+        print(f"Error loading MAG240M subset: {e}")
+        raise e
