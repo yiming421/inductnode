@@ -11,18 +11,6 @@ from torch_geometric.data.storage import GlobalStorage, NodeStorage, EdgeStorage
 import pickle
 import os
 
-# Add safe globals for PyTorch Geometric
-torch.serialization.add_safe_globals([
-    DataEdgeAttr,
-    DataTensorAttr, 
-    TensorAttr,
-    Data,
-    GlobalStorage,
-    NodeStorage,
-    EdgeStorage,
-    # Add other PyG classes that might be needed
-])
-
 def load_ogbn_data(dataset):
     name = dataset
     dataset = PygNodePropPredDataset(name=dataset)
