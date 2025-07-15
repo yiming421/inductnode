@@ -58,3 +58,40 @@ def process_node_features(
         final_class_h = nn.functional.normalize(final_class_h, p=2, dim=-1)
 
     return final_class_h
+
+def acc(y_true, y_pred):
+    import numpy as np
+    y_true = y_true.cpu().numpy().flatten()
+    y_pred = y_pred.cpu().numpy().flatten()
+    correct = y_true == y_pred
+    return float(np.sum(correct)) / len(correct)
+
+def apply_final_pca(projected_features, target_dim, use_full_pca=False):
+    """Apply PCA to projected features to get them in proper PCA form"""
+    if use_full_pca:
+        U, S, V = torch.svd(projected_features)
+        U = U[:, :target_dim]
+        S = S[:target_dim]
+    else:
+        U, S, V = torch.pca_lowrank(projected_features, q=target_dim)
+    
+    return torch.mm(U, torch.diag(S))
+
+def pfn_link_score(target_edge_embedding, link_prototypes):
+    """
+    Computes PFN-style link prediction scores by comparing edge embeddings to prototypes.
+    
+    Args:
+        target_edge_embedding: Embeddings of target edges [num_edges, hidden_dim]
+        link_prototypes: Prototypes for 'no-link' (0) and 'link' (1) [2, hidden_dim]
+    
+    Returns:
+        Scores (logits) for each class (no-link, link) [num_edges, 2]
+    """
+    # Normalize for cosine similarity, which is standard in PFN
+    target_norm = torch.nn.functional.normalize(target_edge_embedding, p=2, dim=-1)
+    prototypes_norm = torch.nn.functional.normalize(link_prototypes, p=2, dim=-1)
+    
+    # Compute dot product (cosine similarity) with both prototypes
+    scores = torch.matmul(target_norm, prototypes_norm.t())
+    return scores

@@ -42,7 +42,7 @@ def parse():
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--norm', type=str2bool, default=True)
     parser.add_argument('--num_layers', type=int, default=4)
-    parser.add_argument('--runs', type=int, default=5)
+    parser.add_argument('--runs', type=int, default=3)
     parser.add_argument('--model', type=str, default='PureGCN_v1')
     parser.add_argument('--predictor', type=str, default='PFN')
     parser.add_argument('--sweep', type=str2bool, default=False)

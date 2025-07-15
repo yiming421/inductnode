@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GINConv
 from torch_sparse.matmul import spmm_add
 from torch_scatter import scatter_softmax
-from utils import process_node_features
+from .utils import process_node_features
 
 class PureGCNConv(nn.Module):
     def __init__(self) -> None:
@@ -542,7 +542,7 @@ class AttentionPool(nn.Module):
         
         att_score = self.att(context_h_transformed).squeeze(-1)
         att_score = F.leaky_relu(att_score, negative_slope=0.2)
-        att_weights = scatter_softmax(att_score, context_y, dim=0) # [N_ctx, nhead]
+        att_weights = scatter_softmax(att_score, context_y.long(), dim=0) # [N_ctx, nhead]
         
         att_h = context_h_transformed * att_weights.unsqueeze(-1)
 
@@ -550,8 +550,39 @@ class AttentionPool(nn.Module):
         att_h = att_h.view(-1, self.nhead * self.out_channels)
 
         pooled_h = torch.scatter_reduce(
-            pooled_h, 0, context_y.view(-1, 1).expand(-1, att_h.size(1)), att_h,
+            pooled_h, 0, context_y.long().view(-1, 1).expand(-1, att_h.size(1)), att_h,
             reduce='sum', include_self=False
         )
         
         return pooled_h
+    
+class IdentityProjection(nn.Module):
+    """
+    Simple identity-preserving projection layer
+    Maps from small_dim to large_dim by keeping original features + learning extra features
+    """
+    def __init__(self, small_dim, large_dim):
+        super().__init__()
+        assert large_dim >= small_dim, f"large_dim ({large_dim}) must be >= small_dim ({small_dim})"
+        
+        self.small_dim = small_dim
+        self.large_dim = large_dim
+        
+        if large_dim > small_dim:
+            # Project only the "extra" dimensions
+            extra_dim = large_dim - small_dim
+            self.extra_proj = nn.Linear(small_dim, extra_dim)
+            
+            # Small initialization to start close to identity behavior
+            nn.init.xavier_uniform_(self.extra_proj.weight, gain=0.1)
+            nn.init.zeros_(self.extra_proj.bias)
+        else:
+            self.extra_proj = None
+    
+    def forward(self, x):
+        if self.extra_proj is None:
+            return x  # No projection needed
+        
+        # Keep original dimensions + add projected dimensions
+        extra_dims = self.extra_proj(x)
+        return torch.cat([x, extra_dims], dim=1)

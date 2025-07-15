@@ -11,9 +11,14 @@ from torch_geometric.data.storage import GlobalStorage, NodeStorage, EdgeStorage
 import pickle
 import os
 
+def get_project_root():
+    """Get the project root directory"""
+    # The root is 'inductnode', which is one level up from 'inductnode/src'
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
 def load_ogbn_data(dataset):
     name = dataset
-    dataset = PygNodePropPredDataset(name=dataset)
+    dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
     data = dataset[0]
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce()
@@ -24,7 +29,7 @@ def load_ogbn_data(dataset):
 
 def load_ogbn_data_train(dataset):
     name = dataset
-    dataset = PygNodePropPredDataset(name=dataset)
+    dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
     data = dataset[0]
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce()
@@ -39,7 +44,7 @@ def load_ogbn_data_train(dataset):
 
 def load_text_enhanced_dataset(dataset_name: str):
     """Load text-enhanced datasets with Qwen-generated node features"""
-    dataset_path = f'dataset/{dataset_name}'
+    dataset_path = os.path.join(get_project_root(), 'dataset', dataset_name)
     
     if not os.path.exists(dataset_path):
         raise ValueError(f"Text-enhanced dataset {dataset_name} not found at {dataset_path}")
@@ -77,44 +82,45 @@ def load_data_train(dataset_name: str):
         }
         return data, split_idx
     # --- 2. Load the dataset using its specific loader ---
-    elif dataset_name in ['Cora', 'Citeseer', 'Pubmed']:
-        dataset = Planetoid(root='dataset', name=dataset_name)
+    root = os.path.join(get_project_root(), 'dataset')
+    if dataset_name in ['Cora', 'Citeseer', 'Pubmed']:
+        dataset = Planetoid(root=root, name=dataset_name)
     elif dataset_name == 'WikiCS':
-        dataset = WikiCS(root='dataset/WikiCS')
+        dataset = WikiCS(root=os.path.join(root, 'WikiCS'))
     elif dataset_name in ['CS', 'Physics']:
-        dataset = Coauthor(root='dataset/Coauthor', name=dataset_name)
+        dataset = Coauthor(root=os.path.join(root, 'Coauthor'), name=dataset_name)
     elif dataset_name in ['Computers', 'Photo']:
-        dataset = Amazon(root='dataset/Amazon', name=dataset_name)
+        dataset = Amazon(root=os.path.join(root, 'Amazon'), name=dataset_name)
     elif dataset_name == 'Reddit':
-        dataset = Reddit(root='dataset/Reddit')
+        dataset = Reddit(root=os.path.join(root, 'Reddit'))
     elif dataset_name == 'Flickr':
-        dataset = Flickr(root='dataset/Flickr')
+        dataset = Flickr(root=os.path.join(root, 'Flickr'))
     elif dataset_name == 'AmazonProducts':
-        dataset = AmazonProducts(root='dataset/AmazonProducts')
+        dataset = AmazonProducts(root=os.path.join(root, 'AmazonProducts'))
     elif dataset_name in ['USA','Brazil', 'Europe']:
-        dataset = Airports(root='dataset/Airports', name=dataset_name)
+        dataset = Airports(root=os.path.join(root, 'Airports'), name=dataset_name)
     elif dataset_name in ['Cornell', 'Texas', 'Wisconsin']:
-        dataset = WebKB(root='dataset/WebKB', name=dataset_name)
+        dataset = WebKB(root=os.path.join(root, 'WebKB'), name=dataset_name)
     elif dataset_name in ['Chameleon', 'Squirrel']:
-        dataset = WikipediaNetwork(root='dataset/WikipediaNetwork', name=dataset_name, geom_gcn_preprocess=True)
+        dataset = WikipediaNetwork(root=os.path.join(root, 'WikipediaNetwork'), name=dataset_name, geom_gcn_preprocess=True)
     elif dataset_name == 'Actor':
-        dataset = Actor(root='dataset/Actor')
+        dataset = Actor(root=os.path.join(root, 'Actor'))
     elif dataset_name == 'DeezerEurope':
-        dataset = DeezerEurope(root='dataset/DeezerEurope')
+        dataset = DeezerEurope(root=os.path.join(root, 'DeezerEurope'))
     elif dataset_name == 'LastFMAsia':
-        dataset = LastFMAsia(root='dataset/LastFMAsia')
+        dataset = LastFMAsia(root=os.path.join(root, 'LastFMAsia'))
     elif dataset_name in ['Wiki', 'BlogCatalog', 'Facebook', 'TWeibo']:
-        dataset = AttributedGraphDataset(root='dataset/AttributedGraph', name=dataset_name)
+        dataset = AttributedGraphDataset(root=os.path.join(root, 'AttributedGraph'), name=dataset_name)
     elif dataset_name == 'EllipticBitcoin':
-        dataset = EllipticBitcoinDataset(root='dataset/EllipticBitcoin')
+        dataset = EllipticBitcoinDataset(root=os.path.join(root, 'EllipticBitcoin'))
     elif dataset_name in ['DBLP']:
-        dataset = CitationFull(root='dataset/CitationFull', name=dataset_name)
+        dataset = CitationFull(root=os.path.join(root, 'CitationFull'), name=dataset_name)
     elif dataset_name.startswith('Twitch-'):
         # Extract region from dataset name (e.g., 'Twitch-DE' -> 'DE')
         region = dataset_name.split('-')[1]
-        dataset = Twitch(root='dataset/Twitch', name=region)
+        dataset = Twitch(root=os.path.join(root, 'Twitch'), name=region)
     elif dataset_name == 'FacebookPagePage':
-        dataset = FacebookPagePage(root='dataset/FacebookPagePage')
+        dataset = FacebookPagePage(root=os.path.join(root, 'FacebookPagePage'))
     elif dataset_name == 'MAG240M':
         # Load MAG240M subset directly
         data, split_idx = load_mag240m_subset()
@@ -199,26 +205,21 @@ def load_data(dataset):
         data = load_text_enhanced_dataset(dataset)
         dataset = [data]
     elif dataset in ['Cora', 'Citeseer', 'Pubmed']:
-        dataset = Planetoid(root='dataset', name=dataset)
+        dataset = Planetoid(root=os.path.join(get_project_root(), 'dataset'), name=dataset)
     elif dataset == 'WikiCS':
-        dataset = WikiCS(root='dataset/WikiCS')
+        dataset = WikiCS(root=os.path.join(get_project_root(), 'dataset', 'WikiCS'))
     elif dataset == 'Products':
         # Load Products subset directly
         data, split_idx = load_products_subset()
         data.name = name
         return data, split_idx
     elif dataset == 'FacebookPagePage':
-        dataset = FacebookPagePage(root='dataset/FacebookPagePage')
+        dataset = FacebookPagePage(root=os.path.join(get_project_root(), 'dataset', 'FacebookPagePage'))
     elif dataset == 'MAG240M':
         # Load MAG240M subset directly
         data, split_idx = load_mag240m_subset()
         data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
         data.adj_t = data.adj_t.to_symmetric().coalesce()
-        data.name = name
-        return data, split_idx
-    elif dataset == 'Products':
-        # Load Products subset directly
-        data, split_idx = load_products_subset()
         data.name = name
         return data, split_idx
     else:
@@ -280,7 +281,8 @@ def load_products_subset():
     print("Loading Products subset...")
     
     try:
-        dict_products = torch.load('dataset/products/raw/ogbn-products_subset.pt', map_location='cpu', weights_only=False)
+        product_path = os.path.join(get_project_root(), 'dataset', 'products', 'raw', 'ogbn-products_subset.pt')
+        dict_products = torch.load(product_path, map_location='cpu', weights_only=False)
         data = Data(
             x=dict_products['x'],
             y=dict_products['y'].squeeze(),
@@ -313,7 +315,7 @@ def load_products_subset():
 
 def load_mag240m_subset():
     """Load MAG240M subset dataset with ~5.9M nodes and ~52.8M edges"""
-    base_path = '/data/wangxiyuan/TAGDataset/mag240m/'
+    base_path = os.path.join(get_project_root(), 'dataset', 'mag240m')
     processed_path = os.path.join(base_path, 'processed')
     raw_path = os.path.join(base_path, 'raw')
     

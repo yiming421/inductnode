@@ -41,7 +41,7 @@ def apply_final_pca(projected_features, target_dim, use_full_pca=False):
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_dataset', type=str, default='ogbn-arxiv,Products,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage')
+    parser.add_argument('--train_dataset', type=str, default='ogbn-arxiv,ogbn-products,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage')
     parser.add_argument('--test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--batch_size', type=int, default=4096)
