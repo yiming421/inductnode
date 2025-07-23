@@ -11,6 +11,155 @@ from torch_geometric.data.storage import GlobalStorage, NodeStorage, EdgeStorage
 import pickle
 import os
 
+from .dataset_config import get_gdrive_download_url, is_dataset_complete
+from .dataset_downloader import download_and_extract_dataset, install_gdown
+
+# Legacy download_dataset function for compatibility
+def download_dataset(dataset_name, force_redownload=False):
+    """Legacy function for compatibility - now uses auto_download_complete_dataset"""
+    return auto_download_complete_dataset()
+
+# Add safe globals for PyTorch 2.6+ compatibility
+try:
+    torch.serialization.add_safe_globals([
+        torch.Tensor,
+        torch.Size,
+        torch.dtype,
+        torch.device,
+        Data,
+        DataEdgeAttr,
+        DataTensorAttr,
+        TensorAttr,
+        GlobalStorage,
+        NodeStorage,
+        EdgeStorage,
+        SparseTensor,
+        defaultdict,
+        type(None),
+        tuple,
+        list,
+        dict,
+        int,
+        float,
+        str,
+        bool,
+    ])
+except (ImportError, AttributeError):
+    # Fallback for older PyTorch versions or if add_safe_globals doesn't exist
+    pass
+
+def ensure_dataset_available(dataset_name: str, dataset_root: str) -> bool:
+    """
+    Ensure a dataset is available locally, downloading if necessary.
+    
+    Args:
+        dataset_name: Name of the dataset
+        dataset_root: Root directory where dataset should be located
+    
+    Returns:
+        True if dataset is available, False otherwise
+    """
+    dataset_path = os.path.join(dataset_root, dataset_name)
+    
+    # Check if dataset already exists and has content
+    if os.path.exists(dataset_path) and os.listdir(dataset_path):
+        return True
+    
+    print(f"Dataset {dataset_name} not found locally. Attempting to download...")
+    
+    # First try the complete dataset download (covers all datasets)
+    try:
+        if auto_download_complete_dataset():
+            # Check again if the specific dataset is now available
+            if os.path.exists(dataset_path) and os.listdir(dataset_path):
+                print(f"Successfully downloaded {dataset_name} as part of complete dataset")
+                return True
+    except Exception as e:
+        print(f"Complete dataset download failed: {e}")
+    
+    # Fallback to individual dataset download
+    try:
+        success = download_dataset(dataset_name, force_redownload=False)
+        if success:
+            print(f"Successfully downloaded {dataset_name}")
+            return True
+        else:
+            print(f"Failed to download {dataset_name}")
+            return False
+    except Exception as e:
+        print(f"Error downloading {dataset_name}: {e}")
+        return False
+
+def auto_download_flickr_files(flickr_root):
+    """
+    Automatically download Flickr dataset files using gdown if they don't exist or are corrupted.
+    """
+    
+    raw_dir = os.path.join(flickr_root, 'raw')
+    os.makedirs(raw_dir, exist_ok=True)
+    
+    # File mappings: filename -> Google Drive file ID
+    flickr_files = {
+        'adj_full.npz': '1crmsTbd1-2sEXsGwa2IKnIB7Zd3TmUsy',
+        'feats.npy': '1join-XdvX3anJU_MLVtick7MgeAQiWIZ',
+        'class_map.json': '1uxIkbtg5drHTsKt-PAsZZ4_yJmgFmle9',
+        'role.json': '1htXCtuktuCW8TR8KiKfrFDAxUgekQoV7'
+    }
+    
+    # Expected file sizes (approximately, for validation)
+    expected_sizes = {
+        'adj_full.npz': 2000000,  # ~2MB
+        'feats.npy': 300000000,   # ~300MB
+        'class_map.json': 1000000, # ~1MB
+        'role.json': 500000       # ~500KB
+    }
+    
+    # Use unified gdown installation
+    if not install_gdown():
+        print("Failed to install gdown for Flickr download")
+        return False
+    
+    try:
+        import gdown
+    except ImportError:
+        print("gdown import failed after installation")
+        return False
+    
+    downloaded_any = False
+    
+    for filename, file_id in flickr_files.items():
+        file_path = os.path.join(raw_dir, filename)
+        needs_download = False
+        
+        if not os.path.exists(file_path):
+            print(f"Flickr file {filename} not found, downloading...")
+            needs_download = True
+        else:
+            # Check if file is corrupted (too small, likely HTML page)
+            file_size = os.path.getsize(file_path)
+            if file_size < expected_sizes[filename] * 0.1:  # Less than 10% of expected size
+                print(f"Flickr file {filename} appears corrupted (size: {file_size}), re-downloading...")
+                needs_download = True
+        
+        if needs_download:
+            try:
+                print(f"Downloading {filename} from Google Drive...")
+                gdown.download(f'https://drive.google.com/uc?id={file_id}', file_path, quiet=False)
+                downloaded_any = True
+                
+                # Verify download
+                new_size = os.path.getsize(file_path)
+                if new_size < expected_sizes[filename] * 0.1:
+                    print(f"Warning: Downloaded {filename} still appears small ({new_size} bytes)")
+                else:
+                    print(f"Successfully downloaded {filename} ({new_size} bytes)")
+                    
+            except Exception as e:
+                print(f"Failed to download {filename}: {e}")
+                print("You may need to download this file manually.")
+    
+    return downloaded_any
+
 def get_project_root():
     """Get the project root directory"""
     # The root is 'inductnode', which is one level up from 'inductnode/src'
@@ -94,7 +243,17 @@ def load_data_train(dataset_name: str):
     elif dataset_name == 'Reddit':
         dataset = Reddit(root=os.path.join(root, 'Reddit'))
     elif dataset_name == 'Flickr':
-        dataset = Flickr(root=os.path.join(root, 'Flickr'))
+        flickr_root = os.path.join(root, 'Flickr')
+        
+        # Try the new universal downloader first, fallback to old method
+        if not ensure_dataset_available('Flickr', root):
+            try:
+                auto_download_flickr_files(flickr_root)
+            except Exception as e:
+                print(f"Warning: Auto-download failed: {e}")
+                print("Proceeding with standard PyTorch Geometric download...")
+        
+        dataset = Flickr(root=flickr_root)
     elif dataset_name == 'AmazonProducts':
         dataset = AmazonProducts(root=os.path.join(root, 'AmazonProducts'))
     elif dataset_name in ['USA','Brazil', 'Europe']:
@@ -441,3 +600,43 @@ def load_mag240m_subset():
     except Exception as e:
         print(f"Error loading MAG240M subset: {e}")
         raise e
+
+def auto_download_complete_dataset():
+    """
+    Automatically download the complete inductnode dataset from Google Drive if not available.
+    """
+    project_root = get_project_root()
+    dataset_dir = os.path.join(project_root, 'dataset')
+    
+    # Check if dataset already exists and is complete
+    if is_dataset_complete(dataset_dir):
+        print("Dataset appears complete.")
+        return True
+    
+    # Get download URL from configuration
+    download_url = get_gdrive_download_url()
+    if not download_url:
+        print("Auto-download not configured yet. Dataset file ID not set.")
+        print("Please run scripts/prepare_dataset_for_upload.py to prepare dataset for upload,")
+        print("then update GDRIVE_DATASET_FILE_ID in src/dataset_config.py.")
+        return False
+    
+    print("Dataset not found or incomplete. Attempting to download from Google Drive...")
+    
+    # Extract file ID from URL
+    file_id = download_url.split('id=')[1] if 'id=' in download_url else None
+    if not file_id:
+        print("Invalid download URL format")
+        return False
+    
+    try:
+        # Use unified download function
+        success = download_and_extract_dataset(file_id, project_root, cleanup=True)
+        if success:
+            print("Dataset download and extraction complete!")
+        return success
+        
+    except Exception as e:
+        print(f"Auto-download failed: {e}")
+        print("Please download the dataset manually using scripts/download_dataset_from_gdrive.py")
+        return False

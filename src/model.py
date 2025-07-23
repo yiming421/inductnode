@@ -311,6 +311,7 @@ class PFNTransformerLayer(nn.Module):
         x_context = self.context_norm2(x_context)
         
         # x_target = self.tar_norm1(x_target)
+        # print(x_target.shape, x_context.shape, flush=True)
         if self.separate_att:
             x_target_att, _ = self.cross_att(x_target, x_context, x_context)
         else:
@@ -330,13 +331,15 @@ class PFNTransformerLayer(nn.Module):
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2, 
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot', 
-                 padding='zero', norm_affine=True, normalize=False):
+                 padding='zero', norm_affine=True, normalize=False, task_type='node_classification'):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
         self.embed_dim = hidden_dim + self.d_label  # Token dimension after concatenation
         self.sim = sim
         self.padding = padding
+        self.task_type = task_type  # 'node_classification' or 'link_prediction'
+        
         if self.padding == 'mlp':
             self.pad_mlp = MLP(
                 in_channels=self.hidden_dim,
@@ -376,6 +379,23 @@ class PFNPredictorNodeCls(nn.Module):
         self.normalize = normalize
     
     def forward(self, data, context_x, target_x, context_y, class_x):
+        """
+        Unified forward pass supporting both node classification and link prediction.
+        
+        For node classification:
+        - data: Graph data with .y and .context_sample attributes
+        - context_x: Context node embeddings
+        - target_x: Target node embeddings  
+        - context_y: Context node labels
+        - class_x: Class prototypes
+        
+        For link prediction:
+        - data: Graph data (may not have .y and .context_sample)
+        - context_x: Context edge embeddings
+        - target_x: Target edge embeddings
+        - context_y: Context edge labels (0: no-link, 1: link)
+        - class_x: Link prototypes [2, hidden_dim]
+        """
         # Step 1: Create context tokens
         class_x_y = class_x[context_y]  # [num_context, hidden_dim]
         context_tokens = torch.cat([context_x, class_x_y], dim=1)  # [num_context, 2*hidden_dim]
@@ -389,35 +409,64 @@ class PFNPredictorNodeCls(nn.Module):
             raise ValueError("Invalid padding type. Choose 'zero' or 'mlp'.")
         target_tokens = torch.cat([target_x, padding], dim=1)
         
-        # Step 4: Prepare for transformer (add sequence dimension)
+        # Step 3: Prepare for transformer (add sequence dimension)
         context_tokens = context_tokens.unsqueeze(1)  # [num_context, 1, 2*hidden_dim]
         target_tokens = target_tokens.unsqueeze(1)    # [num_target, 1, 2*hidden_dim]
         
-        # Step 5: Process through transformer layers
+        # Step 4: Process through transformer layers
         for layer in self.transformer_row:
-            context_tokens, target_tokens = layer(context_tokens, target_tokens)
+           context_tokens, target_tokens = layer(context_tokens, target_tokens)
         
-        # Step 6: Extract refined label embeddings
+        # Step 5: Extract refined label embeddings
         context_tokens = context_tokens.squeeze(1)  # [num_context, 2*hidden_dim]
         target_tokens = target_tokens.squeeze(1)    # [num_target, 2*hidden_dim]
         context_label_emb = context_tokens[:, self.hidden_dim:]  # [num_context, hidden_dim]
         target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
         
-        # Step 7: Compute new class embeddings by pooling refined label embeddings
-        class_emb = process_node_features(
-            context_label_emb,
-            data,
-            degree_normalize=self.degree,
-            attention_pool_module=self.att,
-            mlp_module=self.mlp_pool,
-            normalize=self.normalize
-        )
+        # Step 6: Compute refined class embeddings (different approaches for different tasks)
+        if self.task_type == 'node_classification':
+            # Use process_node_features for node classification
+            class_emb = process_node_features(
+                context_label_emb,
+                data,
+                degree_normalize=self.degree,
+                attention_pool_module=self.att,
+                mlp_module=self.mlp_pool,
+                normalize=self.normalize
+            )
+            data.final_class_h = class_emb
+        elif self.task_type == 'link_prediction':
+            # Use custom pooling for link prediction (no dependency on data.y or data.context_sample)
+            device = target_label_emb.device
+            num_classes = class_x.size(0)  # Should be 2 for link prediction
+            # Use the actual dimension of target_label_emb instead of self.hidden_dim
+            actual_hidden_dim = target_label_emb.size(-1)
+            class_emb = torch.zeros(num_classes, actual_hidden_dim, device=device, dtype=target_label_emb.dtype)
+            
+            # Pool refined embeddings for each class
+            for class_idx in range(num_classes):
+                class_mask = (context_y == class_idx)
+                if class_mask.any():
+                    if self.att is not None:
+                        # Use attention pooling if available
+                        class_embeddings = context_label_emb[class_mask]
+                        class_labels = torch.zeros(class_embeddings.size(0), dtype=torch.long, device=device)
+                        class_emb[class_idx] = self.att(class_embeddings, class_labels, num_classes=1).squeeze(0)
+                    else:
+                        # Use mean pooling as fallback
+                        class_emb[class_idx] = context_label_emb[class_mask].mean(dim=0)
+            
+            # Apply MLP if specified
+            if self.mlp_pool is not None:
+                class_emb = self.mlp_pool(class_emb)
+            
+            # Normalize if specified
+            if self.normalize:
+                class_emb = F.normalize(class_emb, p=2, dim=-1)
+        else:
+            raise ValueError(f"Unknown task_type: {self.task_type}. Choose 'node_classification' or 'link_prediction'.")
 
-        data.final_class_h = class_emb
-
-        # class_emb = F.normalize(class_emb, p=2, dim=1)
-        
-        # Step 8: Compute logits using similarity (dot product)
+        # Step 7: Compute logits using similarity
         if self.sim == 'dot':
             logits = torch.matmul(target_label_emb, class_emb.t())
         elif self.sim == 'cos':
@@ -524,16 +573,14 @@ class AttentionPool(nn.Module):
         self.lin = nn.Linear(in_channels, nhead * out_channels)
         self.att = nn.Linear(out_channels, 1)
 
-    def forward(self, context_h_input, context_y, num_classes=None): # Added num_classes
+    def forward(self, context_h_input, context_y, num_classes=None):
         if num_classes is None:
-            if context_y.numel() == 0: # Handle empty context_y
-                # Output shape should be [0, nhead * in_channels] or handle as error
+            if context_y.numel() == 0:
                 return torch.empty(0, self.nhead * self.in_channels, device=context_h_input.device)
             num_classes = context_y.max().item() + 1
         
-        if context_h_input.numel() == 0: # Handle empty input context_h
+        if context_h_input.numel() == 0:
              return torch.zeros(num_classes, self.nhead * self.in_channels, device=context_h_input.device)
-
 
         context_h_ori_dropout = F.dropout(context_h_input, p=self.dp, training=self.training)
         
@@ -542,19 +589,19 @@ class AttentionPool(nn.Module):
         
         att_score = self.att(context_h_transformed).squeeze(-1)
         att_score = F.leaky_relu(att_score, negative_slope=0.2)
-        att_weights = scatter_softmax(att_score, context_y.long(), dim=0) # [N_ctx, nhead]
         
-        att_h = context_h_transformed * att_weights.unsqueeze(-1)
-
-        pooled_h = torch.zeros(num_classes, self.nhead * self.out_channels, device=context_h_input.device)
-        att_h = att_h.view(-1, self.nhead * self.out_channels)
-
-        pooled_h = torch.scatter_reduce(
-            pooled_h, 0, context_y.long().view(-1, 1).expand(-1, att_h.size(1)), att_h,
-            reduce='sum', include_self=False
-        )
+        from torch_scatter import scatter_softmax, scatter_add
+        att_weights = scatter_softmax(att_score, context_y.long(), dim=0)
         
-        return pooled_h
+        att_h = context_h_ori_dropout.unsqueeze(1) * att_weights.unsqueeze(-1)
+        
+        pooled_h = torch.zeros(num_classes, self.nhead, self.in_channels, 
+                               device=context_h_input.device, dtype=context_h_input.dtype)
+        
+        pooled_h = scatter_add(att_h, context_y, dim=0, out=pooled_h)
+        
+        final_h = pooled_h.view(num_classes, self.nhead * self.in_channels)
+        return final_h
     
 class IdentityProjection(nn.Module):
     """

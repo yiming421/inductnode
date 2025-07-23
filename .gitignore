@@ -131,3 +131,5 @@ slurm-*.out
 # Cache directories
 .cache/
 cache/
+
+*.gz

@@ -1,9 +1,6 @@
 import torch
 import torch.nn.functional as F
 import time
-from .utils import apply_final_pca
-import numpy as np
-from torch_geometric.utils import to_undirected
 from sklearn.decomposition import PCA
 from torch_geometric.utils import negative_sampling
 
@@ -234,21 +231,25 @@ def prepare_link_data(data, split_idx, negative_ratio=1.0):
         row, col, _ = data.adj_t.to_symmetric().coo()
         edge_index = torch.stack([row, col], dim=0)
 
-        # Use PyG's negative_sampling utility
-        neg_train_edge = negative_sampling(
-            edge_index=edge_index, # All known edges
-            num_nodes=data.num_nodes,
-            num_neg_samples=num_neg_train,
-            method='sparse'
-        ).t().to(device)
+        try:
+            # Use PyG's negative_sampling utility
+            neg_train_edge = negative_sampling(
+                edge_index=edge_index, # All known edges
+                num_nodes=data.num_nodes,
+                num_neg_samples=num_neg_train,
+                method='sparse'
+            ).t().to(device)
 
-        train_edges = torch.cat([pos_train_edge, neg_train_edge], dim=0)
-        train_labels = torch.cat([
-            torch.ones(num_pos_train, device=device),
-            torch.zeros(neg_train_edge.size(0), device=device)
-        ], dim=0)
-        
-        result['train'] = {'edge_pairs': train_edges, 'labels': train_labels}
+            train_edges = torch.cat([pos_train_edge, neg_train_edge], dim=0)
+            train_labels = torch.cat([
+                torch.ones(num_pos_train, device=device, dtype=torch.long),
+                torch.zeros(neg_train_edge.size(0), device=device, dtype=torch.long)
+            ], dim=0)
+            
+            result['train'] = {'edge_pairs': train_edges, 'labels': train_labels}
+        except Exception as e:
+            print(f"ERROR in prepare_link_data during negative sampling: {e}")
+            raise e
 
     # Validation and Test splits: use provided negative edges
     for split in ['valid', 'test']:
@@ -258,8 +259,8 @@ def prepare_link_data(data, split_idx, negative_ratio=1.0):
             
             edges = torch.cat([pos_edge, neg_edge], dim=0)
             labels = torch.cat([
-                torch.ones(pos_edge.size(0), device=device),
-                torch.zeros(neg_edge.size(0), device=device)
+                torch.ones(pos_edge.size(0), device=device, dtype=torch.long),
+                torch.zeros(neg_edge.size(0), device=device, dtype=torch.long)
             ], dim=0)
             
             result[split] = {'edge_pairs': edges, 'labels': labels}
@@ -267,7 +268,7 @@ def prepare_link_data(data, split_idx, negative_ratio=1.0):
     return result
 
 
-def select_link_context(train_link_data, k, context_neg_ratio=1.0, remove_from_train=True):
+def select_link_context(train_link_data, k, context_neg_ratio=1.0, remove_from_train=False):
     """
     Select a balanced subset of positive and negative edges for the context set.
     """
@@ -279,10 +280,20 @@ def select_link_context(train_link_data, k, context_neg_ratio=1.0, remove_from_t
 
     # Sample k positive edges
     num_pos_to_select = min(k, len(pos_indices))
+    if num_pos_to_select == 0:
+        print(f"WARNING: No positive edges available for context selection!")
+        return {'edge_pairs': torch.empty((0, 2), dtype=edge_pairs.dtype, device=edge_pairs.device),
+                'labels': torch.empty((0,), dtype=labels.dtype, device=labels.device)}, torch.ones_like(labels, dtype=torch.bool)
+    
     selected_pos_indices = pos_indices[torch.randperm(len(pos_indices))[:num_pos_to_select]]
 
     # Sample k * ratio negative edges
     num_neg_to_select = min(int(k * context_neg_ratio), len(neg_indices))
+    if num_neg_to_select == 0:
+        print(f"WARNING: No negative edges available for context selection!")
+        return {'edge_pairs': torch.empty((0, 2), dtype=edge_pairs.dtype, device=edge_pairs.device),
+                'labels': torch.empty((0,), dtype=labels.dtype, device=labels.device)}, torch.ones_like(labels, dtype=torch.bool)
+    
     selected_neg_indices = neg_indices[torch.randperm(len(neg_indices))[:num_neg_to_select]]
 
     context_indices = torch.cat([selected_pos_indices, selected_neg_indices])

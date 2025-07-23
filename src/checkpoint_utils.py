@@ -277,10 +277,19 @@ def create_predictor_from_config(args, att, mlp):
     from .model import PFNPredictorNodeCls
     
     if args.predictor == 'PFN':
+        # Determine task type based on script or configuration
+        # For link prediction, we use 'link_prediction', otherwise 'node_classification'
+        task_type = getattr(args, 'task_type', 'node_classification')
+        if not hasattr(args, 'task_type'):
+            # Try to infer from the script or configuration
+            # If this is called from link prediction script, set task_type appropriately
+            task_type = 'link_prediction'  # Default for inductnode link prediction
+
         return PFNPredictorNodeCls(
             args.hidden, args.nhead, args.transformer_layers, args.mlp_layers, args.dp, args.norm,
             separate_att=args.seperate, degree=args.degree, att=att, mlp=mlp, sim=args.sim,
-            padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h
+            padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
+            task_type=task_type
         )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented.")
