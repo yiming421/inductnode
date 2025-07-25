@@ -51,6 +51,9 @@ def run_ddp_lp(rank, world_size, args, results_dict):
         analysis_interval=args.analysis_interval
     )
     
+    # Initialize process monitor for both DDP and single GPU modes
+    process_monitor = None
+    
     if world_size > 1:
         setup_ddp(rank, world_size, args.port)
         if rank == 0:
@@ -325,17 +328,13 @@ def run_ddp_lp(rank, world_size, args, results_dict):
             try:
                 process_link_data(data, args, rank=rank)
                 
-                # print("[DEBUG]: Preparing test dataset:", data.name, flush=True)
                 link_data_all = prepare_link_data(data, split_idx, args.train_neg_ratio)
-                # print("[DEBUG]: Test dataset prepared:", data.name, flush=True)
                 
                 # --- TEST CONTEXT SELECTION SYNCHRONIZATION ---
                 # Also synchronize context selection for test datasets to ensure consistency
                 if world_size > 1:
                     if rank == 0:
-                        print(f"[DEBUG] Rank 0: Selecting context for test dataset {data.name}")
                         context_data, _ = select_link_context(link_data_all['train'], args.context_k, args.context_neg_ratio, remove_from_train=False)
-                        print(f"[DEBUG] Rank 0: Context for test dataset {data.name} selected", flush=True)
                         objects_to_broadcast = [context_data]
                     else:
                         objects_to_broadcast = [None]
@@ -394,15 +393,12 @@ def run_ddp_lp(rank, world_size, args, results_dict):
     logger.training_start(args.epochs)
     
     for epoch in range(args.epochs):
-        print(f"[DEBUG] Rank {rank}: Starting epoch {epoch}")
         st = time.time()
         
         # Add barrier to ensure all processes start epoch together
         if world_size > 1:
-            print(f"[DEBUG] Rank {rank}: Waiting at epoch {epoch} start barrier")
             try:
                 dist.barrier()
-                print(f"[DEBUG] Rank {rank}: Passed epoch {epoch} start barrier")
             except Exception as e:
                 print(f"[ERROR] Rank {rank}: Exception at epoch {epoch} start barrier: {e}")
                 raise
@@ -412,16 +408,12 @@ def run_ddp_lp(rank, world_size, args, results_dict):
         train_dataset_count = 0
         
         for i, (data, split_idx) in enumerate(zip(train_data_list, train_split_idx_list)):
-            print(f"[DEBUG] Rank {rank}: Processing dataset {i} ({data.name}) in epoch {epoch}")
-            
             link_data_all = train_link_data_all[i]
             context_data = train_context_data[i]
             train_mask = train_masks[i]
             
             if 'train' in link_data_all and link_data_all['train']['edge_pairs'].size(0) > 0:
                 try:
-                    print(f"[DEBUG] Rank {rank}: About to call train_link_prediction for {data.name}")
-                    
                     # Standard training step
                     train_loss = train_link_prediction(
                         model, predictor, data, link_data_all['train'], context_data, train_mask,
@@ -430,13 +422,11 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                         epoch=epoch, mask_target_edges=args.mask_target_edges, degree=args.degree
                     )
                     
-                    print(f"[DEBUG] Rank {rank}: Completed train_link_prediction for {data.name}, loss={train_loss}")
-                    
                     total_train_loss += train_loss
                     train_dataset_count += 1
                     
                     # Update process monitor activity
-                    if 'process_monitor' in locals():
+                    if process_monitor is not None:
                         process_monitor.update_activity()
                         
                 except RuntimeError as e:
@@ -455,16 +445,13 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                     print(f"[ERROR] Rank {rank}: Traceback: {traceback.format_exc()}")
                     raise  # Re-raise to stop execution and prevent hanging
             else:
-                print(f"[DEBUG] Rank {rank}: Skipping dataset {data.name} - no training data")
+                if rank == 0:
+                    logger.warning(f"Skipping dataset {data.name} - no training data")
 
-        print(f"[DEBUG] Rank {rank}: Completed all training datasets for epoch {epoch}")
-        
         # Add barrier after training to ensure all processes finish training together
         if world_size > 1:
-            print(f"[DEBUG] Rank {rank}: Waiting at epoch {epoch} post-training barrier")
             try:
                 dist.barrier()
-                print(f"[DEBUG] Rank {rank}: Passed epoch {epoch} post-training barrier")
             except Exception as e:
                 print(f"[ERROR] Rank {rank}: Exception at epoch {epoch} post-training barrier: {e}")
                 raise
@@ -534,8 +521,6 @@ def run_ddp_lp(rank, world_size, args, results_dict):
         # --- Periodic Test Evaluation for Monitoring (every eval_interval epochs) ---
         avg_test_metric = 0.0
         if rank == 0 and epoch % args.eval_interval == 0 and len(test_data_list_periodic) > 0:
-            print(f"[DEBUG] Rank 0: Starting test evaluation for epoch {epoch}")
-            
             try:
                 total_test_metric = 0
                 test_dataset_count = 0
@@ -543,16 +528,12 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                 logger.training_test_start(epoch)
                 
                 for i, (data, link_data_all, context_data) in enumerate(zip(test_data_list_periodic, test_link_data_all_periodic, test_context_data_periodic)):
-                    print(f"[DEBUG] Processing test dataset {i+1}/{len(test_data_list_periodic)}: {data.name}")
-                    
                     try:
-                        print(f"[DEBUG] About to evaluate {data.name}...")
                         test_results_dict = evaluate_link_prediction(
                             model, predictor, data, link_data_all['test'], context_data, args.test_batch_size,
                             att, mlp, projector, identity_projection, rank, args.normalize_class_h,
                             degree=args.degree, k_values=[20, 50, 100]
                         )
-                        print(f"[DEBUG] Evaluation completed for {data.name}")
                         
                         # Use the default metric for this dataset
                         if 'default_metric' in test_results_dict:
@@ -580,8 +561,6 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                     avg_test_metric = total_test_metric / test_dataset_count
                     logger.training_test_result(epoch, avg_test_metric)
                     
-                print(f"[DEBUG] Test evaluation completed for epoch {epoch}")
-                
             except Exception as e:
                 print(f"[ERROR] Fatal exception during test evaluation: {e}")
                 import traceback
@@ -590,10 +569,8 @@ def run_ddp_lp(rank, world_size, args, results_dict):
             
         # Add barrier after test evaluation to ensure rank 0 finishes before continuing
         if world_size > 1:
-            print(f"[DEBUG] Rank {rank}: Waiting at epoch {epoch} post-test-evaluation barrier")
             try:
                 dist.barrier()
-                print(f"[DEBUG] Rank {rank}: Passed epoch {epoch} post-test-evaluation barrier")
             except Exception as e:
                 print(f"[ERROR] Rank {rank}: Exception at epoch {epoch} post-test-evaluation barrier: {e}")
                 raise
@@ -611,7 +588,6 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                 
                 # Print detailed monitoring every analysis_interval epochs  
                 if epoch % args.analysis_interval == 0:
-                    print(f"[DEBUG] Rank {rank}: Analysis interval check - epoch {epoch}, analysis_interval {args.analysis_interval}")
                     
                     if args.log_level in [LogLevel.DEBUG, LogLevel.VERBOSE]:
                         gpu_monitor.print_memory_summary()
@@ -620,18 +596,12 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                     
                     # Print waste analysis summary - ONLY ON RANK 0 to prevent DDP hanging!
                     if rank == 0 and epoch > 0:  # Only rank 0 and skip epoch 0
-                        print(f"[DEBUG] Rank 0: About to call waste_training_summary for epoch {epoch}")
                         try:
                             logger.waste_training_summary(epoch, waste_analyzer)
-                            print(f"[DEBUG] Rank 0: waste_training_summary completed successfully")
                         except Exception as e:
                             print(f"[ERROR] Rank 0: Exception in waste_training_summary: {e}")
                             import traceback
                             print(f"[ERROR] Traceback: {traceback.format_exc()}")
-                    elif rank == 0 and epoch == 0:
-                        print(f"[DEBUG] Rank 0: Skipping waste analysis for epoch 0")
-                    elif rank != 0:
-                        print(f"[DEBUG] Rank {rank}: Skipping waste analysis (not rank 0)")
             
             # Main epoch logging with configurable verbosity
             logger.training_epoch_summary({
@@ -801,7 +771,8 @@ def run_ddp_lp(rank, world_size, args, results_dict):
         results_dict[rank] = test_results
 
     # Stop monitoring and print final summary
-    process_monitor.stop_monitoring()
+    if process_monitor is not None:
+        process_monitor.stop_monitoring()
     gpu_monitor.stop_monitoring()
     
     if rank == 0:
@@ -895,9 +866,73 @@ def main():
         for run in range(args.runs):
             print(f"\n🏃 Run {run + 1}/{args.runs}")
             results_dict = {0: None} # Simple dict for single-process
-            run_ddp_lp(0, 1, args, results_dict)
-            if results_dict[0] is not None:
-                all_runs_results.append(results_dict[0])
+            
+            try:
+                run_ddp_lp(0, 1, args, results_dict)
+                if results_dict[0] is not None:
+                    all_runs_results.append(results_dict[0])
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"🚨 OOM Error in Run {run + 1}: {e}")
+                    print("📊 Reporting zero metrics to W&B to continue sweep...")
+                    
+                    # Initialize wandb if not already done (for sweep mode)
+                    if not wandb.run:
+                        wandb.init(project='inductlink', config=args)
+                    
+                    # Report zero metrics for sweep optimization
+                    oom_metrics = {
+                        'avg_test_metric': 0.0,
+                        'avg_valid_metric': 0.0,
+                        'avg_train_loss': float('inf'),
+                        'oom_error': True,
+                        'oom_run': run + 1,
+                        'batch_size': args.batch_size,
+                        'test_batch_size': args.test_batch_size,
+                        'hidden': args.hidden,
+                        'final_test_metric_average': 0.0
+                    }
+                    
+                    # Add individual dataset zero metrics
+                    test_dataset_names = args.test_dataset.split(',')
+                    for dataset_name in test_dataset_names:
+                        oom_metrics[f'{dataset_name}_test_hits_100_mean'] = 0.0
+                        oom_metrics[f'{dataset_name}_test_hits_100_std'] = 0.0
+                        oom_metrics[f'{dataset_name}_test_hits_100_runs'] = 0
+                    
+                    wandb.log(oom_metrics)
+                    print(f"✅ Zero metrics logged to W&B for OOM in run {run + 1}")
+                    
+                    # Exit immediately instead of continuing to next run
+                    print(f"🛑 Exiting due to OOM error in run {run + 1}")
+                    return
+                else:
+                    # Re-raise non-OOM errors
+                    raise e
+            except Exception as e:
+                print(f"🚨 Unexpected error in Run {run + 1}: {e}")
+                import traceback
+                print(f"Traceback: {traceback.format_exc()}")
+                
+                # For sweeps, still report zero metrics for any fatal error
+                if wandb.run or hasattr(args, 'sweep'):
+                    if not wandb.run:
+                        wandb.init(project='inductlink', config=args)
+                    
+                    error_metrics = {
+                        'avg_test_metric': 0.0,
+                        'avg_valid_metric': 0.0,
+                        'avg_train_loss': float('inf'),
+                        'fatal_error': True,
+                        'error_run': run + 1,
+                        'final_test_metric_average': 0.0
+                    }
+                    wandb.log(error_metrics)
+                    print(f"✅ Zero metrics logged to W&B for fatal error in run {run + 1}")
+                
+                # Exit immediately instead of continuing to next run
+                print(f"🛑 Exiting due to fatal error in run {run + 1}")
+                return
     else:
         print(f"Using DistributedDataParallel with {world_size} GPUs (Physical GPUs {gpu_ids})")
         for run in range(args.runs):
@@ -945,6 +980,8 @@ def main():
             return
 
         final_log = {}
+        all_dataset_averages = []  # Collect averages for overall sweep metric
+        
         for name, data in aggregated_results.items():
             if len(data['test_metric']) == 0:
                 print(f"Warning: No valid results for dataset {name}")
@@ -961,6 +998,15 @@ def main():
             final_log[f'{name}_test_{clean_metric_name}_mean'] = avg_test
             final_log[f'{name}_test_{clean_metric_name}_std'] = std_test
             final_log[f'{name}_test_{clean_metric_name}_runs'] = len(data['test_metric'])
+            
+            # Collect for overall average
+            all_dataset_averages.append(avg_test)
+        
+        # Add overall sweep optimization metric (average across all test datasets and runs)
+        if len(all_dataset_averages) > 0:
+            final_sweep_metric = np.mean(all_dataset_averages)
+            final_log['final_test_metric_average'] = final_sweep_metric
+            print(f"\n🎯 Final Sweep Metric (avg across all datasets): {final_sweep_metric:.4f}")
         
         if wandb.run is not None and len(final_log) > 0:
             wandb.log(final_log)

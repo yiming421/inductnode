@@ -147,27 +147,21 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         
         # The dataloader iterates over indices of the FULL training set
         indices = torch.arange(edge_pairs.size(0), device=device)
-        
-        print(f"[DEBUG] Rank {rank}: Creating DataLoader for {edge_pairs.size(0)} edges")
     
         # Use DistributedSampler if in DDP mode
         sampler = None
         if dist.is_initialized() and dist.get_world_size() > 1:
-            print(f"[DEBUG] Rank {rank}: Creating DistributedSampler for epoch {epoch}")
             try:
                 sampler = DistributedSampler(indices.cpu(), shuffle=True)
                 sampler.set_epoch(epoch)
-                print(f"[DEBUG] Rank {rank}: DistributedSampler created successfully")
             except Exception as e:
                 print(f"[ERROR] Rank {rank}: Failed to create DistributedSampler: {e}")
                 raise
 
         # Standard DataLoader with DistributedSampler
-        print(f"[DEBUG] Rank {rank}: Creating DataLoader with batch_size={batch_size}")
         try:
             dataloader = DataLoader(indices.cpu(), batch_size=batch_size, sampler=sampler, 
                                    shuffle=(sampler is None))
-            print(f"[DEBUG] Rank {rank}: DataLoader created successfully")
         except Exception as e:
             print(f"[ERROR] Rank {rank}: Failed to create DataLoader: {e}")
             raise
@@ -185,10 +179,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         total_loss = 0
         batch_count = 0
         
-        print(f"[DEBUG] Rank {rank}: Starting DataLoader iteration")
-        
         for batch_idx in dataloader:
-            print(f'[DEBUG] Rank {rank}: Starting batch {batch_count}')
             st = time.time()
             try:
                 # Convert batch indices back to device
@@ -257,16 +248,13 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
 
                 # Get link prototypes (binary class embeddings)
                 link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
-                # print(f"[DEBUG] Rank {rank}: Link prototypes shape: {link_prototypes.shape}", flush=True)
                 if link_prototypes is None:
                     if rank == 0:
                         print("Warning: Could not form link prototypes. Skipping batch.")
                     continue
 
-
                 # Use unified PFNPredictorNodeCls for link prediction
                 scores = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), link_prototypes)
-                # scores = target_edge_embeds @ link_prototypes.t()  # Directly compute scores
                 
                 # Use the train_mask to ensure loss is only calculated on non-context edges
                 # Make sure the mask is properly aligned with batch indices
@@ -279,7 +267,6 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     mask_for_loss = train_mask[batch_idx]
                 
                 # Validate that we have samples to compute loss on
-                # print(f"[DEBUG] Rank {rank}: Mask for loss has {mask_for_loss.sum()} valid samples", flush=True)
                 if mask_for_loss.sum() == 0:
                     if rank == 0:
                         print(f"Warning: No valid samples in batch for loss computation, skipping...")
@@ -299,24 +286,14 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     
                 loss = nll_loss + orthogonal_push * orthogonal_loss
                 
-                print(f"[DEBUG] Rank {rank}: About to call loss.backward() for batch {batch_count}")
                 try:
-                    # Check if DDP is initialized and world size
-                    if dist.is_initialized():
-                        world_size = dist.get_world_size()
-                        print(f"[DEBUG] Rank {rank}: DDP is initialized, world_size={world_size}")
-                    else:
-                        print(f"[DEBUG] Rank {rank}: DDP not initialized")
-                    
                     loss.backward()
-                    print(f"[DEBUG] Rank {rank}: Successfully completed loss.backward() for batch {batch_count}")
                 except Exception as e:
                     print(f"[ERROR] Rank {rank}: Exception during loss.backward(): {e}")
                     import traceback
                     print(f"[ERROR] Rank {rank}: Traceback: {traceback.format_exc()}")
                 finally:
                     total_loss += loss.item()
-                    print(f"[DEBUG] Rank {rank}: Backward pass completed for batch {batch_count}")
                 
                 # Update weights
                 if clip_grad > 0:
@@ -328,11 +305,10 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     if identity_projection: torch.nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
                 
                 optimizer.step()
-                print(f"[DEBUG] Rank {rank}: Optimizer step completed for batch {batch_count}")
                 batch_count += 1
-                print(f'[DEBUG] Rank {rank}: Completed batch {batch_count}, time taken: {time.time() - st:.2f}s')
                     
-                print(f'Rank: {rank}, Batch: {batch_count}, Batch time: {time.time() - st:.2f}, Loss: {loss.item():.4f}', flush=True)
+                if rank == 0 and batch_count % 100 == 0:  # Only print every 100 batches
+                    print(f'Rank: {rank}, Batch: {batch_count}, Batch time: {time.time() - st:.2f}, Loss: {loss.item():.4f}', flush=True)
 
             except Exception as e:
                 print(f"[ERROR] Rank {rank}: Exception during training batch {batch_count}: {e}")
@@ -342,7 +318,8 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     print(f"Error in training batch: {e}")
                 continue
 
-        print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {total_loss:.4f}, Batch count: {batch_count}")
+        if rank == 0:
+            print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {total_loss:.4f}, Batch count: {batch_count}")
         
         # Final synchronization to ensure all processes complete training
         if dist.is_initialized() and dist.get_world_size() > 1:

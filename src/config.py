@@ -177,9 +177,9 @@ def parse_link_prediction_args():
                         help='If True, target edges are masked from the graph during message passing.')
     
     # System arguments
-    parser.add_argument('--gpu', type=str, default='auto',
+    parser.add_argument('--gpu', type=str, default='0',
                         help='GPU specification: "auto" for all GPUs, single GPU ID (e.g., "0"), or comma-separated list (e.g., "0,1,2,3")')
-    parser.add_argument('--use_ddp', type=str2bool, default=True,
+    parser.add_argument('--use_ddp', type=str2bool, default=False,
                         help='Use distributed training')
     parser.add_argument('--port', type=int, default=12356,
                         help='Port for DDP')
@@ -211,7 +211,7 @@ def parse_link_prediction_args():
                         help='Use identity projection for link prediction')
     parser.add_argument('--projection_small_dim', type=int, default=128,
                         help='Small dimension for identity projection')
-    parser.add_argument('--projection_large_dim', type=int, default=128,
+    parser.add_argument('--projection_large_dim', type=int, default=256,
                         help='Large dimension for identity projection')
     
     # Checkpointing arguments
