@@ -1,11 +1,12 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from ogb.linkproppred import Evaluator
 from torch_sparse import SparseTensor
 import copy
+import time
 
 def get_node_embeddings(model, data, projector=None, identity_projection=None):
     """
@@ -98,183 +99,266 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
     """
     Train link prediction using the PFN methodology.
     """
-    model.train()
-    predictor.train()
-    if att: att.train()
-    if mlp: mlp.train()
-    if projector: projector.train()
-    if identity_projection: identity_projection.train()
-    device = data.x.device
-
-    edge_pairs = train_edges['edge_pairs'].to(device)
-    labels = train_edges['labels'].to(device)
-
-    # Validate input data
-    if edge_pairs.size(0) == 0:
-        if rank == 0:
-            print(f"Warning: No training edges provided for dataset")
-        return 0.0
+    import signal
+    import sys
     
-    # Validate context data before proceeding
-    if (context_edges['edge_pairs'].size(0) == 0 or 
-        torch.sum(context_edges['labels'] == 1) == 0 or 
-        torch.sum(context_edges['labels'] == 0) == 0):
-        if rank == 0:
-            print(f"Warning: Insufficient context data (need both positive and negative examples). "
-                  f"Context edges: {context_edges['edge_pairs'].size(0)}, "
-                  f"Pos examples: {torch.sum(context_edges['labels'] == 1)}, "
-                  f"Neg examples: {torch.sum(context_edges['labels'] == 0)}")
-        return 0.0
+    # Set up timeout handler for debugging deadlocks
+    def timeout_handler(signum, frame):
+        print(f"[TIMEOUT] Rank {rank}: Training function timed out! Possible deadlock detected.")
+        print(f"[TIMEOUT] Rank {rank}: Current frame: {frame}")
+        import traceback
+        traceback.print_stack(frame)
+        # Don't exit immediately, just log
     
-    # The dataloader iterates over indices of the FULL training set
-    indices = torch.arange(edge_pairs.size(0), device=device)
+    # Set a 120 second timeout for training function
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(120)
     
-    # Use DistributedSampler if in DDP mode
-    sampler = None
-    if dist.is_initialized() and dist.get_world_size() > 1:
-        sampler = DistributedSampler(indices.cpu(), shuffle=True)
-        sampler.set_epoch(epoch)
+    try:
+        print(f"Rank {rank}: Starting link prediction training for epoch {epoch}")
+        model.train()
+        predictor.train()
+        if att: att.train()
+        if mlp: mlp.train()
+        if projector: projector.train()
+        if identity_projection: identity_projection.train()
+        device = data.x.device
+        train_mask = train_mask.to(device)
 
-    dataloader = DataLoader(indices.cpu(), batch_size=batch_size, sampler=sampler, shuffle=(sampler is None))
-    
-    # Correctly pre-filter for positive edges, as in the reference
-    pos_train_mask = (labels == 1)
-    pos_train_edges = edge_pairs[pos_train_mask]
-    # The mask should be on the positive edges only
-    pos_adjmask = torch.ones(pos_train_edges.size(0), dtype=torch.bool, device=device)
-    
-    # Map original indices to their position in the positive-only list
-    pos_original_indices = torch.where(pos_train_mask)[0]
-    pos_indices_map = {orig_idx.item(): pos_idx for pos_idx, orig_idx in enumerate(pos_original_indices)}
-    
-    total_loss = 0
-    batch_count = 0
-    
-    for batch_idx in dataloader:
-        try:
-            # Convert batch indices back to device
-            batch_idx = batch_idx.to(device)
-            optimizer.zero_grad()
+        edge_pairs = train_edges['edge_pairs'].to(device)
+        labels = train_edges['labels'].to(device)
 
-            # --- Optional: Masking Target Edges ---
-            adj_for_gnn = data.adj_t
-            if mask_target_edges:
-                # Get batch labels and find positive edges in current batch
-                batch_labels_check = labels[batch_idx]
-                batch_pos_mask = batch_labels_check == 1
-                
-                if batch_pos_mask.any():
-                    # Get the actual batch indices that correspond to positive edges
-                    batch_pos_indices = batch_idx[batch_pos_mask]
-                    
-                    # Map these batch indices to positions in the pos_train_edges tensor
-                    indices_to_mask_in_pos_list = []
-                    for batch_pos_idx in batch_pos_indices:
-                        if batch_pos_idx.item() in pos_indices_map:
-                            indices_to_mask_in_pos_list.append(pos_indices_map[batch_pos_idx.item()])
-                    
-                    if indices_to_mask_in_pos_list:
-                        pos_adjmask[indices_to_mask_in_pos_list] = False
-                        
-                        # Build graph from all positive edges *not* in the current batch
-                        edge = pos_train_edges[pos_adjmask].t()
-                        adj_for_gnn = SparseTensor.from_edge_index(edge, sparse_sizes=(data.num_nodes, data.num_nodes)).to(device)
-                        adj_for_gnn = adj_for_gnn.to_symmetric().coalesce()
-
-                        # Reset the mask for the next iteration
-                        pos_adjmask[indices_to_mask_in_pos_list] = True
-
-            # Recompute embeddings and prototypes for each batch to maintain the computation graph
-            data_for_gnn = copy.copy(data)
-            data_for_gnn.adj_t = adj_for_gnn
-            node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection)
-            #node_embeddings = torch.randn_like(data_for_gnn.x, device=device)
-            #node_embeddings.requires_grad = True
-            
-            src_x = node_embeddings[edge_pairs[batch_idx, 0]]
-            dst_x = node_embeddings[edge_pairs[batch_idx, 1]]
-            link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
-            '''scores = target_x @ link_prototypes.t()  # Directly compute scores
-            loss = F.cross_entropy(scores, labels[batch_idx].long())'''
-
-            # -----------------------------------------
-
-            # Get context edge embeddings for PFN predictor
-            context_edge_pairs = context_edges['edge_pairs'].to(device)
-            context_labels = context_edges['labels'].to(device)
-            context_src_embeds = node_embeddings[context_edge_pairs[:, 0]]
-            context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
-            context_edge_embeds = context_src_embeds * context_dst_embeds
-
-            batch_labels = labels[batch_idx]
-            batch_edges = edge_pairs[batch_idx]
-
-            # Get embeddings for target edges
-            src_embeds = node_embeddings[batch_edges[:, 0]]
-            dst_embeds = node_embeddings[batch_edges[:, 1]]
-            target_edge_embeds = src_embeds * dst_embeds
-
-            # Get link prototypes (binary class embeddings)
-            link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
-            if link_prototypes is None:
-                if rank == 0:
-                    print("Warning: Could not form link prototypes. Skipping batch.")
-                continue
-
-            # Use unified PFNPredictorNodeCls for link prediction
-            scores = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), link_prototypes)
-            # scores = target_edge_embeds @ link_prototypes.t()  # Directly compute scores
-            
-            # Use the train_mask to ensure loss is only calculated on non-context edges
-            # Make sure the mask is properly aligned with batch indices
-            if train_mask.size(0) != edge_pairs.size(0):
-                if rank == 0:
-                    print(f"Warning: train_mask size {train_mask.size(0)} doesn't match edge_pairs size {edge_pairs.size(0)}")
-                # Create a default mask that includes all edges in the batch
-                mask_for_loss = torch.ones(batch_idx.size(0), dtype=torch.bool, device=device)
-            else:
-                mask_for_loss = train_mask[batch_idx]
-            
-            # Validate that we have samples to compute loss on
-            if mask_for_loss.sum() == 0:
-                if rank == 0:
-                    print(f"Warning: No valid samples in batch for loss computation, skipping...")
-                continue
-            
-            # Use CrossEntropyLoss for multi-class classification (link vs no-link)
-            nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
-            
-            # Compute optional orthogonal loss on prototypes
-            if orthogonal_push > 0:
-                proto_norm = F.normalize(link_prototypes, p=2, dim=1)
-                proto_matrix = proto_norm @ proto_norm.T
-                mask = ~torch.eye(proto_matrix.size(0), device=device, dtype=torch.bool)
-                orthogonal_loss = torch.sum(proto_matrix[mask]**2)
-            else:
-                orthogonal_loss = torch.tensor(0.0, device=device)
-                
-            loss = nll_loss + orthogonal_push * orthogonal_loss
-            
-            loss.backward()
-            
-            if clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-                torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
-                if att: torch.nn.utils.clip_grad_norm_(att.parameters(), clip_grad)
-                if mlp: torch.nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad)
-                if projector: torch.nn.utils.clip_grad_norm_(projector.parameters(), clip_grad)
-                if identity_projection: torch.nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
-            
-            optimizer.step()
-            total_loss += loss.item()
-            batch_count += 1
-            
-        except Exception as e:
+        # Validate input data
+        if edge_pairs.size(0) == 0:
             if rank == 0:
-                print(f"Error in training batch: {e}")
-            continue
+                print(f"Warning: No training edges provided for dataset")
+            return 0.0
         
-    return total_loss / max(batch_count, 1)
+        # Validate context data before proceeding
+        if (context_edges['edge_pairs'].size(0) == 0 or 
+            torch.sum(context_edges['labels'] == 1) == 0 or 
+            torch.sum(context_edges['labels'] == 0) == 0):
+            if rank == 0:
+                print(f"Warning: Insufficient context data (need both positive and negative examples). "
+                      f"Context edges: {context_edges['edge_pairs'].size(0)}, "
+                      f"Pos examples: {torch.sum(context_edges['labels'] == 1)}, "
+                      f"Neg examples: {torch.sum(context_edges['labels'] == 0)}")
+            return 0.0
+        
+        # The dataloader iterates over indices of the FULL training set
+        indices = torch.arange(edge_pairs.size(0), device=device)
+        
+        print(f"[DEBUG] Rank {rank}: Creating DataLoader for {edge_pairs.size(0)} edges")
+    
+        # Use DistributedSampler if in DDP mode
+        sampler = None
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            print(f"[DEBUG] Rank {rank}: Creating DistributedSampler for epoch {epoch}")
+            try:
+                sampler = DistributedSampler(indices.cpu(), shuffle=True)
+                sampler.set_epoch(epoch)
+                print(f"[DEBUG] Rank {rank}: DistributedSampler created successfully")
+            except Exception as e:
+                print(f"[ERROR] Rank {rank}: Failed to create DistributedSampler: {e}")
+                raise
+
+        # Standard DataLoader with DistributedSampler
+        print(f"[DEBUG] Rank {rank}: Creating DataLoader with batch_size={batch_size}")
+        try:
+            dataloader = DataLoader(indices.cpu(), batch_size=batch_size, sampler=sampler, 
+                                   shuffle=(sampler is None))
+            print(f"[DEBUG] Rank {rank}: DataLoader created successfully")
+        except Exception as e:
+            print(f"[ERROR] Rank {rank}: Failed to create DataLoader: {e}")
+            raise
+
+        # Correctly pre-filter for positive edges, as in the reference
+        pos_train_mask = (labels == 1)
+        pos_train_edges = edge_pairs[pos_train_mask]
+        # The mask should be on the positive edges only
+        pos_adjmask = torch.ones(pos_train_edges.size(0), dtype=torch.bool, device=device)
+        
+        # Map original indices to their position in the positive-only list
+        pos_original_indices = torch.where(pos_train_mask)[0]
+        pos_indices_map = {orig_idx.item(): pos_idx for pos_idx, orig_idx in enumerate(pos_original_indices)}
+        
+        total_loss = 0
+        batch_count = 0
+        
+        print(f"[DEBUG] Rank {rank}: Starting DataLoader iteration")
+        
+        for batch_idx in dataloader:
+            print(f'[DEBUG] Rank {rank}: Starting batch {batch_count}')
+            st = time.time()
+            try:
+                # Convert batch indices back to device
+                batch_idx = batch_idx.to(device)
+                
+                # Zero gradients
+                optimizer.zero_grad()
+
+                # --- Optional: Masking Target Edges ---
+                adj_for_gnn = data.adj_t
+                if mask_target_edges:
+                    # Get batch labels and find positive edges in current batch
+                    batch_labels_check = labels[batch_idx]
+                    batch_pos_mask = batch_labels_check == 1
+                    
+                    if batch_pos_mask.any():
+                        # Get the actual batch indices that correspond to positive edges
+                        batch_pos_indices = batch_idx[batch_pos_mask]
+                        
+                        # Map these batch indices to positions in the pos_train_edges tensor
+                        indices_to_mask_in_pos_list = []
+                        for batch_pos_idx in batch_pos_indices:
+                            if batch_pos_idx.item() in pos_indices_map:
+                                indices_to_mask_in_pos_list.append(pos_indices_map[batch_pos_idx.item()])
+                        
+                        if indices_to_mask_in_pos_list:
+                            pos_adjmask[indices_to_mask_in_pos_list] = False
+                            
+                            # Build graph from all positive edges *not* in the current batch
+                            edge = pos_train_edges[pos_adjmask].t()
+                            adj_for_gnn = SparseTensor.from_edge_index(edge, sparse_sizes=(data.num_nodes, data.num_nodes)).to(device)
+                            adj_for_gnn = adj_for_gnn.to_symmetric().coalesce()
+
+                            # Reset the mask for the next iteration
+                            pos_adjmask[indices_to_mask_in_pos_list] = True
+
+                # Recompute embeddings and prototypes for each batch to maintain the computation graph
+                data_for_gnn = copy.copy(data)
+                data_for_gnn.adj_t = adj_for_gnn
+                node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection)
+                #node_embeddings = torch.randn_like(data_for_gnn.x, device=device)
+                #node_embeddings.requires_grad = True
+                
+                # src_x = node_embeddings[edge_pairs[batch_idx, 0]]
+                # dst_x = node_embeddings[edge_pairs[batch_idx, 1]]
+                link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
+                '''scores = target_x @ link_prototypes.t()  # Directly compute scores
+                loss = F.cross_entropy(scores, labels[batch_idx].long())'''
+
+                # -----------------------------------------
+
+                # Get context edge embeddings for PFN predictor
+                context_edge_pairs = context_edges['edge_pairs'].to(device)
+                context_labels = context_edges['labels'].to(device)
+                context_src_embeds = node_embeddings[context_edge_pairs[:, 0]]
+                context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
+                context_edge_embeds = context_src_embeds * context_dst_embeds
+
+                batch_labels = labels[batch_idx]
+                batch_edges = edge_pairs[batch_idx]
+
+                # Get embeddings for target edges
+                src_embeds = node_embeddings[batch_edges[:, 0]]
+                dst_embeds = node_embeddings[batch_edges[:, 1]]
+                target_edge_embeds = src_embeds * dst_embeds
+
+                # Get link prototypes (binary class embeddings)
+                link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
+                # print(f"[DEBUG] Rank {rank}: Link prototypes shape: {link_prototypes.shape}", flush=True)
+                if link_prototypes is None:
+                    if rank == 0:
+                        print("Warning: Could not form link prototypes. Skipping batch.")
+                    continue
+
+
+                # Use unified PFNPredictorNodeCls for link prediction
+                scores = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), link_prototypes)
+                # scores = target_edge_embeds @ link_prototypes.t()  # Directly compute scores
+                
+                # Use the train_mask to ensure loss is only calculated on non-context edges
+                # Make sure the mask is properly aligned with batch indices
+                if train_mask.size(0) != edge_pairs.size(0):
+                    if rank == 0:
+                        print(f"Warning: train_mask size {train_mask.size(0)} doesn't match edge_pairs size {edge_pairs.size(0)}")
+                    # Create a default mask that includes all edges in the batch
+                    mask_for_loss = torch.ones(batch_idx.size(0), dtype=torch.bool, device=device)
+                else:
+                    mask_for_loss = train_mask[batch_idx]
+                
+                # Validate that we have samples to compute loss on
+                # print(f"[DEBUG] Rank {rank}: Mask for loss has {mask_for_loss.sum()} valid samples", flush=True)
+                if mask_for_loss.sum() == 0:
+                    if rank == 0:
+                        print(f"Warning: No valid samples in batch for loss computation, skipping...")
+                    continue
+                
+                # Use CrossEntropyLoss for multi-class classification (link vs no-link)
+                nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
+                
+                # Compute optional orthogonal loss on prototypes
+                if orthogonal_push > 0:
+                    proto_norm = F.normalize(link_prototypes, p=2, dim=1)
+                    proto_matrix = proto_norm @ proto_norm.T
+                    mask = ~torch.eye(proto_matrix.size(0), device=device, dtype=torch.bool)
+                    orthogonal_loss = torch.sum(proto_matrix[mask]**2)
+                else:
+                    orthogonal_loss = torch.tensor(0.0, device=device)
+                    
+                loss = nll_loss + orthogonal_push * orthogonal_loss
+                
+                print(f"[DEBUG] Rank {rank}: About to call loss.backward() for batch {batch_count}")
+                try:
+                    # Check if DDP is initialized and world size
+                    if dist.is_initialized():
+                        world_size = dist.get_world_size()
+                        print(f"[DEBUG] Rank {rank}: DDP is initialized, world_size={world_size}")
+                    else:
+                        print(f"[DEBUG] Rank {rank}: DDP not initialized")
+                    
+                    loss.backward()
+                    print(f"[DEBUG] Rank {rank}: Successfully completed loss.backward() for batch {batch_count}")
+                except Exception as e:
+                    print(f"[ERROR] Rank {rank}: Exception during loss.backward(): {e}")
+                    import traceback
+                    print(f"[ERROR] Rank {rank}: Traceback: {traceback.format_exc()}")
+                finally:
+                    total_loss += loss.item()
+                    print(f"[DEBUG] Rank {rank}: Backward pass completed for batch {batch_count}")
+                
+                # Update weights
+                if clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                    torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
+                    if att: torch.nn.utils.clip_grad_norm_(att.parameters(), clip_grad)
+                    if mlp: torch.nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad)
+                    if projector: torch.nn.utils.clip_grad_norm_(projector.parameters(), clip_grad)
+                    if identity_projection: torch.nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
+                
+                optimizer.step()
+                print(f"[DEBUG] Rank {rank}: Optimizer step completed for batch {batch_count}")
+                batch_count += 1
+                print(f'[DEBUG] Rank {rank}: Completed batch {batch_count}, time taken: {time.time() - st:.2f}s')
+                    
+                print(f'Rank: {rank}, Batch: {batch_count}, Batch time: {time.time() - st:.2f}, Loss: {loss.item():.4f}', flush=True)
+
+            except Exception as e:
+                print(f"[ERROR] Rank {rank}: Exception during training batch {batch_count}: {e}")
+                import traceback
+                print(f"[ERROR] Rank {rank}: Traceback: {traceback.format_exc()}")
+                if rank == 0:
+                    print(f"Error in training batch: {e}")
+                continue
+
+        print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {total_loss:.4f}, Batch count: {batch_count}")
+        
+        # Final synchronization to ensure all processes complete training
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+            
+        return total_loss / max(batch_count, 1)
+
+    except Exception as e:
+        print(f"[ERROR] Rank {rank}: Fatal exception in train_link_prediction: {e}")
+        import traceback
+        print(f"[ERROR] Rank {rank}: Traceback: {traceback.format_exc()}")
+        raise
+    finally:
+        # Reset the alarm
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 def get_dataset_default_metric(dataset_name):
     """Get the default metric for each dataset."""

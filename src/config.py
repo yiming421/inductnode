@@ -137,7 +137,7 @@ def parse_link_prediction_args():
     # Data arguments
     parser.add_argument('--train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPage',
                         help='Comma-separated list of datasets for training link prediction model.')
-    parser.add_argument('--test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab,ogbl-citation2',
+    parser.add_argument('--test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab',
                         help='Comma-separated list of datasets for inductive testing.')
     parser.add_argument('--context_neg_ratio', type=int, default=1,
                         help='Ratio of negative to positive samples for context')
@@ -188,6 +188,17 @@ def parse_link_prediction_args():
     parser.add_argument('--sweep', type=str2bool, default=False,
                         help='Use sweep for link prediction')
     
+    # Logging arguments
+    parser.add_argument('--log_level', type=str, default='VERBOSE', 
+                        choices=['QUIET', 'INFO', 'DEBUG', 'VERBOSE'],
+                        help='Log level: QUIET (minimal), INFO (standard), DEBUG (detailed), VERBOSE (everything)')
+    parser.add_argument('--log_interval', type=int, default=1,
+                        help='Interval for printing training progress (epochs)')
+    parser.add_argument('--eval_interval', type=int, default=1,
+                        help='Interval for validation evaluation (epochs)')
+    parser.add_argument('--analysis_interval', type=int, default=1000,
+                        help='Interval for detailed waste analysis (epochs)')
+    
     parser.add_argument('--use_projector', type=str2bool, default=False,
                         help='Use projector for link prediction')
     parser.add_argument('--min_pca_dim', type=int, default=32,
@@ -200,7 +211,7 @@ def parse_link_prediction_args():
                         help='Use identity projection for link prediction')
     parser.add_argument('--projection_small_dim', type=int, default=128,
                         help='Small dimension for identity projection')
-    parser.add_argument('--projection_large_dim', type=int, default=512,
+    parser.add_argument('--projection_large_dim', type=int, default=128,
                         help='Large dimension for identity projection')
     
     # Checkpointing arguments

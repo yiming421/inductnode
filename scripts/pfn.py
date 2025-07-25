@@ -2,7 +2,7 @@ from model import PureGCN_v1, PureGCN, PFNPredictorNodeCls, GCN, AttentionPool, 
 from data import load_all_data, load_all_data_train
 import argparse
 import torch
-from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
 import time

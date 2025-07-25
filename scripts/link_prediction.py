@@ -28,20 +28,40 @@ from src.gpu_utils import (
     validate_gpu_availability,
     print_gpu_info
 )
-from src.correct_gpu_memory import (
-    safe_training_step,
-    get_gpu_memory_info,
-    calculate_safe_batch_sizes_per_gpu
-)
+
 from src.ddp_gpu_monitor import create_ddp_monitor
+from src.ddp_monitor import create_ddp_process_monitor
 from transformers import get_cosine_schedule_with_warmup
+
+# Import logging system and waste analyzer
+from src.logger import TrainingLogger, LogLevel
+sys.path.append('/home/maweishuo/inductnode')
+from waste_analyzer import DistributedWasteAnalyzer
 
 
 def run_ddp_lp(rank, world_size, args, results_dict):
     """Main execution function for link prediction, supports DDP."""
+    # Initialize logging system
+    logger = TrainingLogger(
+        rank=rank, 
+        world_size=world_size,
+        log_level=args.log_level,
+        log_interval=args.log_interval,
+        eval_interval=args.eval_interval,
+        analysis_interval=args.analysis_interval
+    )
+    
     if world_size > 1:
         setup_ddp(rank, world_size, args.port)
         if rank == 0:
+            wandb.init(project='inductlink', config=args)
+
+        # Create and start process monitor for DDP
+        process_monitor = create_ddp_process_monitor(rank, world_size, timeout_minutes=60)
+        process_monitor.start_monitoring()
+    else:
+        # Single GPU mode - initialize wandb if not already initialized
+        if not wandb.run and not getattr(args, 'sweep', False):
             wandb.init(project='inductlink', config=args)
 
     # Handle GPU device selection properly
@@ -54,88 +74,49 @@ def run_ddp_lp(rank, world_size, args, results_dict):
     else:
         # DDP mode - always use rank-based device assignment
         device = f'cuda:{rank}'
+    
+    # Initialize systems
+    waste_analyzer = DistributedWasteAnalyzer(rank, world_size)
+    waste_analyzer.measure_memory_usage("baseline_before_data_loading")
+    
+    # Setup logging
+    logger.setup_start()
+    logger.setup_device(device, {'train': args.batch_size, 'test': args.test_batch_size})
         
     # Correct heterogeneous GPU memory management - use the dedicated module
     try:
-        if rank == 0:
-            print("🔗 Inductive Link Prediction Task")
-            print("=" * 60)
-            print(f"Using device: {device}")
-        
-        # Use the dedicated memory management module instead of inline logic
-        if world_size > 1:
-            # Multi-GPU: use heterogeneous memory allocation from the module
-            local_batch_size, batch_distribution = calculate_safe_batch_sizes_per_gpu(
-                world_size, rank, args.batch_size
-            )
-            
-            args.batch_size = local_batch_size
-            args.test_batch_size = local_batch_size  # Keep consistent
-            
-            if rank == 0:
-                print(f"✅ Rank {rank}: Local batch size = {local_batch_size}")
-                print(f"✅ Batch distribution across GPUs: {batch_distribution}")
-                total_effective = sum(batch_distribution.values()) if batch_distribution else local_batch_size * world_size
-                print(f"✅ Total effective batch size: {total_effective}")
-            else:
-                print(f"✅ Rank {rank}: Local batch size = {local_batch_size} (distribution handled by rank 0)")
-        else:
-            # Single GPU: simple memory check
-            torch_device = torch.device(device)
-            memory_info = get_gpu_memory_info(torch_device)
-            
-            if rank == 0:
-                print(f"GPU {rank} Memory: {memory_info['total']:.1f}GB total, {memory_info['free']:.1f}GB free")
-            
-            estimated_memory_needed = args.batch_size * 0.001  # Rough estimate
-            if memory_info['free'] * 0.8 < estimated_memory_needed:
-                print(f"⚠️  GPU memory may be insufficient, suggest reducing batch size")
-        
-        if rank == 0:
-            print(f"Final batch sizes - Train: {args.batch_size}, Test: {args.test_batch_size}")
-        
         # Initialize enhanced GPU monitoring
         torch_device = torch.device(device)
         gpu_monitor = create_ddp_monitor(rank, world_size, torch_device)
         gpu_monitor.start_monitoring(interval=10.0)  # Monitor every 10 seconds
             
     except Exception as e:
-        if rank == 0:
-            print("🔗 Inductive Link Prediction Task") 
-            print("=" * 60)
-            print(f"Using device: {device}")
-            print(f"Warning: GPU memory check failed, using original batch sizes: {e}")
+        logger.warning(f"GPU memory check failed, using original batch sizes: {e}")
     
     # --- 1. Load and process training datasets ---
     train_dataset_names = args.train_dataset.split(',')
-    if rank == 0: print(f"Loading training datasets: {train_dataset_names}")
+    test_dataset_names = args.test_dataset.split(',')
+    logger.setup_datasets(train_dataset_names, test_dataset_names)
+    
+    # Load training datasets
     train_data_list, train_split_idx_list = load_all_data_link(train_dataset_names, device=device)
 
-    # Analyze dataset memory usage and duplication
-    if rank == 0:
-        dataset_info, duplication_cost = gpu_monitor.analyze_dataset_duplication(
-            train_data_list, train_dataset_names
-        )
-        print(f"⚠️  WARNING: Dataset duplication across {world_size} GPUs wastes {duplication_cost:.2f}GB!")
-        if world_size > 1:
-            print("💡 Consider: Data parallelism with distributed data loading to reduce memory waste")
-
-    if rank == 0: print("Processing training datasets...")
+    # Process training datasets
+    logger.progress("Processing training datasets")
+    
     for i, (data, split_idx) in enumerate(zip(train_data_list, train_split_idx_list)):
         try:
             process_link_data(data, args, rank=rank)
-            if rank == 0:
-                print(f"✅ Processed training dataset {i+1}/{len(train_data_list)}: {data.name}")
+            logger.dataset_processing(data.name, i, len(train_data_list), success=True)
         except RuntimeError as e:
             if "out of memory" in str(e):
-                if rank == 0:
-                    print(f"❌ GPU memory insufficient for dataset {data.name}. Consider reducing batch size or using CPU.")
+                logger.oom_error(data.name, args.batch_size)
                 raise e
             else:
+                logger.dataset_error(data.name, str(e))
                 raise e
-
+    
     # Determine the correct input dimension after data processing
-    # Check if any dataset uses identity projection to set the correct dimension
     processed_input_dim = args.hidden  # Default
     for data, _ in zip(train_data_list, train_split_idx_list):
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
@@ -148,44 +129,53 @@ def run_ddp_lp(rank, world_size, args, results_dict):
             # Use the actual feature dimension after processing
             processed_input_dim = data.x.size(1)
 
-    if rank == 0:
-        print(f"Using processed input dimension: {processed_input_dim}")
-
     # --- 2. Create or load model ---
+    
     if args.use_pretrained_model:
-        if rank == 0: print("Loading pretrained model...")
+        logger.info("Loading pretrained model...")
         model, predictor, att, mlp, projector, identity_projection, model_args = recreate_model_from_checkpoint(
             args.load_checkpoint, processed_input_dim, device
         )
         args = override_args_from_checkpoint(args, model_args, rank)
     else:
-        if rank == 0: print("Creating a new model from scratch...")
+        logger.info("Creating new model from scratch...")
         model, predictor, att, mlp, projector, identity_projection = create_model_from_args(
             args, processed_input_dim, device
         )
     
-    if rank == 0: print("✅ Model and Predictor created successfully!")
+    logger.success("Model and Predictor created successfully!")
 
-    # Conditionally wrap models with DDP
+    # Wrap models with DDP - only wrap modules that will actually be used
+    # Analyze configuration to determine which optional modules will be needed
+    needs_att = getattr(args, 'att_pool', False)
+    needs_mlp = getattr(args, 'mlp_pool', False)
+    needs_projector = getattr(args, 'use_projector', False)
+    needs_identity_projection = getattr(args, 'use_identity_projection', False)
+    
+    # Also check data characteristics for projection modules
+    for data, _ in zip(train_data_list, train_split_idx_list):
+        if hasattr(data, 'needs_projection') and data.needs_projection:
+            needs_projector = True
+        if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
+            needs_identity_projection = True
+    
+    if rank == 0:
+        logger.info(f"DDP wrapping analysis: needs_att={needs_att}, needs_mlp={needs_mlp}, needs_projector={needs_projector}, needs_identity_projection={needs_identity_projection}")
+    
     all_modules_list = [model, predictor, att, mlp, projector, identity_projection]
+    module_names = ['model', 'predictor', 'att', 'mlp', 'projector', 'identity_projection']
+    module_needs = [True, True, needs_att, needs_mlp, needs_projector, needs_identity_projection]
+    
     if world_size > 1:
-        for i, module in enumerate(all_modules_list):
+        for i, (module, module_name, is_needed) in enumerate(zip(all_modules_list, module_names, module_needs)):
             if module is not None and any(p.requires_grad for p in module.parameters()):
-                # Only wrap modules that will actually be used in the forward pass
-                # projector and identity_projection may not be used if data doesn't need projection
-                if i in [4, 5]:  # projector and identity_projection indices
-                    # Only wrap if we expect to use these modules based on data characteristics
-                    should_wrap = False
-                    for data, _ in zip(train_data_list, train_split_idx_list):
-                        if (hasattr(data, 'needs_projection') and data.needs_projection) or \
-                           (hasattr(data, 'needs_identity_projection') and data.needs_identity_projection):
-                            should_wrap = True
-                            break
-                    if should_wrap:
-                        all_modules_list[i] = DDP(module, device_ids=[rank], find_unused_parameters=True)
-                else:
-                    # Always wrap core modules (model, predictor, att, mlp)
+                if is_needed:
                     all_modules_list[i] = DDP(module, device_ids=[rank], find_unused_parameters=True)
+                    if rank == 0:
+                        logger.info(f"Wrapped {module_name} with DDP")
+                else:
+                    if rank == 0:
+                        logger.info(f"Skipping DDP wrapping for {module_name} (not needed)")
     model, predictor, att, mlp, projector, identity_projection = all_modules_list
 
     # Analyze model memory usage after DDP wrapping
@@ -196,13 +186,13 @@ def run_ddp_lp(rank, world_size, args, results_dict):
         total_model_params = sum(info['parameter_count'] for info in model_breakdown.values())
         total_model_memory = sum(info['total_gb'] for info in model_breakdown.values())
         
-        print(f"\n📊 Model Memory Analysis:")
-        print(f"  Total Parameters: {total_model_params:,}")
-        print(f"  Total Model Memory: {total_model_memory:.3f}GB per GPU")
-        print(f"  DDP Memory Overhead: {total_model_memory * world_size:.3f}GB across all GPUs")
-        
-        if world_size > 1:
-            communication_overhead = gpu_monitor.measure_ddp_communication_overhead()
+        # Log model setup information
+        logger.setup_model({
+            'type': args.model,
+            'hidden_dim': processed_input_dim,
+            'total_params': total_model_params,
+            'memory_gb': total_model_memory
+        })
 
     # --- 3. Setup Optimizer and Scheduler ---
     parameters = [p for module in all_modules_list if module is not None for p in module.parameters()]
@@ -240,10 +230,34 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                     print(f"Warning: No training edges found for dataset {data.name}, skipping...")
                 continue
                 
-            context_data, train_mask = select_link_context(
-                link_data['train'], args.context_k, 
-                args.context_neg_ratio, args.remove_context_from_train
-            )
+            # --- CONTEXT SELECTION SYNCHRONIZATION ---
+            # Select context on rank 0 and broadcast to all other ranks to ensure consistency.
+            if world_size > 1:
+                if rank == 0:
+                    # Rank 0 performs the random selection
+                    context_data, train_mask = select_link_context(
+                        link_data['train'], args.context_k, 
+                        args.context_neg_ratio, args.remove_context_from_train
+                    )
+                    # Prepare data for broadcast
+                    objects_to_broadcast = [context_data, train_mask]
+                else:
+                    # Other ranks prepare placeholders
+                    objects_to_broadcast = [None, None]
+                
+                # Broadcast the selected context from rank 0 to all other ranks
+                dist.broadcast_object_list(objects_to_broadcast, src=0)
+                
+                if rank != 0:
+                    # Unpack the received data
+                    context_data, train_mask = objects_to_broadcast
+            else:
+                # Single GPU mode, no broadcasting needed
+                context_data, train_mask = select_link_context(
+                    link_data['train'], args.context_k, 
+                    args.context_neg_ratio, args.remove_context_from_train
+                )
+            # --- END OF SYNCHRONIZATION ---
             
             # Validate context data
             if context_data['edge_pairs'].size(0) == 0:
@@ -293,6 +307,73 @@ def run_ddp_lp(rank, world_size, args, results_dict):
     # This ensures prototypes are identical between training and validation
     valid_context_data = train_context_data.copy()  # Use same context as training
 
+    # --- 4.5. Pre-load and process test datasets for periodic evaluation ---
+    # Load test datasets once before training to avoid repeated loading in the training loop
+    test_dataset_names = args.test_dataset.split(',')
+    if rank == 0:
+        print(f"\n--- Pre-loading test datasets for periodic evaluation ---")
+    
+    test_data_list_periodic = []
+    test_split_idx_list_periodic = []
+    test_link_data_all_periodic = []
+    test_context_data_periodic = []
+    
+    try:
+        test_data_raw, test_split_idx_raw = load_all_data_link(test_dataset_names, device=device)
+        
+        for i, (data, split_idx) in enumerate(zip(test_data_raw, test_split_idx_raw)):
+            try:
+                process_link_data(data, args, rank=rank)
+                
+                # print("[DEBUG]: Preparing test dataset:", data.name, flush=True)
+                link_data_all = prepare_link_data(data, split_idx, args.train_neg_ratio)
+                # print("[DEBUG]: Test dataset prepared:", data.name, flush=True)
+                
+                # --- TEST CONTEXT SELECTION SYNCHRONIZATION ---
+                # Also synchronize context selection for test datasets to ensure consistency
+                if world_size > 1:
+                    if rank == 0:
+                        print(f"[DEBUG] Rank 0: Selecting context for test dataset {data.name}")
+                        context_data, _ = select_link_context(link_data_all['train'], args.context_k, args.context_neg_ratio, remove_from_train=False)
+                        print(f"[DEBUG] Rank 0: Context for test dataset {data.name} selected", flush=True)
+                        objects_to_broadcast = [context_data]
+                    else:
+                        objects_to_broadcast = [None]
+                    
+                    dist.broadcast_object_list(objects_to_broadcast, src=0)
+                    
+                    if rank != 0:
+                        context_data = objects_to_broadcast[0]
+                else:
+                    context_data, _ = select_link_context(link_data_all['train'], args.context_k, args.context_neg_ratio, remove_from_train=False)
+                # --- END OF SYNCHRONIZATION ---
+                                
+                test_data_list_periodic.append(data)
+                test_split_idx_list_periodic.append(split_idx)
+                test_link_data_all_periodic.append(link_data_all)
+                test_context_data_periodic.append(context_data)
+                
+                if rank == 0:
+                    print(f"✅ Test dataset {data.name} prepared for periodic evaluation")
+                    
+            except Exception as e:
+                if rank == 0:
+                    print(f"Error preparing test dataset {data.name} for periodic evaluation: {e}")
+                    import traceback
+                    print(f"Full traceback: {traceback.format_exc()}")
+                continue
+        
+        if rank == 0:
+            print(f"Successfully prepared {len(test_data_list_periodic)} test datasets for periodic evaluation")
+            
+    except Exception as e:
+        if rank == 0:
+            print(f"Error loading test datasets for periodic evaluation: {e}")
+        test_data_list_periodic = []
+        test_split_idx_list_periodic = []
+        test_link_data_all_periodic = []
+        test_context_data_periodic = []
+
     # --- 5. Main Training Loop ---
     best_valid_metric = 0
     best_epoch = 0
@@ -309,43 +390,98 @@ def run_ddp_lp(rank, world_size, args, results_dict):
     # OOM recovery tracking (simplified with decorators)
     oom_count = 0
 
-    if rank == 0: print("\n--- Starting Training Phase ---")
+    # Start training phase
+    logger.training_start(args.epochs)
+    
     for epoch in range(args.epochs):
+        print(f"[DEBUG] Rank {rank}: Starting epoch {epoch}")
         st = time.time()
+        
+        # Add barrier to ensure all processes start epoch together
+        if world_size > 1:
+            print(f"[DEBUG] Rank {rank}: Waiting at epoch {epoch} start barrier")
+            try:
+                dist.barrier()
+                print(f"[DEBUG] Rank {rank}: Passed epoch {epoch} start barrier")
+            except Exception as e:
+                print(f"[ERROR] Rank {rank}: Exception at epoch {epoch} start barrier: {e}")
+                raise
         
         # --- Train on all training datasets ---
         total_train_loss = 0
         train_dataset_count = 0
+        
         for i, (data, split_idx) in enumerate(zip(train_data_list, train_split_idx_list)):
+            print(f"[DEBUG] Rank {rank}: Processing dataset {i} ({data.name}) in epoch {epoch}")
+            
             link_data_all = train_link_data_all[i]
             context_data = train_context_data[i]
             train_mask = train_masks[i]
             
             if 'train' in link_data_all and link_data_all['train']['edge_pairs'].size(0) > 0:
                 try:
-                    # Use safe training step - never dynamically adjust batch size
-                    train_loss = safe_training_step(
-                        train_link_prediction,
+                    print(f"[DEBUG] Rank {rank}: About to call train_link_prediction for {data.name}")
+                    
+                    # Standard training step
+                    train_loss = train_link_prediction(
                         model, predictor, data, link_data_all['train'], context_data, train_mask,
                         optimizer, args.batch_size, att, mlp, projector, identity_projection, 
                         args.clip_grad, rank, args.orthogonal_push, args.normalize_class_h, 
                         epoch=epoch, mask_target_edges=args.mask_target_edges, degree=args.degree
                     )
+                    
+                    print(f"[DEBUG] Rank {rank}: Completed train_link_prediction for {data.name}, loss={train_loss}")
+                    
                     total_train_loss += train_loss
                     train_dataset_count += 1
+                    
+                    # Update process monitor activity
+                    if 'process_monitor' in locals():
+                        process_monitor.update_activity()
+                        
                 except RuntimeError as e:
+                    print(f"[ERROR] Rank {rank}: RuntimeError in training dataset {data.name}: {e}")
                     if "out of memory" in str(e):
                         oom_count += 1
                         if rank == 0:
-                            print(f"❌ GPU out of memory, training failed: {data.name}")
-                            print(f"💡 Suggestion: reduce batch size from {args.batch_size} and restart training")
+                            logger.error_oom(data.name, args.batch_size, oom_count)
                     else:
                         if rank == 0:
-                            print(f"Warning: Training failed for dataset {data.name}: {e}")
+                            logger.error_training(data.name, str(e))
+                    raise  # Re-raise to stop execution and prevent hanging
+                except Exception as e:
+                    print(f"[ERROR] Rank {rank}: Unexpected exception in training dataset {data.name}: {e}")
+                    import traceback
+                    print(f"[ERROR] Rank {rank}: Traceback: {traceback.format_exc()}")
+                    raise  # Re-raise to stop execution and prevent hanging
+            else:
+                print(f"[DEBUG] Rank {rank}: Skipping dataset {data.name} - no training data")
+
+        print(f"[DEBUG] Rank {rank}: Completed all training datasets for epoch {epoch}")
+        
+        # Add barrier after training to ensure all processes finish training together
+        if world_size > 1:
+            print(f"[DEBUG] Rank {rank}: Waiting at epoch {epoch} post-training barrier")
+            try:
+                dist.barrier()
+                print(f"[DEBUG] Rank {rank}: Passed epoch {epoch} post-training barrier")
+            except Exception as e:
+                print(f"[ERROR] Rank {rank}: Exception at epoch {epoch} post-training barrier: {e}")
+                raise
+
+        if epoch == 0:
+            waste_analyzer.end_timing('training_computation')
 
         # Step scheduler once per epoch (not per dataset)
         if scheduler is not None:
             scheduler.step()
+        
+        # Measure gradient synchronization time (communication overhead)
+        if epoch == 0 and world_size > 1:
+            waste_analyzer.start_timing('gradient_synchronization')
+            # DDP automatically synchronizes gradients here
+            torch.cuda.synchronize()  # Ensure timing accuracy
+            waste_analyzer.end_timing('gradient_synchronization')
 
         # --- Validate on all training datasets ---
         total_valid_metric = 0
@@ -356,9 +492,8 @@ def run_ddp_lp(rank, world_size, args, results_dict):
 
             if 'valid' in link_data_all and link_data_all['valid']['edge_pairs'].size(0) > 0:
                 try:
-                    # Use safe validation step - never dynamically adjust batch size
-                    valid_results = safe_training_step(
-                        evaluate_link_prediction,
+                    # Standard validation step
+                    valid_results = evaluate_link_prediction(
                         model, predictor, data, link_data_all['valid'], context_data, args.test_batch_size,
                         att, mlp, projector, identity_projection, rank, args.normalize_class_h,
                         degree=args.degree, k_values=[20, 50, 100]
@@ -376,16 +511,16 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                     total_valid_metric += metric_value
                     valid_dataset_count += 1
                     
-                    if rank == 0 and epoch % 10 == 0:
-                        print(f"Dataset {data.name} validation {metric_name}: {metric_value:.4f}")
+                    if rank == 0 and epoch % args.log_interval == 0 and args.log_level in [LogLevel.DEBUG, LogLevel.VERBOSE]:
+                        logger.debug(f"Dataset {data.name} validation {metric_name}: {metric_value:.4f}")
                         
                 except RuntimeError as e:
                     if "out of memory" in str(e):
                         if rank == 0:
-                            print(f"❌ GPU out of memory, validation failed: {data.name}")
+                            logger.error_oom(data.name, args.test_batch_size, None, is_validation=True)
                     else:
                         if rank == 0:
-                            print(f"Warning: Validation failed for dataset {data.name}: {e}")
+                            logger.error_validation(data.name, str(e))
         
         # Compute average validation metric with proper zero handling
         if valid_dataset_count > 0:
@@ -396,80 +531,118 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                 print(f"Warning: No validation datasets succeeded in epoch {epoch}")
             avg_valid_metric = 0.0
         
-        # --- Periodic Test Evaluation for Monitoring (every 20 epochs) ---
+        # --- Periodic Test Evaluation for Monitoring (every eval_interval epochs) ---
         avg_test_metric = 0.0
-        if rank == 0 and epoch % 20 == 0:
-            # Load test datasets for periodic evaluation
-            test_dataset_names = args.test_dataset.split(',')
-            test_data_list, test_split_idx_list = load_all_data_link(test_dataset_names, device=device)
+        if rank == 0 and epoch % args.eval_interval == 0 and len(test_data_list_periodic) > 0:
+            print(f"[DEBUG] Rank 0: Starting test evaluation for epoch {epoch}")
             
-            total_test_metric = 0
-            test_dataset_count = 0
-            
-            for data, split_idx in zip(test_data_list, test_split_idx_list):
-                try:
-                    process_link_data(data, args, rank=rank)
+            try:
+                total_test_metric = 0
+                test_dataset_count = 0
+                
+                logger.training_test_start(epoch)
+                
+                for i, (data, link_data_all, context_data) in enumerate(zip(test_data_list_periodic, test_link_data_all_periodic, test_context_data_periodic)):
+                    print(f"[DEBUG] Processing test dataset {i+1}/{len(test_data_list_periodic)}: {data.name}")
                     
-                    link_data_all = prepare_link_data(data, split_idx, args.train_neg_ratio)
-                    
-                    if 'test' not in link_data_all or link_data_all['test']['edge_pairs'].size(0) == 0:
-                        continue
-                    
-                    context_data, _ = select_link_context(link_data_all['train'], args.context_k, args.context_neg_ratio, remove_from_train=False)
-                    
-                    if context_data['edge_pairs'].size(0) == 0:
-                        continue
+                    try:
+                        print(f"[DEBUG] About to evaluate {data.name}...")
+                        test_results_dict = evaluate_link_prediction(
+                            model, predictor, data, link_data_all['test'], context_data, args.test_batch_size,
+                            att, mlp, projector, identity_projection, rank, args.normalize_class_h,
+                            degree=args.degree, k_values=[20, 50, 100]
+                        )
+                        print(f"[DEBUG] Evaluation completed for {data.name}")
+                        
+                        # Use the default metric for this dataset
+                        if 'default_metric' in test_results_dict:
+                            metric_value = test_results_dict['default_metric']
+                            metric_name = test_results_dict.get('default_metric_name', 'unknown')
+                        else:
+                            metric_value = test_results_dict.get('hits@100', 0.0)
+                            metric_name = 'hits@100'
+                        
+                        total_test_metric += metric_value
+                        test_dataset_count += 1
 
-                    test_results_dict = evaluate_link_prediction(
-                        model, predictor, data, link_data_all['test'], context_data, args.test_batch_size,
-                        att, mlp, projector, identity_projection, rank, args.normalize_class_h,
-                        degree=args.degree, k_values=[20, 50, 100]
-                    )
+                        # Show individual dataset results - IMPORTANT for monitoring individual performance!
+                        if rank == 0:  # Only rank 0 should print to avoid duplicate output
+                            print(f"Epoch {epoch} - Test {data.name} {metric_name}: {metric_value:.4f}")
+                            
+                    except Exception as e:
+                        print(f"[ERROR] Exception during test evaluation of {data.name}: {e}")
+                        import traceback
+                        print(f"[ERROR] Traceback: {traceback.format_exc()}")
+                        logger.error_test(data.name, str(e))
+                        continue
+                
+                if test_dataset_count > 0:
+                    avg_test_metric = total_test_metric / test_dataset_count
+                    logger.training_test_result(epoch, avg_test_metric)
                     
-                    # Use the default metric for this dataset
-                    if 'default_metric' in test_results_dict:
-                        metric_value = test_results_dict['default_metric']
-                        metric_name = test_results_dict.get('default_metric_name', 'unknown')
-                    else:
-                        metric_value = test_results_dict.get('hits@100', 0.0)
-                        metric_name = 'hits@100'
-                    
-                    total_test_metric += metric_value
-                    test_dataset_count += 1
-                    
-                    print(f"Epoch {epoch} - Test {data.name} {metric_name}: {metric_value:.4f}")
-                    
-                except Exception as e:
-                    print(f"Warning: Test evaluation failed for dataset {data.name}: {e}")
-                    continue
+                print(f"[DEBUG] Test evaluation completed for epoch {epoch}")
+                
+            except Exception as e:
+                print(f"[ERROR] Fatal exception during test evaluation: {e}")
+                import traceback
+                print(f"[ERROR] Traceback: {traceback.format_exc()}")
+                avg_test_metric = 0.0
             
-            if test_dataset_count > 0:
-                avg_test_metric = total_test_metric / test_dataset_count
-                print(f"Epoch {epoch} - Average Test Metric: {avg_test_metric:.4f}")
+        # Add barrier after test evaluation to ensure rank 0 finishes before continuing
+        if world_size > 1:
+            print(f"[DEBUG] Rank {rank}: Waiting at epoch {epoch} post-test-evaluation barrier")
+            try:
+                dist.barrier()
+                print(f"[DEBUG] Rank {rank}: Passed epoch {epoch} post-test-evaluation barrier")
+            except Exception as e:
+                print(f"[ERROR] Rank {rank}: Exception at epoch {epoch} post-test-evaluation barrier: {e}")
+                raise
             
-        if rank == 0 and epoch % 10 == 0:
+        if rank == 0 and epoch % args.log_interval == 0:
             en = time.time()
             avg_train_loss = total_train_loss / max(train_dataset_count, 1)
             
             # Enhanced memory monitoring and efficiency analysis
+            memory_info = ""
             if torch.cuda.is_available():
                 memory_allocated = torch.cuda.memory_allocated(device) / 1e9
                 memory_reserved = torch.cuda.memory_reserved(device) / 1e9
                 memory_info = f", GPU Mem: {memory_allocated:.2f}/{memory_reserved:.2f} GB"
                 
-                # Print detailed monitoring every 50 epochs
-                if epoch % 50 == 0:
-                    gpu_monitor.print_memory_summary()
-                    efficiency_report = gpu_monitor.get_memory_efficiency_report()
-                    print(efficiency_report)
-            else:
-                memory_info = ""
+                # Print detailed monitoring every analysis_interval epochs  
+                if epoch % args.analysis_interval == 0:
+                    print(f"[DEBUG] Rank {rank}: Analysis interval check - epoch {epoch}, analysis_interval {args.analysis_interval}")
+                    
+                    if args.log_level in [LogLevel.DEBUG, LogLevel.VERBOSE]:
+                        gpu_monitor.print_memory_summary()
+                        efficiency_report = gpu_monitor.get_memory_efficiency_report()
+                        logger.debug(efficiency_report)
+                    
+                    # Print waste analysis summary - ONLY ON RANK 0 to prevent DDP hanging!
+                    if rank == 0 and epoch > 0:  # Only rank 0 and skip epoch 0
+                        print(f"[DEBUG] Rank 0: About to call waste_training_summary for epoch {epoch}")
+                        try:
+                            logger.waste_training_summary(epoch, waste_analyzer)
+                            print(f"[DEBUG] Rank 0: waste_training_summary completed successfully")
+                        except Exception as e:
+                            print(f"[ERROR] Rank 0: Exception in waste_training_summary: {e}")
+                            import traceback
+                            print(f"[ERROR] Traceback: {traceback.format_exc()}")
+                    elif rank == 0 and epoch == 0:
+                        print(f"[DEBUG] Rank 0: Skipping waste analysis for epoch 0")
+                    elif rank != 0:
+                        print(f"[DEBUG] Rank {rank}: Skipping waste analysis (not rank 0)")
             
-            print(f"Epoch {epoch}: Avg Loss {avg_train_loss:.4f}, Avg Valid Metric {avg_valid_metric:.4f}, Time: {en-st:.2f}s{memory_info}")
-            if train_dataset_count == 0:
-                print(f"Warning: No training datasets succeeded in epoch {epoch}")
-            if oom_count > 0:
-                print(f"Total OOM events so far: {oom_count}")
+            # Main epoch logging with configurable verbosity
+            logger.training_epoch_summary({
+                'epoch': epoch,
+                'avg_loss': avg_train_loss,
+                'avg_valid_metric': avg_valid_metric,
+                'time': en-st,
+                'memory_info': memory_info,
+                'train_dataset_count': train_dataset_count,
+                'oom_count': oom_count if oom_count > 0 else None
+            })
             
             # Log both validation and test metrics
             log_dict = {'epoch': epoch, 'avg_train_loss': avg_train_loss, 'avg_valid_metric': avg_valid_metric}
@@ -480,12 +653,24 @@ def run_ddp_lp(rank, world_size, args, results_dict):
             if avg_test_metric > 0:
                 log_dict['avg_test_metric'] = avg_test_metric
             
+            # Add efficiency metrics to wandb logs
+            if epoch > 0:  # Only after we have timing data
+                efficiency_scores = waste_analyzer.metrics.get('efficiency_scores', {})
+                if efficiency_scores:
+                    log_dict['memory_efficiency_percent'] = efficiency_scores.get('memory_efficiency_percent', 0)
+                    log_dict['compute_efficiency_percent'] = efficiency_scores.get('compute_efficiency_percent', 0)
+                    log_dict['overall_efficiency_percent'] = efficiency_scores.get('overall_efficiency_percent', 0)
+                    log_dict['resource_waste_factor'] = efficiency_scores.get('waste_factor', 1)
+            
             if wandb.run is not None:
                 wandb.log(log_dict)
 
         if avg_valid_metric > best_valid_metric:
             best_valid_metric = avg_valid_metric
             best_epoch = epoch
+            
+            if rank == 0:
+                logger.training_new_best(epoch, avg_valid_metric)
             
             # Save best model states (only rank 0 saves, then broadcast to all ranks)
             if rank == 0:
@@ -520,15 +705,15 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                     best_epoch = int(best_epoch)
 
     if rank == 0:
-        print(f"\n--- Training Complete ---")
-        print(f"Best validation metric: {best_valid_metric:.4f} at epoch {best_epoch}")
+        logger.training_complete(best_valid_metric, best_epoch)
 
     # --- 6. Inductive Testing Phase ---
-    if rank == 0: print("\n--- Starting Inductive Testing Phase ---")
+    logger.testing_start()
     
     # Load best model weights for all components (ensure all ranks load the same state)
     if best_states['model'] is not None:
-        if rank == 0: print("Loading best model states for all components...")
+        if rank == 0: 
+            logger.info("Loading best model states for all components...")
         
         # Load best states into models
         model_to_load = model.module if hasattr(model, 'module') else model
@@ -553,37 +738,38 @@ def run_ddp_lp(rank, world_size, args, results_dict):
             identity_projection_to_load = identity_projection.module if hasattr(identity_projection, 'module') else identity_projection
             identity_projection_to_load.load_state_dict(best_states['identity_projection'])
     else:
-        if rank == 0: print("Warning: No best model found, using the final model state.")
+        if rank == 0: 
+            logger.warning("No best model found, using the final model state.")
 
     # Ensure all ranks are synchronized before proceeding to testing
     if world_size > 1:
         dist.barrier()
 
-    # Load and process test datasets
+    # Load and process test datasets (final evaluation)
     test_dataset_names = args.test_dataset.split(',')
-    if rank == 0: print(f"Loading test datasets: {test_dataset_names}")
-    test_data_list, test_split_idx_list = load_all_data_link(test_dataset_names, device=device)
+    if rank == 0: 
+        logger.testing_datasets(test_dataset_names)
+    
+    # Always reuse the pre-processed test data from periodic evaluation
+    final_test_data_list = test_data_list_periodic
+    final_test_link_data_all = test_link_data_all_periodic
+    final_test_context_data = test_context_data_periodic
+    if rank == 0:
+        print("Using pre-processed test datasets for final evaluation")
 
     test_results = []
-    for data, split_idx in zip(test_data_list, test_split_idx_list):
+    for i, (data, link_data_all, context_data) in enumerate(zip(final_test_data_list, final_test_link_data_all, final_test_context_data)):
         try:
-            process_link_data(data, args, rank=rank)
-            
-            link_data_all = prepare_link_data(data, split_idx, args.train_neg_ratio)
-            
             # Validate that test data exists
             if 'test' not in link_data_all or link_data_all['test']['edge_pairs'].size(0) == 0:
                 if rank == 0:
-                    print(f"Warning: No test edges found for dataset {data.name}, skipping...")
+                    logger.warning(f"No test edges found for dataset {data.name}, skipping...")
                 continue
-            
-            # Use training context for test evaluation (inductive setting)
-            context_data, _ = select_link_context(link_data_all['train'], args.context_k, args.context_neg_ratio, remove_from_train=False)
             
             # Validate context data for test
             if context_data['edge_pairs'].size(0) == 0:
                 if rank == 0:
-                    print(f"Warning: No context available for test dataset {data.name}, skipping...")
+                    logger.warning(f"No context available for test dataset {data.name}, skipping...")
                 continue
 
             test_results_dict = evaluate_link_prediction(
@@ -603,39 +789,72 @@ def run_ddp_lp(rank, world_size, args, results_dict):
             })
             
             if rank == 0:
-                print(f"✅ Test completed for {data.name}: {default_metric_name} = {default_metric_value:.4f}")
+                logger.testing_dataset_result(data.name, default_metric_name, default_metric_value)
                 
         except Exception as e:
             if rank == 0:
-                print(f"Error testing dataset {data.name}: {e}")
+                logger.error_test(data.name, str(e))
             continue
     
-    # --- 6. Aggregate and Log Final Results ---
+    # --- 7. Final Results and Summary ---
     if rank == 0 and results_dict is not None:
         results_dict[rank] = test_results
 
     # Stop monitoring and print final summary
+    process_monitor.stop_monitoring()
     gpu_monitor.stop_monitoring()
+    
     if rank == 0:
-        gpu_monitor.print_memory_summary()
-        print("\n" + "="*60)
-        print("🎯 Final GPU Usage Summary:")
-        print("="*60)
-        efficiency_report = gpu_monitor.get_memory_efficiency_report()
-        print(efficiency_report)
+        # Generate final summaries using logger
+        logger.results_final_summary(gpu_monitor, waste_analyzer)
+        
+        # Save detailed metrics to file
+        waste_analyzer.save_detailed_metrics("distributed_training_waste_analysis.json")
+        logger.info("Detailed waste analysis saved to distributed_training_waste_analysis.json")
 
+    # Cleanup DDP
     if world_size > 1:
         cleanup_ddp()
 
 def main():
     """Main function for link prediction."""
+    import signal
+    import sys
+    
+    # Set up signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        print(f"\nReceived signal {signum}, shutting down gracefully...")
+        # Kill any remaining child processes
+        try:
+            import psutil
+            current_process = psutil.Process()
+            children = current_process.children(recursive=True)
+            for child in children:
+                print(f"Terminating child process {child.pid}")
+                child.terminate()
+            # Wait for children to terminate
+            psutil.wait_procs(children, timeout=10)
+            # Force kill any remaining children
+            for child in children:
+                if child.is_running():
+                    print(f"Force killing child process {child.pid}")
+                    child.kill()
+        except ImportError:
+            print("psutil not available, cannot cleanup child processes automatically")
+        except Exception as e:
+            print(f"Error during signal cleanup: {e}")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     args = parse_link_prediction_args()
 
     if args.use_pretrained_model and args.load_checkpoint is None:
         raise ValueError("Must provide --load_checkpoint when --use_pretrained_model is True.")
 
-    if not args.use_ddp and not args.sweep:
-         wandb.init(project='inductlink', config=args)
+    # Note: wandb.init() is now handled inside run_ddp_lp() for both single GPU and DDP modes
+    # This avoids conflicts and ensures proper initialization in all scenarios
     
     # --- GPU Setup and Validation ---
     try:
