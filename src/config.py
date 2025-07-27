@@ -229,3 +229,110 @@ def parse_link_prediction_args():
                         help='Safe learning rate for deep transformers')
     
     return parser.parse_args()
+
+def parse_joint_training_args():
+    """
+    Parse command line arguments for joint training.
+    Combines arguments from both node classification and link prediction scripts.
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Joint Training for Node Classification and Link Prediction')
+    
+    # === Basic Configuration ===
+    parser.add_argument('--runs', type=int, default=1, help='Number of training runs')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--gpu', type=str, default='0', help='GPU specification: "auto" for all GPUs, single GPU ID (e.g., "0"), or comma-separated list (e.g., "0,1,2,3")')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--port', type=int, default=12355, help='Port for DDP')
+    parser.add_argument('--single_gpu', type=str2bool, default=True, help='Use single GPU mode instead of distributed training')
+    
+    # === Model Architecture ===
+    parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN'])
+    parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN'])
+    parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
+    parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
+    parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
+    parser.add_argument('--transformer_layers', type=int, default=1, help='Number of transformer layers')
+    parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
+    parser.add_argument('--dp', type=float, default=0.2, help='Dropout rate')
+    parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
+    parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections')
+    parser.add_argument('--relu', type=str2bool, default=False, help='Use ReLU activation')
+    parser.add_argument('--gnn_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in GNN norm')
+    parser.add_argument('--mlp_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in MLP norm')
+    parser.add_argument('--multilayer', type=str2bool, default=True, help='Use multilayer structure for GCN')
+    parser.add_argument('--use_gin', type=str2bool, default=False, help='Use GIN variant for GCN')
+    
+    # === Training Configuration ===
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
+    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.000001, help='Weight decay')
+    parser.add_argument('--schedule', type=str, default='warmup', choices=['cosine', 'step', 'warmup', 'none'])
+    parser.add_argument('--nc_batch_size', type=int, default=4096, help='Node classification batch size')
+    parser.add_argument('--lp_batch_size', type=int, default=2048, help='Link prediction batch size')
+    parser.add_argument('--test_batch_size', type=int, default=4096, help='Test batch size')
+    parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
+    
+    # === Joint Training Specific ===
+    parser.add_argument('--lambda_nc', type=float, default=1.0, help='Weight for node classification loss')
+    parser.add_argument('--lambda_lp', type=float, default=1.0, help='Weight for link prediction loss')
+    
+    # === Dataset Configuration ===
+    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Reddit', 
+                       help='Node classification training datasets')
+    parser.add_argument('--nc_test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS', 
+                       help='Node classification test datasets')
+    parser.add_argument('--lp_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPage', 
+                       help='Link prediction training datasets')
+    parser.add_argument('--lp_test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab', 
+                       help='Link prediction test datasets')
+    
+    # === Model Components ===
+    parser.add_argument('--use_identity_projection', type=str2bool, default=True, help='Use identity projection')
+    
+    # === PFN Predictor Configuration ===
+    parser.add_argument('--context_num', type=int, default=20, help='Number of context nodes')
+    parser.add_argument('--seperate', type=str2bool, default=True, help='Separate processing in PFN predictor')
+    parser.add_argument('--padding', type=str, default='zero', choices=['zero', 'mlp'], help='Padding method for PFN predictor')
+    parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'mlp'], help='Similarity function')
+    parser.add_argument('--orthogonal_push', type=float, default=0.000001, help='Orthogonal push regularization weight')
+    parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize class embeddings')
+    
+    # === Data Processing ===
+    parser.add_argument('--use_full_pca', type=str2bool, default=False, help='Use full PCA decomposition')
+    parser.add_argument('--normalize_data', type=str2bool, default=False, help='Normalize input data')
+    parser.add_argument('--padding_strategy', type=str, default='random', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
+    parser.add_argument('--use_batchnorm', type=str2bool, default=False, help='Use BatchNorm instead of LayerNorm')
+    parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
+    parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
+    
+    # === Link Prediction Specific ===
+    parser.add_argument('--context_neg_ratio', type=int, default=1, help='Negative sampling ratio for context')
+    parser.add_argument('--train_neg_ratio', type=int, default=1, help='Negative sampling ratio for training')
+    parser.add_argument('--context_k', type=int, default=128, help='Number of context samples for link prediction')
+    parser.add_argument('--remove_context_from_train', type=str2bool, default=False, help='Remove context from training set')
+    parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
+    
+    # === Checkpointing ===
+    parser.add_argument('--save_checkpoint', type=str2bool, default=False, help='Save model checkpoints')
+    parser.add_argument('--checkpoint_dir', type=str, default='../checkpoints', help='Checkpoint directory')
+    parser.add_argument('--checkpoint_name', type=str, default=None, help='Custom checkpoint name')
+    parser.add_argument('--load_checkpoint', type=str, default=None, help='Path to checkpoint to load')
+    parser.add_argument('--use_pretrained_model', type=str2bool, default=False, help='Use pretrained model')
+    
+    # === Safe Learning Rate ===
+    parser.add_argument('--safe_transformer_layers', type=int, default=5, help='Max transformer layers for safe LR')
+    parser.add_argument('--safe_lr', type=float, default=0.0001, help='Safe learning rate for deep transformers')
+    
+    # === Logging and Monitoring ===
+    parser.add_argument('--log_level', type=str, default='INFO', 
+                       choices=['QUIET', 'INFO', 'DEBUG', 'VERBOSE'])
+    parser.add_argument('--log_interval', type=int, default=1, help='Logging interval (epochs)')
+    parser.add_argument('--eval_interval', type=int, default=1, help='Evaluation interval (epochs)')
+    
+    # === Experiment Tracking ===
+    parser.add_argument('--sweep', type=str2bool, default=False, help='Running hyperparameter sweep')
+    
+    args = parser.parse_args()
+    return args

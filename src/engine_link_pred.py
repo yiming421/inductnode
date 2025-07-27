@@ -93,26 +93,12 @@ def get_link_prototypes(node_embeddings, context_data, att_pool, mlp_pool, norma
 
 
 def train_link_prediction(model, predictor, data, train_edges, context_edges, train_mask, optimizer, 
-                          batch_size, att, mlp, projector=None, identity_projection=None, 
-                          clip_grad=1.0, rank=0, orthogonal_push=0.0, 
-                          normalize_class_h=False, epoch=0, mask_target_edges=False, degree=False):
+                          batch_size, att=None, mlp=None, projector=None, identity_projection=None, 
+                          clip_grad=1.0, rank=0, orthogonal_push=0.0, normalize_class_h=False, 
+                          epoch=0, mask_target_edges=False, degree=False, lambda_=1.0):
     """
     Train link prediction using the PFN methodology.
     """
-    import signal
-    import sys
-    
-    # Set up timeout handler for debugging deadlocks
-    def timeout_handler(signum, frame):
-        print(f"[TIMEOUT] Rank {rank}: Training function timed out! Possible deadlock detected.")
-        print(f"[TIMEOUT] Rank {rank}: Current frame: {frame}")
-        import traceback
-        traceback.print_stack(frame)
-        # Don't exit immediately, just log
-    
-    # Set a 120 second timeout for training function
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(120)
     
     try:
         print(f"Rank {rank}: Starting link prediction training for epoch {epoch}")
@@ -185,8 +171,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 # Convert batch indices back to device
                 batch_idx = batch_idx.to(device)
                 
-                # Zero gradients
-                optimizer.zero_grad()
+                # Only zero gradients if optimizer is provided (for joint training compatibility)
+                if optimizer is not None:
+                    optimizer.zero_grad()
 
                 # --- Optional: Masking Target Edges ---
                 adj_for_gnn = data.adj_t
@@ -254,7 +241,8 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     continue
 
                 # Use unified PFNPredictorNodeCls for link prediction
-                scores = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), link_prototypes)
+                scores = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), 
+                                   link_prototypes, "link_prediction")
                 
                 # Use the train_mask to ensure loss is only calculated on non-context edges
                 # Make sure the mask is properly aligned with batch indices
@@ -285,6 +273,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     orthogonal_loss = torch.tensor(0.0, device=device)
                     
                 loss = nll_loss + orthogonal_push * orthogonal_loss
+                loss = loss * lambda_  # Apply lambda scaling
                 
                 try:
                     loss.backward()
@@ -305,6 +294,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     if identity_projection: torch.nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
                 
                 optimizer.step()
+                
                 batch_count += 1
                     
                 if rank == 0 and batch_count % 100 == 0:  # Only print every 100 batches
@@ -319,7 +309,8 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 continue
 
         if rank == 0:
-            print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {total_loss:.4f}, Batch count: {batch_count}")
+            loss_str = f"{total_loss:.4f}" if optimizer is not None else "tensor"
+            print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {loss_str}, Batch count: {batch_count}")
         
         # Final synchronization to ensure all processes complete training
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -332,10 +323,6 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         import traceback
         print(f"[ERROR] Rank {rank}: Traceback: {traceback.format_exc()}")
         raise
-    finally:
-        # Reset the alarm
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
 
 def get_dataset_default_metric(dataset_name):
     """Get the default metric for each dataset."""
@@ -442,7 +429,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             target_edge_embeds = src_embeds * dst_embeds
             
             # Use the unified predictor for link prediction
-            batch_scores = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), link_prototypes)
+            batch_scores = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
+                                     link_prototypes, "link_prediction")
             # Use the positive class score (class 1)
             pos_scores.append(batch_scores[:, 1])
         
@@ -459,7 +447,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             target_edge_embeds = src_embeds * dst_embeds
             
             # Use the unified predictor for link prediction  
-            batch_scores = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), link_prototypes)
+            batch_scores = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
+                                     link_prototypes, "link_prediction")
             # Use the positive class score (class 1)
             neg_scores.append(batch_scores[:, 1])
         

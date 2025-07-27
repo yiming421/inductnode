@@ -9,7 +9,7 @@ from .utils import process_node_features, acc, apply_final_pca
 
 def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None, 
           orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, rank=0, epoch=0, 
-          identity_projection=None):
+          identity_projection=None, lambda_=1.0):
     st = time.time()
     print(f"[RANK {rank}] Starting training epoch {epoch} on device cuda:{rank}", flush=True)
 
@@ -85,7 +85,9 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         
         nll_loss = F.nll_loss(score, label)
         loss = nll_loss + orthogonal_push * orthogonal_loss
+        loss = loss * lambda_  # Apply lambda scaling
 
+        # Only perform optimization if optimizer is provided (for joint training compatibility)
         optimizer.zero_grad()
         loss.backward()
         
@@ -109,17 +111,21 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     en = time.time()
     if rank == 0:
         print(f"Train time: {en-st:.2f}s", flush=True)
-    print(f"[RANK {rank}] Completed training epoch {epoch}, loss: {total_loss / len(dataloader):.4f}", flush=True)
     
-    return total_loss / len(dataloader)
+    loss_str = f"{total_loss / len(dataloader):.4f}" if optimizer is not None else "tensor"
+    print(f"[RANK {rank}] Completed training epoch {epoch}, loss: {loss_str}", flush=True)
+    
+    return total_loss / len(dataloader)  # Return scalar for normal training
 
 def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, degree=False, att=None,
-              mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, rank=0, epoch=0, identity_projection=None):
+              mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, 
+              rank=0, epoch=0, identity_projection=None, lambda_=1.0):
     tot_loss = 0
     for data, split_idx in zip(data_list, split_idx_list):
         train_idx = split_idx['train']
         loss = train(model, data, train_idx, optimizer, pred, batch_size, degree, att, mlp,
-                     orthogonal_push, normalize_class_h, clip_grad, projector, rank, epoch, identity_projection)
+                     orthogonal_push, normalize_class_h, clip_grad, projector, rank, epoch, 
+                     identity_projection, lambda_)
         if rank == 0:
             print(f"Dataset {data.name} Loss: {loss}", flush=True)
         tot_loss += loss

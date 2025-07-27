@@ -1,6 +1,11 @@
 import os
 import torch
 import datetime
+import sys
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+from src.model import PFNPredictorNodeCls
 
 
 def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch, 
@@ -272,28 +277,6 @@ def create_pfn_components_from_config(args_dict, device='cpu'):
     return att, mlp, projector, identity_projection
 
 
-def create_predictor_from_config(args, att, mlp):
-    """Creates a PFN predictor from configuration."""
-    from .model import PFNPredictorNodeCls
-    
-    if args.predictor == 'PFN':
-        # Determine task type based on script or configuration
-        # For link prediction, we use 'link_prediction', otherwise 'node_classification'
-        task_type = getattr(args, 'task_type', 'node_classification')
-        if not hasattr(args, 'task_type'):
-            # Try to infer from the script or configuration
-            # If this is called from link prediction script, set task_type appropriately
-            task_type = 'link_prediction'  # Default for inductnode link prediction
-
-        return PFNPredictorNodeCls(
-            args.hidden, args.nhead, args.transformer_layers, args.mlp_layers, args.dp, args.norm,
-            separate_att=args.seperate, degree=args.degree, att=att, mlp=mlp, sim=args.sim,
-            padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
-            task_type=task_type
-        )
-    else:
-        raise NotImplementedError(f"Predictor {args.predictor} not implemented.")
-
 def create_model_from_args(args, input_dim, device):
     """Creates a GNN model and all PFN components from command-line arguments."""
     from .model import PureGCN, PureGCN_v1, GCN, AttentionPool, MLP, IdentityProjection
@@ -314,7 +297,11 @@ def create_model_from_args(args, input_dim, device):
     mlp = MLP(args.hidden, args.hidden, args.hidden, args.mlp_layers, args.dp, args.norm, False, args.mlp_norm_affine).to(device) if args.mlp_pool else None
     
     # Predictor
-    predictor = create_predictor_from_config(args, att, mlp).to(device)
+    predictor = PFNPredictorNodeCls(
+            args.hidden, args.nhead, args.transformer_layers, args.mlp_layers, args.dp, args.norm,
+            separate_att=args.seperate, degree=args.degree, att=att, mlp=mlp, sim=args.sim,
+            padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
+        ).to(device) if args.predictor == 'PFN' else None
     
     projector = MLP(args.min_pca_dim, args.hidden, args.hidden, 2, args.dp, args.norm, False, args.mlp_norm_affine).to(device) if args.use_projector else None
     identity_projection = IdentityProjection(args.projection_small_dim, args.projection_large_dim).to(device) if args.use_identity_projection else None
@@ -352,7 +339,11 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
     if identity_projection is not None:
         identity_projection = identity_projection.to(device)
     
-    predictor = create_predictor_from_config(args, att, mlp).to(device)
+    predictor = PFNPredictorNodeCls(
+        args.hidden, args.nhead, args.transformer_layers, args.mlp_layers, args.dp, args.norm,
+        separate_att=args.seperate, degree=args.degree, att=att, mlp=mlp, sim=args.sim,
+        padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
+    ).to(device) if args.predictor == 'PFN' else None
     
     # 3. Load the saved states into the newly created objects
     load_checkpoint_states(

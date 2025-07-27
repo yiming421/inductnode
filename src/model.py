@@ -331,14 +331,13 @@ class PFNTransformerLayer(nn.Module):
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2, 
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot', 
-                 padding='zero', norm_affine=True, normalize=False, task_type='node_classification'):
+                 padding='zero', norm_affine=True, normalize=False):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
         self.embed_dim = hidden_dim + self.d_label  # Token dimension after concatenation
         self.sim = sim
         self.padding = padding
-        self.task_type = task_type  # 'node_classification' or 'link_prediction'
         
         if self.padding == 'mlp':
             self.pad_mlp = MLP(
@@ -378,7 +377,7 @@ class PFNPredictorNodeCls(nn.Module):
         self.mlp_pool = mlp
         self.normalize = normalize
     
-    def forward(self, data, context_x, target_x, context_y, class_x):
+    def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification'):
         """
         Unified forward pass supporting both node classification and link prediction.
         
@@ -397,6 +396,7 @@ class PFNPredictorNodeCls(nn.Module):
         - class_x: Link prototypes [2, hidden_dim]
         """
         # Step 1: Create context tokens
+
         class_x_y = class_x[context_y]  # [num_context, hidden_dim]
         context_tokens = torch.cat([context_x, class_x_y], dim=1)  # [num_context, 2*hidden_dim]
 
@@ -424,7 +424,7 @@ class PFNPredictorNodeCls(nn.Module):
         target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
         
         # Step 6: Compute refined class embeddings (different approaches for different tasks)
-        if self.task_type == 'node_classification':
+        if task_type == 'node_classification':
             # Use process_node_features for node classification
             class_emb = process_node_features(
                 context_label_emb,
@@ -435,7 +435,7 @@ class PFNPredictorNodeCls(nn.Module):
                 normalize=self.normalize
             )
             data.final_class_h = class_emb
-        elif self.task_type == 'link_prediction':
+        elif task_type == 'link_prediction':
             # Use custom pooling for link prediction (no dependency on data.y or data.context_sample)
             device = target_label_emb.device
             num_classes = class_x.size(0)  # Should be 2 for link prediction

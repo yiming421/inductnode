@@ -326,11 +326,8 @@ def process_link_data(data, args, rank=0):
     projection_small_dim = args.projection_small_dim
     projection_large_dim = args.projection_large_dim
     use_full_pca = args.use_full_pca
-    sign_normalize = args.sign_normalize
     normalize_data = args.normalize_data
     use_batchnorm = args.use_batchnorm
-    use_projector = args.use_projector
-    min_pca_dim = args.min_pca_dim
     padding_strategy = args.padding_strategy
     
     # Identity projection approach
@@ -341,12 +338,6 @@ def process_link_data(data, args, rank=0):
         
         if original_dim >= projection_small_dim:
             U, S, V = torch.pca_lowrank(data.x, q=projection_small_dim)
-            if sign_normalize:
-                for i in range(projection_small_dim):
-                    feature_vector = U[:, i] * S[i]
-                    max_idx = torch.argmax(torch.abs(feature_vector))
-                    if feature_vector[max_idx] < 0:
-                        U[:, i] = -U[:, i]
             data.x_pca = torch.mm(U, torch.diag(S))
         else:
             data.x_pca = data.x
@@ -365,9 +356,6 @@ def process_link_data(data, args, rank=0):
         if original_dim >= hidden_dim:
             pca_target_dim = hidden_dim
             data.needs_projection = False
-        elif use_projector:
-            pca_target_dim = min(original_dim, min_pca_dim)
-            data.needs_projection = True
         else:
             pca_target_dim = original_dim
             data.needs_projection = False
@@ -380,13 +368,6 @@ def process_link_data(data, args, rank=0):
         U = U[:, :pca_target_dim]
         S = S[:pca_target_dim]
         
-        if sign_normalize:
-            for i in range(pca_target_dim):
-                feature_vector = U[:, i] * S[i]
-                max_idx = torch.argmax(torch.abs(feature_vector))
-                if feature_vector[max_idx] < 0:
-                    U[:, i] = -U[:, i]
-        
         data.x_pca = torch.mm(U, torch.diag(S)).to(device)
         
         if data.needs_projection:
@@ -396,11 +377,30 @@ def process_link_data(data, args, rank=0):
             if data.x_pca.size(1) < hidden_dim:
                 padding_size = hidden_dim - data.x_pca.size(1)
                 if padding_strategy == 'zero':
+                                    # Zero padding (can harm performance due to distribution mismatch)
                     padding = torch.zeros(data.x_pca.size(0), padding_size, device=device)
                     data.x = torch.cat([data.x_pca, padding], dim=1)
-                else: # Fallback to zero for simplicity in link pred
-                    padding = torch.zeros(data.x_pca.size(0), padding_size, device=device)
-                    data.x = torch.cat([data.x_pca, padding], dim=1)
+                    if rank == 0:
+                        print(f"Dataset {data.name}: Applied zero padding ({data.x_pca.size(1)} -> {hidden_dim})")
+                elif padding_strategy == 'random':
+                    # Random padding from same distribution as real features
+                    real_std = data.x_pca.std(dim=0, keepdim=True)
+                    real_mean = data.x_pca.mean(dim=0, keepdim=True)
+                    random_padding = torch.randn(data.x_pca.size(0), padding_size, device=device) * real_std.mean() + real_mean.mean()
+                    data.x = torch.cat([data.x_pca, random_padding], dim=1)
+                    if rank == 0:
+                        print(f"Dataset {data.name}: Applied random padding ({data.x_pca.size(1)} -> {hidden_dim})")
+                elif padding_strategy == 'repeat':
+                    # Feature repetition
+                    data.x = data.x_pca
+                    while data.x.size(1) < hidden_dim:
+                        remaining = hidden_dim - data.x.size(1)
+                        repeat_size = min(remaining, data.x_pca.size(1))
+                        data.x = torch.cat([data.x, data.x_pca[:, :repeat_size]], dim=1)
+                    if rank == 0:
+                        print(f"Dataset {data.name}: Applied feature repetition padding")
+                else:
+                    raise ValueError(f"Unknown padding strategy: {padding_strategy}")
             else:
                 data.x = data.x_pca
             data.needs_final_pca = False
