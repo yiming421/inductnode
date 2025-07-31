@@ -39,7 +39,9 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         # Apply different projection strategies
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
             # Apply identity projection
+            # print(f"Using identity projection for data.x with shape {data.x.shape}", flush=True)
             x_input = identity_projection(data.x)
+            # print(f"Projected x_input shape: {x_input.shape}", flush=True)
         elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
             projected_features = projector(data.x)
             # Apply final PCA to get features in proper PCA form

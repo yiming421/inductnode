@@ -139,6 +139,18 @@ def run_ddp(rank, world_size, args, results_dict=None):
         # For checkpoint loading, we don't need to load training data
         data_list, split_idx_list = [], []
 
+    test_dataset = args.test_dataset.split(',')
+    test_data_list, test_split_idx_list = load_all_data(test_dataset)
+
+    for data, split_idx in zip(test_data_list, test_split_idx_list):
+        data.x = data.x.to(device)
+        data.adj_t = data.adj_t.to(device)
+        data.y = data.y.to(device)
+        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, 
+                     args.normalize_data, args.use_projector, args.min_pca_dim, 0, 
+                     args.padding_strategy, args.use_batchnorm, args.use_identity_projection,
+                     args.projection_small_dim, args.projection_large_dim)
+
     att, mlp = None, None
 
     if args.att_pool:
@@ -284,13 +296,35 @@ def run_ddp(rank, world_size, args, results_dict=None):
             if scheduler is not None:
                 scheduler.step()
             
-            train_metric, valid_metric, test_metric = \
-            test_all(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
-                     att, mlp, args.normalize_class_h, projector, rank, identity_projection)
+            # Get individual dataset metrics during training for better monitoring
+            train_metric_list, valid_metric_list, test_metric_list = \
+            test_all_induct(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
+                           att, mlp, args.normalize_class_h, projector, rank, identity_projection)
+            
+            # Calculate aggregated metrics (geometric mean)
+            train_metric = (sum(train_metric_list) / len(train_metric_list)) if train_metric_list else 0
+            valid_metric = (sum(valid_metric_list) / len(valid_metric_list)) if valid_metric_list else 0
+            test_metric = (sum(test_metric_list) / len(test_metric_list)) if test_metric_list else 0
             
             if rank == 0:
-                wandb.log({'train_loss': loss, 'train_metric': train_metric, 'valid_metric': valid_metric, 
-                           'test_metric': test_metric})
+                # Log aggregated metrics
+                log_dict = {
+                    'epoch': epoch,
+                    'train_loss': loss, 
+                    'train_metric_avg': train_metric, 
+                    'valid_metric_avg': valid_metric, 
+                    'test_metric_avg': test_metric
+                }
+                
+                # Log individual dataset metrics during training for progress tracking
+                for i, data in enumerate(data_list):
+                    dataset_name = data.name
+                    log_dict.update({
+                        f'train_{dataset_name}_test_metric': test_metric_list[i]
+                    })
+                    print(f"  {dataset_name}: Train={train_metric_list[i]:.4f}, Valid={valid_metric_list[i]:.4f}, Test={test_metric_list[i]:.4f}")
+                
+                wandb.log(log_dict)
                 en = time.time()
                 print(f"Epoch time: {en-st}", flush=True)
             
@@ -329,23 +363,10 @@ def run_ddp(rank, world_size, args, results_dict=None):
                     module_to_load.load_state_dict(state)
         else:
             if rank == 0: print("Warning: No best model found, using the final model state.")
-    
-    test_dataset = args.test_dataset.split(',')
-    data_list, split_idx_list = load_all_data(test_dataset)
 
-    for data, split_idx in zip(data_list, split_idx_list):
-        data.x = data.x.to(device)
-        data.y = data.y.to(device)
-        data.adj_t = data.adj_t.to(device)
-        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, 
-                     args.normalize_data, args.use_projector, args.min_pca_dim, rank, 
-                     args.padding_strategy, args.use_batchnorm, args.use_identity_projection,
-                     args.projection_small_dim, args.projection_large_dim)
-
-    st_total = time.time()
     st = time.time()
     train_metric_list, valid_metric_list, test_metric_list = \
-    test_all_induct(model, predictor, data_list, split_idx_list, args.test_batch_size, 
+    test_all_induct(model, predictor, test_data_list, test_split_idx_list, args.test_batch_size, 
                     args.degree, att, mlp, args.normalize_class_h, projector, rank, identity_projection)
     
     train_metric = sum(train_metric_list) / len(train_metric_list)
@@ -353,20 +374,39 @@ def run_ddp(rank, world_size, args, results_dict=None):
     test_metric = sum(test_metric_list) / len(test_metric_list)
     
     if rank == 0:
-        print(f"Test time: {time.time()-st}", flush=True)
-        for i, data in enumerate(data_list):
-            print(f"Dataset {data.name}")
-            print(f"Train {train_metric_list[i]}")
-            print(f"Valid {valid_metric_list[i]}")
-            print(f"Test {test_metric_list[i]}")
-            wandb.log({f'{data.name}_train_metric': train_metric_list, 
-                       f'{data.name}_valid_metric': valid_metric_list[i], 
-                       f'{data.name}_test_metric': test_metric_list[i]})
+        print(f"\n=== FINAL TEST RESULTS ===")
+        print(f"Test time: {time.time()-st:.2f} seconds", flush=True)
         
-        print(f'induct_train_metric: {train_metric}, induct_valid_metric: {valid_metric}, induct_test_metric: {test_metric}', flush=True)
-        wandb.log({'induct_train_metric': train_metric, 'induct_valid_metric': valid_metric, 
-                   'induct_test_metric': test_metric})
-        print(f"Total time: {time.time()-st_total}", flush=True)
+        # Create comprehensive logging dictionary
+        final_log_dict = {
+            'induct_test_metric_avg': test_metric,
+            'total_time': time.time()-st
+        }
+        
+        # Log individual dataset results with better formatting
+        print(f"\nIndividual Dataset Results:")
+        for i, data in enumerate(test_data_list):
+            dataset_name = data.name
+            print(f"  {dataset_name}:")
+            print(f"    Train: {train_metric_list[i]:.4f}")
+            print(f"    Valid: {valid_metric_list[i]:.4f}")
+            print(f"    Test:  {test_metric_list[i]:.4f}")
+            
+            # Add individual dataset metrics to logging
+            final_log_dict.update({
+                f'final_{dataset_name}_train_metric': train_metric_list[i],
+                f'final_{dataset_name}_valid_metric': valid_metric_list[i],
+                f'final_{dataset_name}_test_metric': test_metric_list[i]
+            })
+        
+        print(f"\nAverage Metrics Across All Datasets:")
+        print(f"  Train: {train_metric:.4f}")
+        print(f"  Valid: {valid_metric:.4f}")
+        print(f"  Test:  {test_metric:.4f}")
+        print(f"Total time: {time.time()-st_total:.2f} seconds", flush=True)
+        
+        # Log everything to wandb
+        wandb.log(final_log_dict)
 
     # Store results for collection (only rank 0 stores results)
     if rank == 0 and results_dict is not None:
@@ -488,6 +528,18 @@ def run_single_gpu(args, device='cuda:0'):
     else:
         # For checkpoint loading, we don't need to load training data
         data_list, split_idx_list = [], []
+
+    test_dataset = args.test_dataset.split(',')
+    test_data_list, test_split_idx_list = load_all_data(test_dataset)
+
+    for data, split_idx in zip(test_data_list, test_split_idx_list):
+        data.x = data.x.to(device)
+        data.y = data.y.to(device)
+        data.adj_t = data.adj_t.to(device)
+        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, 
+                     args.normalize_data, args.use_projector, args.min_pca_dim, 0, 
+                     args.padding_strategy, args.use_batchnorm, args.use_identity_projection,
+                     args.projection_small_dim, args.projection_large_dim)
 
     att, mlp = None, None
 
@@ -611,12 +663,51 @@ def run_single_gpu(args, device='cuda:0'):
             if scheduler is not None:
                 scheduler.step()
             
-            train_metric, valid_metric, test_metric = \
-            test_all(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
-                     att, mlp, args.normalize_class_h, projector, rank=0, identity_projection=identity_projection)
+            # Get individual dataset metrics during training for better monitoring
+            train_metric_list, valid_metric_list, test_metric_list = \
+            test_all_induct(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
+                           att, mlp, args.normalize_class_h, projector, rank=0, identity_projection=identity_projection)
             
-            wandb.log({'train_loss': loss, 'train_metric': train_metric, 'valid_metric': valid_metric, 
-                       'test_metric': test_metric})
+            # Calculate aggregated metrics (arithmetic mean for single GPU)
+            train_metric = sum(train_metric_list) / len(train_metric_list) if train_metric_list else 0
+            valid_metric = sum(valid_metric_list) / len(valid_metric_list) if valid_metric_list else 0
+            test_metric = sum(test_metric_list) / len(test_metric_list) if test_metric_list else 0
+
+            induct_train_metric_list, induct_valid_metric_list, induct_test_metric_list = \
+            test_all_induct(model, predictor, test_data_list, test_split_idx_list, args.test_batch_size, args.degree, 
+                            att, mlp, args.normalize_class_h, projector, rank=0, identity_projection=identity_projection)
+
+            induct_train_metric = sum(induct_train_metric_list) / len(induct_train_metric_list)
+            induct_valid_metric = sum(induct_valid_metric_list) / len(induct_valid_metric_list)
+            induct_test_metric = sum(induct_test_metric_list) / len(induct_test_metric_list)
+            
+            # Log aggregated metrics
+            log_dict = {
+                'epoch': epoch,
+                'train_loss': loss, 
+                'train_metric_avg': train_metric, 
+                'valid_metric_avg': valid_metric, 
+                'test_metric_avg': test_metric,
+                'induct_test_metric_avg': induct_test_metric
+            }
+            
+            # Log individual dataset metrics during training for progress tracking
+            for i, data in enumerate(data_list):
+                dataset_name = data.name
+                log_dict.update({
+                    f'train_{dataset_name}_test_metric': test_metric_list[i],
+                })
+                print(f"  {dataset_name}: Train={train_metric_list[i]:.4f}, Valid={valid_metric_list[i]:.4f}, Test={test_metric_list[i]:.4f}")
+            
+            for i, data in enumerate(test_data_list):
+                dataset_name = data.name
+                log_dict.update({
+                    f'induct_{dataset_name}_test_metric': induct_test_metric_list[i],
+                })
+                print(f"  {dataset_name}: Induct Train={induct_train_metric_list[i]:.4f}, "
+                      f"Induct Valid={induct_valid_metric_list[i]:.4f}, Induct Test={induct_test_metric_list[i]:.4f}")
+            
+            wandb.log(log_dict)
             en = time.time()
             print(f"Epoch time: {en-st}", flush=True)
             
@@ -636,8 +727,14 @@ def run_single_gpu(args, device='cuda:0'):
                 if identity_projection is not None:
                     best_states['identity_projection'] = copy.deepcopy(identity_projection.state_dict())
 
+        print(f"Memory: {torch.cuda.max_memory_allocated() / 1e9} GB", flush=True)
+        print(f"Training completed in: {time.time()-st_all:.2f} seconds", flush=True)
+        wandb.log({'final_test_training': final_test, 'best_epoch': best_epoch, 'best_valid': best_valid})
+        print(f"Best epoch: {best_epoch}, Best valid: {best_valid:.4f}, Final test: {final_test:.4f}", flush=True)
+
         # Load best model weights for all components
         if best_states['model'] is not None:
+            print("Loading best model states for all components...")
             model.load_state_dict(best_states['model'])
             predictor.load_state_dict(best_states['predictor'])
             if att is not None and best_states['att'] is not None:
@@ -648,59 +745,55 @@ def run_single_gpu(args, device='cuda:0'):
                 projector.load_state_dict(best_states['projector'])
             if identity_projection is not None and best_states['identity_projection'] is not None:
                 identity_projection.load_state_dict(best_states['identity_projection'])
-    
-    test_dataset = args.test_dataset.split(',')
-    data_list, split_idx_list = load_all_data(test_dataset)
-
-    for data, split_idx in zip(data_list, split_idx_list):
-        data.x = data.x.to(device)
-        data.adj_t = data.adj_t.to(device)
-        data.y = data.y.to(device)
-        process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, 
-                     args.normalize_data, args.use_projector, args.min_pca_dim, 0, 
-                     args.padding_strategy, args.use_batchnorm, args.use_identity_projection,
-                     args.projection_small_dim, args.projection_large_dim)
+        else:
+            print("Warning: No best model found, using the final model state.")
 
     train_metric_list, valid_metric_list, test_metric_list = \
-    test_all_induct(model, predictor, data_list, split_idx_list, args.test_batch_size, args.degree, 
+    test_all_induct(model, predictor, test_data_list, test_split_idx_list, args.test_batch_size, args.degree, 
                     att, mlp, args.normalize_class_h, projector, rank=0, identity_projection=identity_projection)
 
     train_metric = sum(train_metric_list) / len(train_metric_list)
     valid_metric = sum(valid_metric_list) / len(valid_metric_list)
     test_metric = sum(test_metric_list) / len(test_metric_list)
 
-    print(f"Test time for individual datasets:")
-    for i, data in enumerate(data_list):
-        print(f"Dataset {data.name}")
-        print(f"Train {train_metric_list[i]}")
-        print(f"Valid {valid_metric_list[i]}")
-        print(f"Test {test_metric_list[i]}")
-        wandb.log({f'{data.name}_train_metric': train_metric_list[i], 
-                   f'{data.name}_valid_metric': valid_metric_list[i], 
-                   f'{data.name}_test_metric': test_metric_list[i]})
+    print(f"\n=== FINAL TEST RESULTS ===")
+    print(f"Test time: {time.time()-st:.2f} seconds", flush=True)
     
-    print(f'induct_train_metric: {train_metric}, induct_valid_metric: {valid_metric}, induct_test_metric: {test_metric}', flush=True)
-    wandb.log({'induct_train_metric': train_metric, 'induct_valid_metric': valid_metric, 
-               'induct_test_metric': test_metric})
+    en_all = time.time()
+    total_time = en_all - st_all
+    # Create comprehensive logging dictionary
+    final_log_dict = {
+        'induct_test_metric_avg': test_metric,
+        'final_test_time': time.time()-st,
+        'best_epoch': best_epoch,
+        'total_time': total_time
+    }
+    
+    # Log individual dataset results with better formatting
+    print(f"\nIndividual Dataset Results:")
+    for i, data in enumerate(test_data_list):
+        dataset_name = data.name
+        print(f"  {dataset_name}:")
+        print(f"    Train: {train_metric_list[i]:.4f}")
+        print(f"    Valid: {valid_metric_list[i]:.4f}")
+        print(f"    Test:  {test_metric_list[i]:.4f}")
+        
+        # Add individual dataset metrics to logging
+        final_log_dict.update({
+            f'final_{dataset_name}_test_metric': test_metric_list[i]
+        })
+    
+    print(f"\nAverage Metrics Across All Datasets:")
+    print(f"  Train: {train_metric:.4f}")
+    print(f"  Valid: {valid_metric:.4f}")
+    print(f"  Test:  {test_metric:.4f}")
+    
+    # Log everything to wandb
+    wandb.log(final_log_dict)
 
     en_all = time.time()
     total_time = en_all - st_all
-    print(f"Total time: {total_time:.2f} seconds", flush=True)
-    
-    wandb.log({
-        'best_epoch': best_epoch,
-        'best_valid': best_valid,
-        'final_train': train_metric,
-        'final_valid': valid_metric,
-        'final_test': test_metric,
-        'total_time': total_time
-    })
-    
-    print(f'Best epoch: {best_epoch}')
-    print(f'Best valid: {best_valid}')
-    print(f'Final train: {train_metric}')
-    print(f'Final valid: {valid_metric}')
-    print(f'Final test: {test_metric}')
+    print(f"\\nTotal time: {total_time:.2f} seconds", flush=True)
 
     # Save checkpoint if requested
     if args.save_checkpoint and args.load_checkpoint is None:

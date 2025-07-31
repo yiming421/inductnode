@@ -39,20 +39,19 @@ def create_unified_model(args, input_dim, device):
     """
     # Initialize optional components
     identity_projection = None
+
+    hidden = args.projection_large_dim if args.use_identity_projection else args.hidden
         
     if args.use_identity_projection:
-        identity_projection = IdentityProjection(input_dim, args.projection_large_dim)
+        identity_projection = IdentityProjection(args.projection_small_dim, args.projection_large_dim)
         identity_projection = identity_projection.to(device)
     
     # Create GNN backbone
     if args.model == 'PureGCN_v1':
-        model = PureGCN_v1(args.projection_large_dim, args.num_layers, args.projection_large_dim, args.dp, args.norm, 
+        model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm, 
                           args.res, args.relu, args.gnn_norm_affine)
-    elif args.model == 'PureGCN':
-        model = PureGCN(args.projection_large_dim, args.num_layers, args.projection_large_dim, args.dp, args.norm, 
-                       args.res, args.relu, args.gnn_norm_affine)
     elif args.model == 'GCN':
-        model = GCN(args.projection_large_dim, args.projection_large_dim, args.norm, args.relu, args.num_layers, args.dp,
+        model = GCN(hidden, hidden, args.norm, args.relu, args.num_layers, args.dp,
                    args.multilayer, args.use_gin, args.res, args.gnn_norm_affine)
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
@@ -60,7 +59,7 @@ def create_unified_model(args, input_dim, device):
     # Create unified predictor (same for both tasks)
     if args.predictor == 'PFN':
         predictor = PFNPredictorNodeCls(
-            args.projection_large_dim, args.nhead, args.transformer_layers, args.mlp_layers, 
+            hidden, args.nhead, args.transformer_layers, args.mlp_layers, 
             args.dp, args.norm, args.seperate, False, None, None, args.sim, 
             args.padding, args.mlp_norm_affine, args.normalize_class_h
         )
@@ -94,6 +93,7 @@ def load_and_preprocess_data(args, device):
         data.adj_t = data.adj_t.to(device)
         data.y = data.y.to(device)
         # Apply node classification specific preprocessing
+
         process_data(data, split_idx, args.hidden, args.context_num, False, args.use_full_pca, 
                     args.normalize_data, False, 32, 0, args.padding_strategy, 
                     args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim)
@@ -422,7 +422,7 @@ def run_joint_training(args, device='cuda:0'):
         # Compute combined validation score on seen datasets
         nc_valid_seen = seen_valid_results['nc_metrics'].get('valid', 0.0)
         lp_valid_seen = seen_valid_results['lp_metrics'].get('valid', 0.0)
-        combined_valid_seen = args.lambda_nc * nc_valid_seen + args.lambda_lp * lp_valid_seen
+        combined_valid_seen = nc_valid_seen + lp_valid_seen
         
         # Save best model based on seen validation performance
         if combined_valid_seen > best_valid_score:
@@ -447,7 +447,7 @@ def run_joint_training(args, device='cuda:0'):
             
             nc_test_unseen = nc_unseen_results.get('test', 0.0)
             lp_test_unseen = lp_unseen_results.get('test', 0.0)
-            combined_test_unseen = args.lambda_nc * nc_test_unseen + args.lambda_lp * lp_test_unseen
+            combined_test_unseen = nc_test_unseen + lp_test_unseen
             
             # Get individual dataset metrics
             nc_individual = nc_unseen_results.get('individual_test_metrics', [])
@@ -549,12 +549,16 @@ def run_joint_training(args, device='cuda:0'):
     wandb.log({
         'test/nc_metric': nc_test_metric,
         'test/lp_metric': lp_test_metric,
-        'test/combined_score': args.lambda_nc * nc_test_metric + args.lambda_lp * lp_test_metric,
+        'test/combined_score': nc_test_metric + lp_test_metric,
         'best_epoch': best_epoch,
         'best_valid_score': best_valid_score
     })
     
-    return nc_test_metric, lp_test_metric
+    # Return both average metrics and individual dataset metrics
+    nc_individual = nc_test_results.get('individual_test_metrics', [])
+    lp_individual = lp_test_results.get('individual_test_metrics', [])
+    
+    return nc_test_metric, lp_test_metric, nc_individual, lp_individual
 
 
 def main():
@@ -588,6 +592,8 @@ def main():
     
     all_nc_results = []
     all_lp_results = []
+    all_nc_individual_results = []
+    all_lp_individual_results = []
     
     for run in range(args.runs):
         print(f"\n{'='*50}")
@@ -597,13 +603,31 @@ def main():
         # Set different seed for each run
         torch.manual_seed(args.seed + run)
         
-        nc_result, lp_result = run_joint_training(args, device)
+        nc_result, lp_result, nc_individual, lp_individual = run_joint_training(args, device)
         all_nc_results.append(nc_result)
         all_lp_results.append(lp_result)
+        all_nc_individual_results.append(nc_individual)
+        all_lp_individual_results.append(lp_individual)
     
     # Aggregate results
     avg_nc = sum(all_nc_results) / len(all_nc_results)
     avg_lp = sum(all_lp_results) / len(all_lp_results)
+    
+    # Aggregate individual dataset metrics across runs
+    avg_nc_individual = []
+    avg_lp_individual = []
+    
+    if all_nc_individual_results and all_nc_individual_results[0]:
+        num_nc_datasets = len(all_nc_individual_results[0])
+        for dataset_idx in range(num_nc_datasets):
+            dataset_metrics = [run_results[dataset_idx] for run_results in all_nc_individual_results if len(run_results) > dataset_idx]
+            avg_nc_individual.append(sum(dataset_metrics) / len(dataset_metrics))
+    
+    if all_lp_individual_results and all_lp_individual_results[0]:
+        num_lp_datasets = len(all_lp_individual_results[0])
+        for dataset_idx in range(num_lp_datasets):
+            dataset_metrics = [run_results[dataset_idx] for run_results in all_lp_individual_results if len(run_results) > dataset_idx]
+            avg_lp_individual.append(sum(dataset_metrics) / len(dataset_metrics))
     
     print(f"\n{'='*50}")
     print(f"Final Results (Average over {args.runs} runs)")
@@ -615,14 +639,27 @@ def main():
     sweep_metric = args.lambda_nc * avg_nc + args.lambda_lp * avg_lp
     print(f"Combined Score: {sweep_metric:.4f}")
     
+    # Get dataset names
+    nc_test_datasets = args.nc_test_dataset.split(',')
+    lp_test_datasets = args.lp_test_dataset.split(',')
+    
     # Log final aggregated results
     wandb.init(project='inductnode-joint-summary')
-    wandb.log({
+    final_log = {
         'final/avg_nc_metric': avg_nc,
         'final/avg_lp_metric': avg_lp,
         'final/combined_score': sweep_metric,
         'runs': args.runs
-    })
+    }
+    
+    # Add individual dataset metrics
+    for dataset_name, metric in zip(nc_test_datasets, avg_nc_individual):
+        final_log[f'final/nc_{dataset_name.strip()}'] = metric
+    
+    for dataset_name, metric in zip(lp_test_datasets, avg_lp_individual):
+        final_log[f'final/lp_{dataset_name.strip()}'] = metric
+    
+    wandb.log(final_log)
     
     print("\n🎉 Joint training completed successfully!")
 

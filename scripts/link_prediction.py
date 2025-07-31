@@ -102,7 +102,7 @@ def run_ddp_lp(rank, world_size, args, results_dict):
     logger.setup_datasets(train_dataset_names, test_dataset_names)
     
     # Load training datasets
-    train_data_list, train_split_idx_list = load_all_data_link(train_dataset_names, device=device)
+    train_data_list, train_split_idx_list = load_all_data_link(train_dataset_names, device=device, is_pretraining=args.use_test_split_for_pretraining)
 
     # Process training datasets
     logger.progress("Processing training datasets")
@@ -262,27 +262,6 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                 )
             # --- END OF SYNCHRONIZATION ---
             
-            # Validate context data
-            if context_data['edge_pairs'].size(0) == 0:
-                if rank == 0:
-                    print(f"Warning: No context edges selected for dataset {data.name}, using minimum context...")
-                # Use a minimal context with at least one positive and one negative edge
-                pos_indices = torch.where(link_data['train']['labels'] == 1)[0]
-                neg_indices = torch.where(link_data['train']['labels'] == 0)[0]
-                
-                if len(pos_indices) > 0 and len(neg_indices) > 0:
-                    min_context_indices = torch.cat([pos_indices[:1], neg_indices[:1]])
-                    context_data = {
-                        'edge_pairs': link_data['train']['edge_pairs'][min_context_indices],
-                        'labels': link_data['train']['labels'][min_context_indices]
-                    }
-                    train_mask = torch.ones_like(link_data['train']['labels'], dtype=torch.bool)
-                    train_mask[min_context_indices] = False
-                else:
-                    if rank == 0:
-                        print(f"Error: Insufficient training data for dataset {data.name}")
-                    continue
-            
             train_context_data.append(context_data)
             train_masks.append(train_mask)
             train_link_data_all.append(link_data)
@@ -296,19 +275,6 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                 import traceback
                 print(f"Full traceback: {traceback.format_exc()}")
             continue
-    
-    # Validate that we have at least one valid training dataset
-    if len(train_context_data) == 0:
-        raise ValueError("No valid training datasets found. Please check your data and configuration.")
-    
-    # Update the data lists to only include valid datasets
-    valid_indices = list(range(len(train_context_data)))
-    train_data_list = [train_data_list[i] for i in valid_indices]
-    train_split_idx_list = [train_split_idx_list[i] for i in valid_indices]
-    
-    # Use same context data for validation as training (for consistency)
-    # This ensures prototypes are identical between training and validation
-    valid_context_data = train_context_data.copy()  # Use same context as training
 
     # --- 4.5. Pre-load and process test datasets for periodic evaluation ---
     # Load test datasets once before training to avoid repeated loading in the training loop
@@ -475,7 +441,7 @@ def run_ddp_lp(rank, world_size, args, results_dict):
         valid_dataset_count = 0
         for i, (data, split_idx) in enumerate(zip(train_data_list, train_split_idx_list)):
             link_data_all = train_link_data_all[i]
-            context_data = valid_context_data[i]
+            context_data = train_context_data[i]
 
             if 'valid' in link_data_all and link_data_all['valid']['edge_pairs'].size(0) > 0:
                 try:

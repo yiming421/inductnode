@@ -113,23 +113,6 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
 
         edge_pairs = train_edges['edge_pairs'].to(device)
         labels = train_edges['labels'].to(device)
-
-        # Validate input data
-        if edge_pairs.size(0) == 0:
-            if rank == 0:
-                print(f"Warning: No training edges provided for dataset")
-            return 0.0
-        
-        # Validate context data before proceeding
-        if (context_edges['edge_pairs'].size(0) == 0 or 
-            torch.sum(context_edges['labels'] == 1) == 0 or 
-            torch.sum(context_edges['labels'] == 0) == 0):
-            if rank == 0:
-                print(f"Warning: Insufficient context data (need both positive and negative examples). "
-                      f"Context edges: {context_edges['edge_pairs'].size(0)}, "
-                      f"Pos examples: {torch.sum(context_edges['labels'] == 1)}, "
-                      f"Neg examples: {torch.sum(context_edges['labels'] == 0)}")
-            return 0.0
         
         # The dataloader iterates over indices of the FULL training set
         indices = torch.arange(edge_pairs.size(0), device=device)
@@ -207,14 +190,6 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 data_for_gnn = copy.copy(data)
                 data_for_gnn.adj_t = adj_for_gnn
                 node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection)
-                #node_embeddings = torch.randn_like(data_for_gnn.x, device=device)
-                #node_embeddings.requires_grad = True
-                
-                # src_x = node_embeddings[edge_pairs[batch_idx, 0]]
-                # dst_x = node_embeddings[edge_pairs[batch_idx, 1]]
-                link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
-                '''scores = target_x @ link_prototypes.t()  # Directly compute scores
-                loss = F.cross_entropy(scores, labels[batch_idx].long())'''
 
                 # -----------------------------------------
 
@@ -253,12 +228,6 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     mask_for_loss = torch.ones(batch_idx.size(0), dtype=torch.bool, device=device)
                 else:
                     mask_for_loss = train_mask[batch_idx]
-                
-                # Validate that we have samples to compute loss on
-                if mask_for_loss.sum() == 0:
-                    if rank == 0:
-                        print(f"Warning: No valid samples in batch for loss computation, skipping...")
-                    continue
                 
                 # Use CrossEntropyLoss for multi-class classification (link vs no-link)
                 nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
