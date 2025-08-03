@@ -435,7 +435,7 @@ def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0
     return create_random_splits(dataset, train_ratio, val_ratio, test_ratio, seed, pretraining_mode)
 
 
-def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda', context_only_mode=False):
+def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
     """
     Prepare graph data for PFN-based graph classification.
     This function organizes graphs by class and prepares context samples.
@@ -457,7 +457,6 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda', 
     if is_multitask:
         # Smart incremental context sampling for multi-task datasets
         import time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         
         start_time = time.time()
         num_tasks = sample_graph.y.numel()
@@ -559,20 +558,16 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda', 
         print(f"Deduplication: {len(unique_indices)} unique graphs out of {num_tasks * 2 * context_k} total samples")
         
         # Step 4: Load unique graphs to GPU/create graph objects only once
-        if context_only_mode:
-            # For context_only_mode, just keep the indices - no actual loading
-            pass  # task_contexts already contains indices
-        else:
-            # Load each unique graph only once
-            gpu_graph_cache = {}
-            for idx in unique_indices:
-                gpu_graph_cache[idx] = dataset[idx]  # Load once
-            
-            # Replace indices with actual graph objects using cache
-            for task_idx in task_contexts:
-                for class_label in task_contexts[task_idx]:
-                    indices = task_contexts[task_idx][class_label]
-                    task_contexts[task_idx][class_label] = [gpu_graph_cache[idx] for idx in indices]
+        # Load each unique graph only once
+        gpu_graph_cache = {}
+        for idx in unique_indices:
+            gpu_graph_cache[idx] = dataset[idx]  # Load once
+        
+        # Replace indices with actual graph objects using cache
+        for task_idx in task_contexts:
+            for class_label in task_contexts[task_idx]:
+                indices = task_contexts[task_idx][class_label]
+                task_contexts[task_idx][class_label] = [gpu_graph_cache[idx] for idx in indices]
         
         dedup_time = time.time() - dedup_start
         total_time = time.time() - start_time
@@ -638,15 +633,14 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda', 
             unique_indices.update(selected_indices)
         
         # Apply deduplication (load unique graphs only once)
-        if not context_only_mode:
-            gpu_graph_cache = {}
-            for idx in unique_indices:
-                gpu_graph_cache[idx] = dataset[idx]
-            
-            # Replace indices with graph objects
-            for class_label in task_contexts[0]:
-                indices = task_contexts[0][class_label]
-                task_contexts[0][class_label] = [gpu_graph_cache[idx] for idx in indices]
+        gpu_graph_cache = {}
+        for idx in unique_indices:
+            gpu_graph_cache[idx] = dataset[idx]
+        
+        # Replace indices with graph objects
+        for class_label in task_contexts[0]:
+            indices = task_contexts[0][class_label]
+            task_contexts[0][class_label] = [gpu_graph_cache[idx] for idx in indices]
         
         total_time = time.time() - start_time
         total_samples = sum(len(indices) for indices in task_contexts[0].values())
@@ -712,8 +706,7 @@ def graph_pooling(node_embeddings, batch, pooling_method='mean'):
         raise ValueError(f"Unsupported pooling method: {pooling_method}")
 
 
-def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False, 
-                          context_only_mode=False, context_k=32):
+def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False, context_k=32):
     """
     Load multiple graph classification datasets with memory-efficient context sampling.
     
@@ -721,7 +714,6 @@ def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False
         dataset_names (list): List of dataset names to load
         device (str): Device to load data onto
         pretraining_mode (bool): If True, optimize splits for pretraining (train/val only)
-        context_only_mode (bool): If True, sample minimal context data from train split for memory efficiency
         context_k (int): Number of context graphs per class to sample
         
     Returns:
@@ -756,7 +748,6 @@ def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False
         prep_start = time.time()
         processed_data = prepare_graph_data_for_pfn(
             dataset, split_idx, device=device, context_k=context_k, 
-            context_only_mode=context_only_mode
         )
         prep_time = time.time() - prep_start
         print(f"  Context preparation: {prep_time:.2f}s")
@@ -772,10 +763,7 @@ def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False
     
     return datasets, processed_data_list
 
-
-
-
-def create_task_filtered_datasets(dataset, split_idx):
+def create_task_filtered_datasets(dataset, split_idx, filter_split=None):
     """
     Create task-specific filtered datasets for multi-task learning.
     Each task gets its own dataset containing only graphs with valid labels for that task.
@@ -783,6 +771,8 @@ def create_task_filtered_datasets(dataset, split_idx):
     Args:
         dataset: PyTorch Geometric dataset
         split_idx (dict): Dictionary with split indices
+        filter_split (str, optional): If specified, only filter this split ('train', 'val', 'test').
+                                     Other splits will be returned as-is.
         
     Returns:
         dict: For single-task: {0: {split: [indices]}}
@@ -798,29 +788,54 @@ def create_task_filtered_datasets(dataset, split_idx):
         # Single task: return original splits wrapped in task 0
         return {0: split_idx}
     
+    # Validate filter_split parameter
+    if filter_split is not None and filter_split not in ['train', 'val', 'test']:
+        raise ValueError(f"Invalid filter_split '{filter_split}'. Must be one of: 'train', 'val', 'test'")
+    if filter_split is not None and filter_split not in split_idx:
+        raise ValueError(f"Filter split '{filter_split}' not found in split_idx. Available splits: {list(split_idx.keys())}")
+    
     # Multi-task: filter each split by task validity
     num_tasks = sample_graph.y.numel()
     task_filtered_splits = {}
     
-    print(f"Prefiltering dataset for {num_tasks} tasks...")
+    if filter_split is not None:
+        print(f"Prefiltering dataset for {num_tasks} tasks (filtering only '{filter_split}' split)...")
+    else:
+        print(f"Prefiltering dataset for {num_tasks} tasks...")
     
     for task_idx in range(num_tasks):
         task_filtered_splits[task_idx] = {}
         
         for split_name, indices in split_idx.items():
-            valid_indices = []
-            
-            for idx in indices:
-                graph = dataset[idx]
-                if hasattr(graph, 'task_mask') and graph.task_mask[task_idx]:
-                    valid_indices.append(idx)
-            
-            task_filtered_splits[task_idx][split_name] = valid_indices
+            if filter_split is None or split_name == filter_split:
+                # Apply task filtering to this split
+                valid_indices = []
+                
+                for idx in indices:
+                    graph = dataset[idx]
+                    if hasattr(graph, 'task_mask') and graph.task_mask[task_idx]:
+                        valid_indices.append(idx)
+                
+                task_filtered_splits[task_idx][split_name] = valid_indices
+            else:
+                # Don't filter this split, use original indices
+                # Convert to list for consistency
+                if hasattr(indices, 'tolist'):
+                    task_filtered_splits[task_idx][split_name] = indices.tolist()
+                else:
+                    task_filtered_splits[task_idx][split_name] = indices
             
         # Log filtering results
-        total_samples = sum(len(indices) for indices in split_idx.values())
-        valid_samples = sum(len(indices) for indices in task_filtered_splits[task_idx].values())
-        print(f"  Task {task_idx}: {valid_samples}/{total_samples} samples ({valid_samples/total_samples*100:.1f}%)")
+        if filter_split is None:
+            # Show total filtering stats
+            total_samples = sum(len(indices) for indices in split_idx.values())
+            valid_samples = sum(len(indices) for indices in task_filtered_splits[task_idx].values())
+            print(f"  Task {task_idx}: {valid_samples}/{total_samples} samples ({valid_samples/total_samples*100:.1f}%)")
+        else:
+            # Show filtering stats only for the filtered split
+            original_count = len(split_idx[filter_split])
+            filtered_count = len(task_filtered_splits[task_idx][filter_split])
+            print(f"  Task {task_idx} ({filter_split}): {filtered_count}/{original_count} samples ({filtered_count/original_count*100:.1f}%)")
     
     return task_filtered_splits
 
@@ -874,13 +889,13 @@ def create_data_loaders(dataset, split_idx, batch_size=128, shuffle=True, task_i
 def process_graph_features(dataset, hidden_dim, device='cuda', 
                          use_identity_projection=False, projection_small_dim=128, projection_large_dim=256,
                          use_full_pca=False, sign_normalize=False, normalize_data=False,
-                         padding_strategy='zero', use_batchnorm=False):
+                         padding_strategy='zero', use_batchnorm=False, split=None, split_idx=None,
+                         processed_data=None, process_context_graphs=False):
     """
     Process graph features to match the required hidden dimension using PCA and padding.
     Custom implementation for graph classification.
     
     Args:
-
         dataset: PyTorch Geometric dataset
         hidden_dim (int): Target hidden dimension
         device (str): Device for computations
@@ -892,11 +907,35 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         normalize_data (bool): Apply normalization to final features
         padding_strategy (str): Strategy for padding ('zero', 'random', 'repeat')
         use_batchnorm (bool): Use BatchNorm-style normalization
+        split (str, optional): Specific split to process ('train', 'val', 'test'). If None, processes all graphs.
+        split_idx (dict, optional): Dictionary with split indices. Required if split is specified.
+        processed_data (dict, optional): Processed data containing context graphs to also process.
+        process_context_graphs (bool): Whether to also process context graphs in processed_data.
         
     Returns:
         dict: Processing information and flags
     """
     import time
+    
+    # Validate split parameters
+    if split is not None and split_idx is None:
+        raise ValueError("split_idx is required when split is specified")
+    if split is not None and split not in ['train', 'val', 'test']:
+        raise ValueError(f"Invalid split '{split}'. Must be one of: 'train', 'val', 'test'")
+    if split is not None and split_idx is not None and split not in split_idx:
+        raise ValueError(f"Split '{split}' not found in split_idx. Available splits: {list(split_idx.keys())}")
+    
+    # Determine which graphs to process
+    if split is not None:
+        # Get indices for the specified split
+        target_indices = split_idx[split]
+        if hasattr(target_indices, 'tolist'):  # Convert tensor to list if needed
+            target_indices = target_indices.tolist()
+        target_indices_set = set(target_indices)
+        print(f"Processing only {split} split: {len(target_indices)} graphs")
+    else:
+        target_indices_set = None
+        print("Processing all graphs in dataset")
     
     # Check if dataset has node features
     sample = dataset[0] if len(dataset) > 0 else None
@@ -912,14 +951,18 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
     print(f"Processing graph features: {original_dim}D -> {hidden_dim}D")
     st = time.time()
     
-    # Collect all node features from all graphs for PCA
+    # Collect all node features from graphs for PCA
     collection_start = time.time()
     all_node_features = []
     node_counts = []
+    processed_graph_indices = []  # Track which graphs were processed
     
-    for graph in dataset:
-        all_node_features.append(graph.x.to(device))
-        node_counts.append(graph.x.size(0))
+    for idx, graph in enumerate(dataset):
+        # Only process graphs from the specified split (or all graphs if no split specified)
+        if target_indices_set is None or idx in target_indices_set:
+            all_node_features.append(graph.x.to(device))
+            node_counts.append(graph.x.size(0))
+            processed_graph_indices.append(idx)
     
     # Stack all features
     stacked_features = torch.cat(all_node_features, dim=0)
@@ -1053,11 +1096,11 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             processed_features = F.normalize(processed_features, p=2, dim=1)
             print("Applied LayerNorm-style normalization")
     
-    # Split the processed features back to individual graphs
+    # Split the processed features back to individual graphs (only for processed graphs)
     current_idx = 0
-    for i, graph in enumerate(dataset):
+    for i, graph_idx in enumerate(processed_graph_indices):
         num_nodes = node_counts[i]
-        graph.x = processed_features[current_idx:current_idx + num_nodes]
+        dataset[graph_idx].x = processed_features[current_idx:current_idx + num_nodes]
         current_idx += num_nodes
     
     processing_info = {
@@ -1068,7 +1111,37 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         'projection_target_dim': projection_large_dim if needs_identity_projection else None
     }
     
-    print(f"Graph feature processing completed in {time.time()-st:.2f}s: {original_dim}D -> {processed_features.size(1)}D")
+    if split is not None:
+        print(f"Graph feature processing completed in {time.time()-st:.2f}s: {original_dim}D -> {processed_features.size(1)}D (processed {len(processed_graph_indices)} graphs from {split} split)")
+    else:
+        print(f"Graph feature processing completed in {time.time()-st:.2f}s: {original_dim}D -> {processed_features.size(1)}D (processed all {len(processed_graph_indices)} graphs)")
+    
+    # Process context graphs if requested
+    if process_context_graphs and processed_data is not None and 'context_graphs' in processed_data:
+        print("Processing context graphs with the same transformation...")
+        context_start = time.time()
+        
+        context_graphs = processed_data['context_graphs']
+        total_context_graphs = 0
+        
+        # Create a temporary dataset containing all context graphs
+        all_context_graphs = []
+        for task_idx, task_context in context_graphs.items():
+            for class_label, graphs in task_context.items():
+                all_context_graphs.extend(graphs)
+                total_context_graphs += len(graphs)
+        
+        # Apply the same processing to context graphs (recursively call without context processing)
+        if all_context_graphs:
+            process_graph_features(
+                all_context_graphs, hidden_dim, device,
+                use_identity_projection, projection_small_dim, projection_large_dim,
+                use_full_pca, sign_normalize, normalize_data,
+                padding_strategy, use_batchnorm
+            )
+        
+        context_time = time.time() - context_start
+        print(f"Context graph processing completed in {context_time:.2f}s: processed {total_context_graphs} context graphs")
     
     return processing_info
 

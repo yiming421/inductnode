@@ -56,7 +56,7 @@ def get_main_parser():
     parser.add_argument('--normalize_class_h', type=str2bool, default=True)
     parser.add_argument('--sign_normalize', type=str2bool, default=False)
     parser.add_argument('--use_full_pca', type=str2bool, default=False)
-    parser.add_argument('--normalize_data', type=str2bool, default=False)   
+    parser.add_argument('--normalize_data', type=str2bool, default=True)   
 
     parser.add_argument('--use_gin', type=str2bool, default=False)
     parser.add_argument('--multilayer', type=str2bool, default=True)
@@ -90,7 +90,7 @@ def get_main_parser():
     # Safe learning rate arguments
     parser.add_argument('--safe_transformer_layers', type=int, default=5,
                         help='Maximum number of transformer layers for safe learning rate')
-    parser.add_argument('--safe_lr', type=float, default=0.00014,
+    parser.add_argument('--safe_lr', type=float, default=0.000014,
                         help='Safe learning rate for deep transformers')
     return parser
 
@@ -222,12 +222,6 @@ def parse_link_prediction_args():
                         help='Directory to save checkpoints')
     parser.add_argument('--checkpoint_name', type=str, default=None,
                         help='Custom checkpoint name (default: auto-generated)')
-
-    # Safe learning rate arguments
-    parser.add_argument('--safe_transformer_layers', type=int, default=5,
-                        help='Maximum number of transformer layers for safe learning rate')
-    parser.add_argument('--safe_lr', type=float, default=0.0001,
-                        help='Safe learning rate for deep transformers')
     
     return parser.parse_args()
 
@@ -252,11 +246,11 @@ def parse_joint_training_args():
     parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN'])
     parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
+    parser.add_argument('--num_layers', type=int, default=6, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--transformer_layers', type=int, default=1, help='Number of transformer layers')
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
-    parser.add_argument('--dp', type=float, default=0.2, help='Dropout rate')
+    parser.add_argument('--dp', type=float, default=0.4, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
     parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections')
     parser.add_argument('--relu', type=str2bool, default=False, help='Use ReLU activation')
@@ -266,13 +260,13 @@ def parse_joint_training_args():
     parser.add_argument('--use_gin', type=str2bool, default=False, help='Use GIN variant for GCN')
     
     # === Training Configuration ===
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw'])
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.000001, help='Weight decay')
+    parser.add_argument('--weight_decay', type=float, default=0.005, help='Weight decay')
     parser.add_argument('--schedule', type=str, default='warmup', choices=['cosine', 'step', 'warmup', 'none'])
     parser.add_argument('--nc_batch_size', type=int, default=4096, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=2048, help='Link prediction batch size')
-    parser.add_argument('--test_batch_size', type=int, default=4096, help='Test batch size')
+    parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
@@ -297,22 +291,22 @@ def parse_joint_training_args():
     parser.add_argument('--seperate', type=str2bool, default=True, help='Separate processing in PFN predictor')
     parser.add_argument('--padding', type=str, default='zero', choices=['zero', 'mlp'], help='Padding method for PFN predictor')
     parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'mlp'], help='Similarity function')
-    parser.add_argument('--orthogonal_push', type=float, default=0.000001, help='Orthogonal push regularization weight')
+    parser.add_argument('--orthogonal_push', type=float, default=0, help='Orthogonal push regularization weight')
     parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize class embeddings')
     
     # === Data Processing ===
     parser.add_argument('--use_full_pca', type=str2bool, default=False, help='Use full PCA decomposition')
-    parser.add_argument('--normalize_data', type=str2bool, default=False, help='Normalize input data')
+    parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize input data')
     parser.add_argument('--padding_strategy', type=str, default='random', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
-    parser.add_argument('--use_batchnorm', type=str2bool, default=False, help='Use BatchNorm instead of LayerNorm')
+    parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
     parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
     parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
     
     # === Link Prediction Specific ===
-    parser.add_argument('--context_neg_ratio', type=int, default=1, help='Negative sampling ratio for context')
-    parser.add_argument('--train_neg_ratio', type=int, default=1, help='Negative sampling ratio for training')
+    parser.add_argument('--context_neg_ratio', type=int, default=3, help='Negative sampling ratio for context')
+    parser.add_argument('--train_neg_ratio', type=int, default=3, help='Negative sampling ratio for training')
     parser.add_argument('--context_k', type=int, default=128, help='Number of context samples for link prediction')
-    parser.add_argument('--remove_context_from_train', type=str2bool, default=False, help='Remove context from training set')
+    parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
     
     # === Checkpointing ===
@@ -321,10 +315,6 @@ def parse_joint_training_args():
     parser.add_argument('--checkpoint_name', type=str, default=None, help='Custom checkpoint name')
     parser.add_argument('--load_checkpoint', type=str, default=None, help='Path to checkpoint to load')
     parser.add_argument('--use_pretrained_model', type=str2bool, default=False, help='Use pretrained model')
-    
-    # === Safe Learning Rate ===
-    parser.add_argument('--safe_transformer_layers', type=int, default=5, help='Max transformer layers for safe LR')
-    parser.add_argument('--safe_lr', type=float, default=0.0001, help='Safe learning rate for deep transformers')
     
     # === Logging and Monitoring ===
     parser.add_argument('--log_level', type=str, default='INFO', 
@@ -350,7 +340,7 @@ def parse_graph_classification_args():
 
     # Model architecture (used if not loading a pretrained model)
     parser.add_argument('--model', type=str, default='PureGCN_v1', help='GNN model type (e.g., PureGCN_v1, GCN)')
-    parser.add_argument("--hidden", default=128, type=int, help='Hidden dimension size')
+    parser.add_argument("--hidden", default=256, type=int, help='Hidden dimension size')
     parser.add_argument("--num_layers", default=4, type=int, help='Number of GNN layers')
     parser.add_argument("--dp", default=0.2, type=float, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization in GNN')
@@ -365,7 +355,7 @@ def parse_graph_classification_args():
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of layers in MLP pool')
     parser.add_argument('--mlp_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in MLP norm')
     parser.add_argument('--nhead', type=int, default=4, help='Number of heads for attention pooling and PFN predictor')
-    parser.add_argument('--transformer_layers', type=int, default=1, help='Number of transformer layers in PFN predictor')
+    parser.add_argument('--transformer_layers', type=int, default=2, help='Number of transformer layers in PFN predictor')
     parser.add_argument('--seperate', type=str2bool, default=True, help='For PFN predictor')
     parser.add_argument('--degree', type=str2bool, default=False, help='For PFN predictor (not typically used for graphs)')
     parser.add_argument('--padding', type=str, default='zero', 
@@ -380,22 +370,22 @@ def parse_graph_classification_args():
     # Data arguments
     parser.add_argument('--train_dataset', type=str, default='bace,bbbp,muv,tox21,toxcast',
                         help='Comma-separated list of datasets for training graph classification model.')
-    parser.add_argument('--test_dataset', type=str, default='chemhiv',
+    parser.add_argument('--test_dataset', type=str, default='chemhiv,chempcba',
                         help='Comma-separated list of datasets for inductive testing.')
     parser.add_argument('--sign_normalize', type=str2bool, default=False, help='For PCA: normalize eigenvectors direction')
     parser.add_argument('--use_full_pca', type=str2bool, default=False, help='For PCA: use full SVD')
-    parser.add_argument('--normalize_data', type=str2bool, default=False, help='Normalize data features after preprocessing')
+    parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize data features after preprocessing')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.0001,
                         help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=4096,
                         help='Batch size (number of graphs per batch)')
-    parser.add_argument('--test_batch_size', type=int, default=128,
+    parser.add_argument('--test_batch_size', type=int, default=4096,
                         help='Test batch size (number of graphs per batch)')
-    parser.add_argument('--weight_decay', type=float, default=0,
+    parser.add_argument('--weight_decay', type=float, default=0.005,
                         help='Weight decay')
     parser.add_argument('--clip_grad', type=float, default=1.0,
                         help='Gradient clipping')
@@ -437,8 +427,8 @@ def parse_graph_classification_args():
                         help='Minimum PCA dimension')
     parser.add_argument('--padding_strategy', type=str, default='zero',
                         help='Padding strategy for graph classification')
-    parser.add_argument('--use_batchnorm', type=str2bool, default=False,
-                        help='Use batch normalization in GNN')
+    parser.add_argument('--use_batchnorm', type=str2bool, default=True,
+                        help='Use batch normalization')
     parser.add_argument('--use_identity_projection', type=str2bool, default=False,
                         help='Use identity projection for graph classification')
     parser.add_argument('--projection_small_dim', type=int, default=128,
@@ -453,11 +443,5 @@ def parse_graph_classification_args():
                         help='Directory to save checkpoints')
     parser.add_argument('--checkpoint_name', type=str, default=None,
                         help='Custom checkpoint name (default: auto-generated)')
-
-    # Safe learning rate arguments
-    parser.add_argument('--safe_transformer_layers', type=int, default=5,
-                        help='Maximum number of transformer layers for safe learning rate')
-    parser.add_argument('--safe_lr', type=float, default=0.0001,
-                        help='Safe learning rate for deep transformers')
     
     return parser.parse_args()

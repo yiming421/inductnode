@@ -864,7 +864,7 @@ def main():
             print(f"Run {run_idx + 1}/{args.runs}")
             
             # Run single GPU execution
-            train_metric, valid_metric, test_metric = run_single_gpu(args, device='cuda:0')
+            train_metric, valid_metric, test_metric = run_single_gpu(args, device=f'cuda:{args.gpu}')
             
             print(f"Run {run_idx + 1} Results:")
             print(f"  Train: {train_metric:.4f}")

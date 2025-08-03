@@ -8,7 +8,7 @@ from torch_sparse import SparseTensor
 import copy
 import time
 
-def get_node_embeddings(model, data, projector=None, identity_projection=None):
+def get_node_embeddings(model, data, projector=None, identity_projection=None, use_full_adj=False):
     """
     Get node embeddings using the same model and preprocessing as node classification.
     
@@ -17,6 +17,7 @@ def get_node_embeddings(model, data, projector=None, identity_projection=None):
         data: Graph data
         projector: Optional projector module
         identity_projection: Optional identity projection module
+        use_full_adj: Whether to use full_adj_t if available (for test evaluation)
     
     Returns:
         Node embeddings [num_nodes, hidden_dim]
@@ -30,8 +31,14 @@ def get_node_embeddings(model, data, projector=None, identity_projection=None):
     else:
         x_input = data.x
     
+    # Choose adjacency matrix: use full_adj_t for test evaluation if available
+    if use_full_adj and hasattr(data, 'full_adj_t') and data.full_adj_t is not None:
+        adj_matrix = data.full_adj_t
+    else:
+        adj_matrix = data.adj_t
+    
     # Get node embeddings
-    node_embeddings = model(x_input, data.adj_t)
+    node_embeddings = model(x_input, adj_matrix)
     return node_embeddings
 
 def get_link_prototypes(node_embeddings, context_data, att_pool, mlp_pool, normalize=False):
@@ -189,7 +196,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 # Recompute embeddings and prototypes for each batch to maintain the computation graph
                 data_for_gnn = copy.copy(data)
                 data_for_gnn.adj_t = adj_for_gnn
-                node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection)
+                node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection, use_full_adj=False)
 
                 # -----------------------------------------
 
@@ -329,9 +336,13 @@ def compute_mrr_citation2(pos_scores, neg_scores):
 def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, batch_size,
                              att, mlp, projector=None, identity_projection=None, rank=0, 
                              normalize_class_h=False, degree=False, evaluator=None, 
-                             neg_edges=None, k_values=[20, 50, 100]):
+                             neg_edges=None, k_values=[20, 50, 100], use_full_adj_for_test=True):
     """
     Evaluate link prediction using the PFN methodology with Hits@K metric.
+    
+    Args:
+        use_full_adj_for_test: If True, use full_adj_t (train+valid edges) for test evaluation
+                              when available. This is required for OGB standards (e.g., ogbl-collab).
     """
     try:
         model.eval()
@@ -343,8 +354,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         
         device = data.x.device
         
-        # Get node embeddings
-        node_embeddings = get_node_embeddings(model, data, projector, identity_projection)
+        # Get node embeddings - use full_adj_t for test evaluation if available
+        node_embeddings = get_node_embeddings(model, data, projector, identity_projection, use_full_adj_for_test)
         
         # Get context edge embeddings for PFN predictor
         context_edge_pairs = context_edges['edge_pairs'].to(device)

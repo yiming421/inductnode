@@ -155,12 +155,41 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         
         # Get labels for this batch - all samples are valid for this task
         batch_labels = batch_data.y
-        if batch_labels.dim() > 1:
-            # Multi-task format: extract labels for current task
+        batch_size = target_embeddings.size(0)
+        
+        # Skip single-sample batches to avoid dimension issues with PFN predictor
+        if batch_size == 1:
+            print(f"Warning: Skipping training batch with only 1 sample to avoid PFN predictor dimension issues")
+            continue
+        
+        # Check if this is a multi-task dataset
+        sample_graph = dataset_info['dataset'][0]
+        is_multitask = hasattr(sample_graph, 'task_mask') and sample_graph.y.numel() > 1
+        
+        if is_multitask:
+            # Multi-task format: labels are flattened [batch_size * num_tasks]
+            num_tasks = sample_graph.y.numel()
+            if batch_labels.dim() == 1 and len(batch_labels) == batch_size * num_tasks:
+                # Reshape from flattened format back to [batch_size, num_tasks]
+                batch_labels = batch_labels.view(batch_size, num_tasks)
+            
+            # Extract labels for current task
             batch_labels = batch_labels[:, task_idx]
         else:
-            # Single-task format: use labels directly
-            batch_labels = batch_labels
+            # Single-task format: labels might be squeezed to 1D
+            if batch_labels.dim() > 1:
+                batch_labels = batch_labels.squeeze()
+        
+        # Debug print to understand the shape issue
+        if batch_labels.size(0) != batch_size:
+            print(f"DEBUG - Label/batch size mismatch:")
+            print(f"  batch_size: {batch_size}")
+            print(f"  batch_labels.shape: {batch_labels.shape}")
+            print(f"  original batch_data.y.shape: {batch_data.y.shape}")
+            print(f"  task_idx: {task_idx}")
+            print(f"  is_multitask: {is_multitask}")
+            if is_multitask:
+                print(f"  num_tasks: {num_tasks}")
         
         # Ensure labels are long integers
         if batch_labels.dtype != torch.long:
@@ -267,6 +296,12 @@ def train_graph_classification(model, predictor, dataset_info, data_loaders, opt
         # Pool to get graph embeddings (these are our "target" embeddings)
         target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
         
+        # Skip single-sample batches to avoid dimension issues with PFN predictor
+        batch_size = target_embeddings.size(0)
+        if batch_size == 1:
+            print(f"Warning: Skipping training batch with only 1 sample to avoid PFN predictor dimension issues")
+            continue
+        
         # Get labels and task masks for this batch
         batch_labels = batch_data.y  # Shape: [batch_size * num_tasks] or [batch_size] when batched
         
@@ -324,7 +359,7 @@ def train_graph_classification(model, predictor, dataset_info, data_loaders, opt
                     valid_task_labels = valid_task_labels.to(torch.long)
                 
                 # Use PFN predictor with task-specific context
-                print(task_context_embeddings.shape, valid_target_embeddings.shape, task_context_labels.shape, task_class_h.shape, flush=True)
+                # print(task_context_embeddings.shape, valid_target_embeddings.shape, task_context_labels.shape, task_class_h.shape, flush=True)
                 scores = predictor(task_pfn_data, task_context_embeddings, valid_target_embeddings, task_context_labels, task_class_h)
                 scores = F.log_softmax(scores, dim=1)
                 
@@ -398,6 +433,120 @@ def train_graph_classification(model, predictor, dataset_info, data_loaders, opt
         num_batches += 1
     
     return total_loss / num_batches if num_batches > 0 else 0.0
+
+
+@torch.no_grad()
+def evaluate_graph_classification_single_task(model, predictor, dataset_info, data_loaders, task_idx,
+                                             pooling_method='mean', device='cuda', 
+                                             normalize_class_h=True):
+    """
+    Evaluate graph classification performance for a single task with prefiltered data.
+    All samples in each batch are guaranteed to have valid labels for the specified task.
+    
+    Args:
+        model: GNN model
+        predictor: PFN predictor
+        dataset_info (dict): Dataset information including context graphs
+        data_loaders (dict): Task-specific data loaders (prefiltered)
+        task_idx (int): Current task index
+        pooling_method (str): Graph pooling method
+        device (str): Device for computation
+        normalize_class_h (bool): Whether to normalize class embeddings
+        
+    Returns:
+        dict: Dictionary with train/val/test accuracies for this task
+    """
+    model.eval()
+    predictor.eval()
+    
+    results = {}
+    
+    # Create task-specific context embeddings once for this task
+    context_embeddings, context_labels = create_context_embeddings(
+        model, dataset_info['context_graphs'], task_idx=task_idx, 
+        pooling_method=pooling_method, device=device
+    )
+    
+    # Prepare PFN data structure
+    pfn_data = prepare_pfn_data_structure(context_embeddings, context_labels, 
+                                        dataset_info['num_classes'], device)
+    
+    # Process context embeddings to create class prototypes
+    from .utils import process_node_features
+    class_h = process_node_features(
+        context_embeddings, pfn_data,
+        degree_normalize=False,
+        attention_pool_module=None,
+        mlp_module=None,
+        normalize=normalize_class_h
+    )
+    
+    # Evaluate on each split
+    for split_name, data_loader in data_loaders.items():
+        if len(data_loader.dataset) == 0:
+            results[split_name] = 0.0
+            continue
+            
+        all_predictions = []
+        all_labels = []
+        
+        for batch_graphs in data_loader:
+            batch_data = batch_graphs.to(device)
+            
+            # Get node embeddings from GNN
+            node_embeddings = model(batch_data.x, batch_data.adj_t)
+            
+            # Pool to get graph embeddings
+            target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
+            
+            # Get labels for this batch - all samples are valid for this task
+            batch_labels = batch_data.y
+            batch_size = target_embeddings.size(0)
+            
+            # Skip single-sample batches to avoid dimension issues with PFN predictor
+            if batch_size == 1:
+                print(f"Warning: Skipping batch with only 1 sample to avoid PFN predictor dimension issues")
+                continue
+            
+            # Check if this is a multi-task dataset
+            sample_graph = dataset_info['dataset'][0]
+            is_multitask = hasattr(sample_graph, 'task_mask') and sample_graph.y.numel() > 1
+            
+            if is_multitask:
+                # Multi-task format: reshape and extract task labels
+                num_tasks = sample_graph.y.numel()
+                if batch_labels.dim() == 1 and len(batch_labels) == batch_size * num_tasks:
+                    batch_labels = batch_labels.view(batch_size, num_tasks)
+                batch_labels = batch_labels[:, task_idx]
+            else:
+                # Single-task format
+                if batch_labels.dim() > 1:
+                    batch_labels = batch_labels.squeeze()
+            
+            # Ensure labels are long integers
+            if batch_labels.dtype != torch.long:
+                batch_labels = batch_labels.to(torch.long)
+            
+            # Get predictions using PFN predictor
+            # print(context_embeddings.shape, target_embeddings.shape, context_labels.shape, class_h.shape, flush=True)
+            scores = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
+            predictions = scores.argmax(dim=1)
+            
+            all_predictions.append(predictions)
+            all_labels.append(batch_labels)
+        
+        # Concatenate all predictions and labels
+        if all_predictions:
+            all_predictions = torch.cat(all_predictions, dim=0)
+            all_labels = torch.cat(all_labels, dim=0)
+            
+            # Calculate accuracy
+            accuracy = (all_predictions == all_labels).float().mean().item()
+            results[split_name] = accuracy
+        else:
+            results[split_name] = 0.0
+    
+    return results
 
 
 @torch.no_grad()
@@ -476,6 +625,7 @@ def evaluate_graph_classification(model, predictor, dataset_info, data_loaders,
                     )
                     
                     # Prepare task-specific PFN data structure
+
                     task_pfn_data = prepare_pfn_data_structure(task_context_embeddings, task_context_labels, 
                                                              dataset_info['num_classes'], device)
                     
@@ -494,6 +644,7 @@ def evaluate_graph_classification(model, predictor, dataset_info, data_loaders,
                     valid_task_labels = batch_labels[:, task_idx][valid_mask].long()
                     
                     # Get predictions using PFN predictor with task-specific context
+                    # print(task_context_embeddings.shape, valid_target_embeddings.shape, task_context_labels.shape, task_class_h.shape, flush=True)
                     scores = predictor(task_pfn_data, task_context_embeddings, valid_target_embeddings, task_context_labels, task_class_h)
                     
                     # For binary classification, use probability of positive class
@@ -519,19 +670,27 @@ def evaluate_graph_classification(model, predictor, dataset_info, data_loaders,
                 task_true = torch.cat(task_labels[task_idx], dim=0)
                 
                 if dataset_info['num_classes'] == 2:
-                    # Binary classification: use ROC-AUC
+                    # Binary classification: use dataset-specific metrics
                     try:
-                        from sklearn.metrics import roc_auc_score
+                        from sklearn.metrics import roc_auc_score, average_precision_score
                         # Convert to numpy for sklearn
                         task_preds_np = task_preds.cpu().numpy()
                         task_true_np = task_true.cpu().numpy()
                         
                         # Check if we have both classes
                         if len(np.unique(task_true_np)) > 1:
-                            auc = roc_auc_score(task_true_np, task_preds_np)
-                            task_metrics.append(auc)
+                            # Use AP for PCBA datasets, AUC for HIV datasets (following OGB standards)
+                            dataset_name = dataset_info.get('name', '').lower()
+                            if 'pcba' in dataset_name:
+                                # Use Average Precision for PCBA (OGB standard)
+                                ap = average_precision_score(task_true_np, task_preds_np)
+                                task_metrics.append(ap)
+                            else:
+                                # Use ROC-AUC for HIV and other binary datasets (OGB standard)
+                                auc = roc_auc_score(task_true_np, task_preds_np)
+                                task_metrics.append(auc)
                         else:
-                            # Only one class present, can't compute AUC
+                            # Only one class present, can't compute AUC/AP
                             task_metrics.append(0.5)  # Random performance
                     except ImportError:
                         # Fallback to accuracy if sklearn not available
@@ -641,7 +800,6 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
     print(f"\nTraining on {len(train_datasets)} datasets: {', '.join(dataset_names)}")
     
     # Create task-filtered data loaders for all training datasets
-    all_train_data_loaders = []
     all_task_filtered_splits = []
     
     for train_dataset_info in train_processed_data_list:
@@ -652,16 +810,6 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
             train_dataset_info['split_idx']
         )
         all_task_filtered_splits.append(task_filtered_splits)
-        
-        # For now, create loaders for task 0 (will be updated per task during training)
-        data_loaders = create_data_loaders(
-            train_dataset_info['dataset'], 
-            task_filtered_splits[0],  # Start with task 0
-            batch_size=args.batch_size,
-            shuffle=True,
-            task_idx=0
-        )
-        all_train_data_loaders.append(data_loaders)
     
     best_val_acc = 0
     best_epoch = 0
@@ -710,31 +858,49 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
         
         avg_train_loss = total_train_loss / len(train_processed_data_list)
         
-        # Validation on all training datasets every epoch (for model selection)
-        # NOTE: For now, using the original evaluation which handles masking internally
-        # This could be optimized later to use task-specific evaluation
+        # Validation using task-specific evaluation (consistent with training)
         all_val_results = {}
         total_val_acc = 0
         
         for dataset_idx, (train_dataset_info, task_filtered_splits) in enumerate(zip(train_processed_data_list, all_task_filtered_splits)):
             dataset_name = dataset_names[dataset_idx]
             
-            # Create combined data loaders for evaluation (using task 0 for now)
-            eval_data_loaders = create_data_loaders(
-                train_dataset_info['dataset'], 
-                train_dataset_info['split_idx'],  # Use original splits for evaluation
-                batch_size=args.batch_size,
-                shuffle=False,
-                task_idx="eval"
-            )
+            # Evaluate each task separately and aggregate results
+            task_val_accs = []
+            task_train_accs = []
             
-            val_results = evaluate_graph_classification(
-                model, predictor, train_dataset_info, eval_data_loaders,
-                pooling_method=args.graph_pooling, device=device,
-                normalize_class_h=args.normalize_class_h
-            )
-            all_val_results[dataset_name] = val_results
-            total_val_acc += val_results['val']
+            for task_idx, task_splits in task_filtered_splits.items():
+                # Create task-specific data loaders for evaluation
+                task_eval_loaders = create_data_loaders(
+                    train_dataset_info['dataset'], 
+                    task_splits,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    task_idx=task_idx
+                )
+                
+                # Evaluate this specific task
+                task_results = evaluate_graph_classification_single_task(
+                    model, predictor, train_dataset_info, task_eval_loaders, task_idx,
+                    pooling_method=args.graph_pooling, device=device,
+                    normalize_class_h=args.normalize_class_h
+                )
+                
+                task_train_accs.append(task_results['train'])
+                task_val_accs.append(task_results['val'])
+            
+            # Aggregate results across tasks
+            if task_val_accs:
+                val_results = {
+                    'train': sum(task_train_accs) / len(task_train_accs),
+                    'val': sum(task_val_accs) / len(task_val_accs),
+                }
+                all_val_results[dataset_name] = val_results
+                total_val_acc += val_results['val']
+            else:
+                # No valid tasks
+                val_results = {'train': 0.0, 'val': 0.0}
+                all_val_results[dataset_name] = val_results
         
         # Use average validation accuracy across all datasets for early stopping
         avg_val_acc = total_val_acc / len(train_processed_data_list)
@@ -756,15 +922,36 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
             if epoch % args.log_interval == 0:
                 # Log average metrics across all training datasets
                 avg_train_acc = sum(results['train'] for results in all_val_results.values()) / len(all_val_results)
-                avg_test_acc = sum(results['test'] for results in all_val_results.values()) / len(all_val_results)
-                
+                avg_valid_acc = sum(results['val'] for results in all_val_results.values()) / len(all_val_results)
+
                 print(f"Epoch {epoch:3d} | Train Loss: {avg_train_loss:.4f} | "
-                      f"Avg Train Acc: {avg_train_acc:.4f} | Avg Val Acc: {avg_val_acc:.4f} | "
-                      f"Avg Test Acc: {avg_test_acc:.4f} | Time: {time.time()-start_time:.2f}s")
+                      f"Avg Train Acc: {avg_train_acc:.4f} | Avg Val Acc: {avg_valid_acc:.4f} | "
+                      f"Time: {time.time()-start_time:.2f}s")
+                
+                # Log epoch metrics to wandb
+                try:
+                    import wandb
+                    epoch_metrics = {
+                        'epoch': epoch,
+                        'train_loss': avg_train_loss,
+                        'avg_train_acc': avg_train_acc,
+                        'avg_val_acc': avg_valid_acc,
+                        'best_val_acc': best_val_acc,
+                        'lr': optimizer.param_groups[0]['lr']
+                    }
+                    
+                    # Log per-dataset metrics
+                    for dataset_name, results in all_val_results.items():
+                        epoch_metrics[f'{dataset_name}_train_acc'] = results['train']
+                        epoch_metrics[f'{dataset_name}_val_acc'] = results['val']
+                    
+                    wandb.log(epoch_metrics)
+                except ImportError:
+                    pass  # wandb not available
                 
                 # Log individual dataset performance
                 for dataset_name, results in all_val_results.items():
-                    print(f"  {dataset_name}: Train={results['train']:.4f}, Val={results['val']:.4f}, Test={results['test']:.4f}")
+                    print(f"  {dataset_name}: Train={results['train']:.4f}, Val={results['val']:.4f}")
             
             # Evaluate on unseen test datasets if provided
             if test_datasets is not None and test_processed_data_list is not None:
@@ -772,26 +959,60 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                 for test_dataset, test_dataset_info in zip(test_datasets, test_processed_data_list):
                     test_name = test_dataset_info['dataset'].name if hasattr(test_dataset_info['dataset'], 'name') else f'test_dataset_{len(best_results)}'
                     
-                    # Create data loaders for test dataset
-                    test_data_loaders = create_data_loaders(
+                    # Create task-filtered datasets for test evaluation
+                    test_task_filtered_splits = create_task_filtered_datasets(
                         test_dataset_info['dataset'], 
-                        test_dataset_info['split_idx'], 
-                        batch_size=args.test_batch_size,
-                        shuffle=False
+                        test_dataset_info['split_idx'],
+                        "test"
                     )
                     
-                    # Evaluate on test dataset
-                    test_results = evaluate_graph_classification(
-                        model, predictor, test_dataset_info, test_data_loaders,
-                        pooling_method=args.graph_pooling, device=device,
-                        normalize_class_h=args.normalize_class_h
-                    )
+                    # Evaluate each task separately and aggregate - ONLY TEST SPLIT for unseen datasets
+                    task_test_results = {'test': []}
+                    
+                    for task_idx, task_splits in test_task_filtered_splits.items():
+                        # Create data loaders ONLY for test split of unseen dataset
+                        test_only_splits = {'test': task_splits['test']}
+                        task_test_loaders = create_data_loaders(
+                            test_dataset_info['dataset'], 
+                            test_only_splits,
+                            batch_size=args.test_batch_size,
+                            shuffle=False,
+                            task_idx=task_idx
+                        )
+                        
+                        # Evaluate this specific task - only test split
+                        task_results = evaluate_graph_classification_single_task(
+                            model, predictor, test_dataset_info, task_test_loaders, task_idx,
+                            pooling_method=args.graph_pooling, device=device,
+                            normalize_class_h=args.normalize_class_h
+                        )
+                        
+                        # Only collect test results for unseen datasets
+                        task_test_results['test'].append(task_results['test'])
+                    
+                    # Aggregate results across tasks - only test split
+                    if task_test_results['test']:
+                        test_results = {
+                            'test': sum(task_test_results['test']) / len(task_test_results['test'])
+                        }
+                    else:
+                        test_results = {'test': 0.0}
                     
                     # Store test results (will be overwritten each eval interval)
                     best_results[f"test_{test_name}"] = test_results.copy()
                     
-                    print(f"    {test_name}: Train={test_results['train']:.4f}, "
-                          f"Val={test_results['val']:.4f}, Test={test_results['test']:.4f}")
+                    print(f"    {test_name}: Test={test_results['test']:.4f}")
+                    
+                    # Log test results to wandb
+                    try:
+                        import wandb
+                        test_metrics = {
+                            'epoch': epoch,
+                            f'test_{test_name}_acc': test_results['test']
+                        }
+                        wandb.log(test_metrics)
+                    except ImportError:
+                        pass  # wandb not available
         
         # Early stopping based on validation performance on training dataset
         if patience_counter >= patience:

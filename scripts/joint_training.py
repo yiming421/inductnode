@@ -300,7 +300,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     lp_results = evaluate_link_prediction(
                         model, predictor, data, link_data_all[split_key], context_data,
                         args.test_batch_size, None, None, None, identity_projection,
-                        0, True, degree=False, k_values=[20, 50, 100]
+                        0, True, degree=False, k_values=[20, 50, 100], 
+                        use_full_adj_for_test=(split == 'test')
                     )
                     lp_results_list.append(lp_results.get('default_metric', 0.0))
                 else:

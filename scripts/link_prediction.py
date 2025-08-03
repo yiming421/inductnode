@@ -449,7 +449,7 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                     valid_results = evaluate_link_prediction(
                         model, predictor, data, link_data_all['valid'], context_data, args.test_batch_size,
                         att, mlp, projector, identity_projection, rank, args.normalize_class_h,
-                        degree=args.degree, k_values=[20, 50, 100]
+                        degree=args.degree, k_values=[20, 50, 100], use_full_adj_for_test=False
                     )
                     
                     # Use the default metric for this dataset
@@ -498,7 +498,7 @@ def run_ddp_lp(rank, world_size, args, results_dict):
                         test_results_dict = evaluate_link_prediction(
                             model, predictor, data, link_data_all['test'], context_data, args.test_batch_size,
                             att, mlp, projector, identity_projection, rank, args.normalize_class_h,
-                            degree=args.degree, k_values=[20, 50, 100]
+                            degree=args.degree, k_values=[20, 50, 100], use_full_adj_for_test=True
                         )
                         
                         # Use the default metric for this dataset
@@ -711,7 +711,7 @@ def run_ddp_lp(rank, world_size, args, results_dict):
             test_results_dict = evaluate_link_prediction(
                 model, predictor, data, link_data_all['test'], context_data, args.test_batch_size,
                 att, mlp, projector, identity_projection, rank, args.normalize_class_h,
-                degree=args.degree, k_values=[20, 50, 100]  # Standard Hits@K values
+                degree=args.degree, k_values=[20, 50, 100], use_full_adj_for_test=True  # Standard Hits@K values
             )
             
             # Get the dataset-specific metric

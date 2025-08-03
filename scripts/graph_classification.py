@@ -106,7 +106,7 @@ def setup_optimizer_and_scheduler(model, predictor, args):
     return optimizer, scheduler
 
 
-def process_datasets_for_models(datasets, processed_data_list, args, device):
+def process_datasets_for_models(datasets, processed_data_list, args, device, test_datasets=False):
     """
     Process datasets to handle feature dimensions and create any necessary dummy features.
     
@@ -124,12 +124,22 @@ def process_datasets_for_models(datasets, processed_data_list, args, device):
     
     for dataset, dataset_info in zip(datasets, processed_data_list):
         # Process features using PCA and padding
-        processing_info = process_graph_features(
-            dataset, args.hidden, device, 
-            args.use_identity_projection, args.projection_small_dim, args.projection_large_dim,
-            args.use_full_pca, args.sign_normalize, args.normalize_data,
-            args.padding_strategy, args.use_batchnorm
-        )
+        if test_datasets:
+            processing_info = process_graph_features(
+                dataset, args.hidden, device, 
+                args.use_identity_projection, args.projection_small_dim, args.projection_large_dim,
+                args.use_full_pca, args.sign_normalize, args.normalize_data,
+                args.padding_strategy, args.use_batchnorm,
+                "test", dataset_info.get('split_idx', None),
+                dataset_info, True  # process_context_graphs=True for test datasets
+            )
+        else:
+            processing_info = process_graph_features(
+                dataset, args.hidden, device, 
+                args.use_identity_projection, args.projection_small_dim, args.projection_large_dim,
+                args.use_full_pca, args.sign_normalize, args.normalize_data,
+                args.padding_strategy, args.use_batchnorm
+            )
         
         processed_datasets.append(dataset)
         
@@ -162,7 +172,7 @@ def run_single_experiment(args, device='cuda:0'):
     if pretraining_mode:
         print("Pretraining mode enabled: optimizing train/val splits for maximum data utilization")
     train_datasets, train_processed_data_list = load_all_graph_datasets(
-        train_dataset_names, device, pretraining_mode=pretraining_mode
+        train_dataset_names, device, pretraining_mode, args.context_k
     )
     
     if len(train_datasets) == 0:
@@ -181,13 +191,13 @@ def run_single_experiment(args, device='cuda:0'):
         test_dataset_names = args.test_dataset.split(',')
         # Use context sampling for memory efficiency (sample minimal context from train split)
         test_datasets, test_processed_data_list = load_all_graph_datasets(
-            test_dataset_names, device, context_only_mode=True, context_k=32
+            test_dataset_names, device, context_k=args.context_k,
         )
         
         if len(test_datasets) > 0:
             # Process test datasets
             test_datasets, test_processed_data_list, _ = process_datasets_for_models(
-                test_datasets, test_processed_data_list, args, device
+                test_datasets, test_processed_data_list, args, device, True
             )
             print(f"Loaded {len(test_datasets)} test datasets")
     
@@ -260,8 +270,11 @@ def main():
             
             print(f"\nRun {run + 1} Results:")
             for dataset_name, dataset_results in results.items():
-                print(f"  {dataset_name}: Train={dataset_results['train']:.4f}, "
-                      f"Val={dataset_results['val']:.4f}, Test={dataset_results['test']:.4f}")
+                result_parts = []
+                for split_name in ['train', 'val', 'test']:
+                    if split_name in dataset_results:
+                        result_parts.append(f"{split_name.capitalize()}={dataset_results[split_name]:.4f}")
+                print(f"  {dataset_name}: {', '.join(result_parts)}")
         
         except Exception as e:
             print(f"Run {run + 1} failed with error: {e}")
@@ -287,22 +300,22 @@ def main():
         for dataset_name in dataset_names:
             dataset_results = [r[dataset_name] for r in all_results if dataset_name in r]
             if dataset_results:
-                # Calculate means and stds
-                train_accs = [r['train'] for r in dataset_results]
-                val_accs = [r['val'] for r in dataset_results]
-                test_accs = [r['test'] for r in dataset_results]
-                
-                final_metrics[f"{dataset_name}_train_mean"] = np.mean(train_accs)
-                final_metrics[f"{dataset_name}_train_std"] = np.std(train_accs)
-                final_metrics[f"{dataset_name}_val_mean"] = np.mean(val_accs)
-                final_metrics[f"{dataset_name}_val_std"] = np.std(val_accs)
-                final_metrics[f"{dataset_name}_test_mean"] = np.mean(test_accs)
-                final_metrics[f"{dataset_name}_test_std"] = np.std(test_accs)
+                # Check which splits exist in the results
+                sample_result = dataset_results[0]
+                available_splits = list(sample_result.keys())
                 
                 print(f"{dataset_name}:")
-                print(f"  Train: {np.mean(train_accs):.4f} ± {np.std(train_accs):.4f}")
-                print(f"  Val:   {np.mean(val_accs):.4f} ± {np.std(val_accs):.4f}")
-                print(f"  Test:  {np.mean(test_accs):.4f} ± {np.std(test_accs):.4f}")
+                
+                # Process each available split
+                for split_name in ['train', 'val', 'test']:
+                    if split_name in available_splits:
+                        split_accs = [r[split_name] for r in dataset_results]
+                        
+                        final_metrics[f"{dataset_name}_{split_name}_mean"] = np.mean(split_accs)
+                        final_metrics[f"{dataset_name}_{split_name}_std"] = np.std(split_accs)
+                        
+                        split_label = split_name.capitalize()
+                        print(f"  {split_label}: {np.mean(split_accs):.4f} ± {np.std(split_accs):.4f}")
         
         # Log final metrics to wandb
         wandb.log(final_metrics)
@@ -312,7 +325,8 @@ def main():
         for result in all_results:
             for dataset_name, dataset_results in result.items():
                 if not dataset_name.startswith('test_'):  # Only include main datasets, not test datasets
-                    all_test_accs.append(dataset_results['test'])
+                    if 'test' in dataset_results:
+                        all_test_accs.append(dataset_results['test'])
         
         if all_test_accs:
             avg_test_acc = np.mean(all_test_accs)
