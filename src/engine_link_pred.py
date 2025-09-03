@@ -7,6 +7,48 @@ from ogb.linkproppred import Evaluator
 from torch_sparse import SparseTensor
 import copy
 import time
+import psutil
+import os
+
+def log_memory_usage(rank=0, stage=""):
+    """Log CPU and GPU memory usage with detailed breakdown"""
+    if rank == 0:
+        # CPU memory usage
+        process = psutil.Process(os.getpid())
+        cpu_memory_mb = process.memory_info().rss / 1024 / 1024
+        cpu_percent = process.memory_percent()
+        
+        # GPU memory usage
+        if torch.cuda.is_available():
+            gpu_memory_allocated = torch.cuda.memory_allocated() / 1024 / 1024
+            gpu_memory_reserved = torch.cuda.memory_reserved() / 1024 / 1024
+            gpu_memory_max = torch.cuda.max_memory_allocated() / 1024 / 1024
+            
+            # Calculate memory deltas if this is a paired start/end measurement
+            memory_delta = ""
+            if "START" in stage:
+                # Store current values for delta calculation
+                if not hasattr(log_memory_usage, 'start_values'):
+                    log_memory_usage.start_values = {}
+                epoch_key = stage.split('_')[-1] if '_' in stage else "0"
+                log_memory_usage.start_values[epoch_key] = {
+                    'gpu_allocated': gpu_memory_allocated,
+                    'cpu_memory': cpu_memory_mb
+                }
+            elif "END" in stage and hasattr(log_memory_usage, 'start_values'):
+                epoch_key = stage.split('_')[-1] if '_' in stage else "0"
+                if epoch_key in log_memory_usage.start_values:
+                    start_vals = log_memory_usage.start_values[epoch_key]
+                    gpu_delta = gpu_memory_allocated - start_vals['gpu_allocated']
+                    cpu_delta = cpu_memory_mb - start_vals['cpu_memory']
+                    memory_delta = f" | Δ GPU: {gpu_delta:+.1f}MB, Δ CPU: {cpu_delta:+.1f}MB"
+            
+            print(f"[MEMORY {stage}] CPU: {cpu_memory_mb:.1f}MB ({cpu_percent:.1f}%), "
+                  f"GPU Allocated: {gpu_memory_allocated:.1f}MB, "
+                  f"GPU Reserved: {gpu_memory_reserved:.1f}MB, "
+                  f"GPU Max: {gpu_memory_max:.1f}MB{memory_delta}", flush=True)
+        else:
+            print(f"[MEMORY {stage}] CPU: {cpu_memory_mb:.1f}MB ({cpu_percent:.1f}%), GPU: N/A", flush=True)
 
 def get_node_embeddings(model, data, projector=None, identity_projection=None, use_full_adj=False):
     """
@@ -109,6 +151,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
     
     try:
         print(f"Rank {rank}: Starting link prediction training for epoch {epoch}")
+        log_memory_usage(rank, f"LINK_TRAIN_START_EPOCH_{epoch}")
         model.train()
         predictor.train()
         if att: att.train()
@@ -122,13 +165,13 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         labels = train_edges['labels'].to(device)
         
         # The dataloader iterates over indices of the FULL training set
-        indices = torch.arange(edge_pairs.size(0), device=device)
+        indices = torch.arange(edge_pairs.size(0))  # Keep on CPU initially
     
         # Use DistributedSampler if in DDP mode
         sampler = None
         if dist.is_initialized() and dist.get_world_size() > 1:
             try:
-                sampler = DistributedSampler(indices.cpu(), shuffle=True)
+                sampler = DistributedSampler(indices, shuffle=True)
                 sampler.set_epoch(epoch)
             except Exception as e:
                 print(f"[ERROR] Rank {rank}: Failed to create DistributedSampler: {e}")
@@ -136,7 +179,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
 
         # Standard DataLoader with DistributedSampler
         try:
-            dataloader = DataLoader(indices.cpu(), batch_size=batch_size, sampler=sampler, 
+            dataloader = DataLoader(indices, batch_size=batch_size, sampler=sampler, 
                                    shuffle=(sampler is None))
         except Exception as e:
             print(f"[ERROR] Rank {rank}: Failed to create DataLoader: {e}")
@@ -223,8 +266,8 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     continue
 
                 # Use unified PFNPredictorNodeCls for link prediction
-                scores = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), 
-                                   link_prototypes, "link_prediction")
+                scores, link_prototypes = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), 
+                                      link_prototypes, "link_prediction")
                 
                 # Use the train_mask to ensure loss is only calculated on non-context edges
                 # Make sure the mask is properly aligned with batch indices
@@ -284,6 +327,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     print(f"Error in training batch: {e}")
                 continue
 
+        log_memory_usage(rank, f"LINK_TRAIN_END_EPOCH_{epoch}")
         if rank == 0:
             loss_str = f"{total_loss:.4f}" if optimizer is not None else "tensor"
             print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {loss_str}, Batch count: {batch_count}")
@@ -291,6 +335,13 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         # Final synchronization to ensure all processes complete training
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.barrier()
+        
+        # Move persistent tensors back to CPU to free GPU memory
+        train_edges['edge_pairs'] = train_edges['edge_pairs'].cpu()
+        train_edges['labels'] = train_edges['labels'].cpu()
+        context_edges['edge_pairs'] = context_edges['edge_pairs'].cpu()
+        context_edges['labels'] = context_edges['labels'].cpu()
+        train_mask = train_mask.cpu()
             
         return total_loss / max(batch_count, 1)
 
@@ -345,6 +396,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                               when available. This is required for OGB standards (e.g., ogbl-collab).
     """
     try:
+        log_memory_usage(rank, "LINK_EVAL_START")
         model.eval()
         predictor.eval()
         if att: att.eval()
@@ -409,10 +461,10 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             target_edge_embeds = src_embeds * dst_embeds
             
             # Use the unified predictor for link prediction
-            batch_scores = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
-                                     link_prototypes, "link_prediction")
-            # Use the positive class score (class 1)
-            pos_scores.append(batch_scores[:, 1])
+            batch_scores, _ = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
+                                        link_prototypes, "link_prediction")
+            # Use the positive class score (class 1) and move to CPU immediately
+            pos_scores.append(batch_scores[:, 1].cpu())
         
         pos_scores = torch.cat(pos_scores, dim=0)
         
@@ -427,10 +479,10 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             target_edge_embeds = src_embeds * dst_embeds
             
             # Use the unified predictor for link prediction  
-            batch_scores = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
-                                     link_prototypes, "link_prediction")
-            # Use the positive class score (class 1)
-            neg_scores.append(batch_scores[:, 1])
+            batch_scores, _ = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
+                                        link_prototypes, "link_prediction")
+            # Use the positive class score (class 1) and move to CPU immediately  
+            neg_scores.append(batch_scores[:, 1].cpu())
         
         neg_scores = torch.cat(neg_scores, dim=0)
         
@@ -471,6 +523,15 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             results['default_metric'] = results[default_metric]
             results['default_metric_name'] = default_metric
         
+        # Move persistent tensors back to CPU to free GPU memory
+        test_edges['edge_pairs'] = test_edges['edge_pairs'].cpu()
+        test_edges['labels'] = test_edges['labels'].cpu()
+        context_edges['edge_pairs'] = context_edges['edge_pairs'].cpu()
+        context_edges['labels'] = context_edges['labels'].cpu()
+        if neg_edges is not None:
+            neg_edges = neg_edges.cpu()
+        
+        log_memory_usage(rank, "LINK_EVAL_END")
         return results
         
     except Exception as e:

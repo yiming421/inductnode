@@ -1,8 +1,120 @@
 import torch
 import torch.nn.functional as F
 import time
-from sklearn.decomposition import PCA
+import numpy as np
+from sklearn.decomposition import PCA, IncrementalPCA
 from torch_geometric.utils import negative_sampling
+
+def apply_incremental_pca_cpu(data_tensor, target_dim, batch_size=10000, sign_normalize=False, rank=0):
+    """
+    Apply Incremental PCA on CPU with performance monitoring.
+    Keeps everything on CPU to avoid wasteful GPU↔CPU transfers.
+    
+    Args:
+        data_tensor (torch.Tensor): Input data tensor [n_samples, n_features] (can be GPU or CPU)
+        target_dim (int): Target number of PCA components
+        batch_size (int): Batch size for incremental processing
+        sign_normalize (bool): Whether to normalize eigenvector signs
+        rank (int): Process rank for logging
+    
+    Returns:
+        torch.Tensor: PCA-transformed data [n_samples, target_dim] on CPU
+    """
+    if rank == 0:
+        print(f"[Incremental PCA] Starting CPU-based PCA: {data_tensor.shape} -> {target_dim} components")
+    
+    start_time = time.time()
+    n_samples, n_features = data_tensor.shape
+    
+    # Move to CPU if needed (only once)
+    if data_tensor.is_cuda:
+        gpu_to_cpu_start = time.time()
+        data_cpu_tensor = data_tensor.cpu()
+        gpu_to_cpu_time = time.time() - gpu_to_cpu_start
+        if rank == 0:
+            print(f"[Incremental PCA] GPU→CPU transfer: {gpu_to_cpu_time:.2f}s")
+    else:
+        data_cpu_tensor = data_tensor
+        gpu_to_cpu_time = 0
+    
+    # Convert to numpy for sklearn
+    data_numpy = data_cpu_tensor.numpy()
+    if rank == 0:
+        print(f"[Incremental PCA] Memory usage: {data_numpy.nbytes / 1e9:.2f}GB")
+    
+    # Initialize Incremental PCA
+    pca = IncrementalPCA(n_components=target_dim, batch_size=batch_size)
+    
+    # Fit PCA in batches
+    fit_start = time.time()
+    n_batches = (n_samples + batch_size - 1) // batch_size
+    
+    if rank == 0:
+        print(f"[Incremental PCA] Fitting PCA with {n_batches} batches of size {batch_size}")
+    
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch = data_numpy[start_idx:end_idx]
+        
+        pca.partial_fit(batch)
+        
+        if rank == 0 and (batch_idx + 1) % max(1, n_batches // 10) == 0:
+            progress = (batch_idx + 1) / n_batches * 100
+            print(f"[Incremental PCA] Fit progress: {progress:.1f}% ({batch_idx + 1}/{n_batches})")
+    
+    fit_time = time.time() - fit_start
+    
+    # Transform in batches
+    transform_start = time.time()
+    transformed_batches = []
+    
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch = data_numpy[start_idx:end_idx]
+        
+        transformed_batch = pca.transform(batch)
+        transformed_batches.append(transformed_batch)
+    
+    # Concatenate all transformed batches
+    data_transformed = np.concatenate(transformed_batches, axis=0)
+    transform_time = time.time() - transform_start
+    
+    # Apply sign normalization if requested
+    if sign_normalize:
+        sign_norm_start = time.time()
+        components = pca.components_  # Shape: [target_dim, n_features]
+        singular_values = np.sqrt(pca.explained_variance_)
+        
+        for i in range(target_dim):
+            # Reconstruct the feature vector: component * singular_value
+            feature_vector = components[i] * singular_values[i]  
+            max_idx = np.argmax(np.abs(feature_vector))
+            if feature_vector[max_idx] < 0:
+                # Flip the sign of the transformed data for this component
+                data_transformed[:, i] = -data_transformed[:, i]
+        
+        sign_norm_time = time.time() - sign_norm_start
+        if rank == 0:
+            print(f"[Incremental PCA] Sign normalization: {sign_norm_time:.2f}s")
+    
+    # Convert back to CPU torch tensor (no GPU transfer!)
+    result_tensor = torch.from_numpy(data_transformed).to(dtype=data_tensor.dtype)
+    
+    total_time = time.time() - start_time
+    
+    if rank == 0:
+        print(f"[Incremental PCA] Performance Summary:")
+        if gpu_to_cpu_time > 0:
+            print(f"  - GPU→CPU: {gpu_to_cpu_time:.2f}s")  
+        print(f"  - PCA Fit: {fit_time:.2f}s ({n_batches} batches)")
+        print(f"  - PCA Transform: {transform_time:.2f}s")
+        print(f"  - Total: {total_time:.2f}s")
+        print(f"  - Result shape: {result_tensor.shape} (CPU)")
+        print(f"  - Explained variance ratio: {pca.explained_variance_ratio_[:min(5, target_dim)].sum():.4f} (first {min(5, target_dim)} components)")
+    
+    return result_tensor
 
 def select_k_shot_context(data, k, index):
     classes = data.y.unique()
@@ -39,7 +151,8 @@ def select_k_shot_context(data, k, index):
 def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use_full_pca=False, 
                  normalize_data=False, use_projector=False, min_pca_dim=32, rank=0, 
                  padding_strategy='zero', use_batchnorm=False, use_identity_projection=False, 
-                 projection_small_dim=128, projection_large_dim=256):
+                 projection_small_dim=128, projection_large_dim=256, pca_device='gpu',
+                 incremental_pca_batch_size=10000):
     device = data.x.device
     split_idx['train'] = split_idx['train'].to(device)
     split_idx['valid'] = split_idx['valid'].to(device)
@@ -129,23 +242,47 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         if rank == 0:
             print(f"Dataset {data.name}: Using zero padding ({original_dim} -> zero-pad to {hidden})")
     
-    # Apply PCA
-    if use_full_pca:
-        U, S, V = torch.svd(data.x)
-        U = U[:, :pca_target_dim]
-        S = S[:pca_target_dim]
+    # Apply PCA - choose method based on configuration
+    if pca_device == 'cpu':
+        # Use CPU-based Incremental PCA (stays on CPU)
+        pca_start = time.time()
+        data.x_pca = apply_incremental_pca_cpu(
+            data.x, 
+            target_dim=pca_target_dim, 
+            batch_size=incremental_pca_batch_size,
+            sign_normalize=sign_normalize,
+            rank=rank
+        )
+        pca_time = time.time() - pca_start
+        if rank == 0:
+            print(f"Dataset {data.name}: Incremental PCA completed in {pca_time:.2f}s (result on CPU)")
     else:
-        U, S, V = torch.pca_lowrank(data.x, q=pca_target_dim)
+        # Use original GPU-based PCA methods
+        if use_full_pca:
+            U, S, V = torch.svd(data.x)
+            U = U[:, :pca_target_dim]
+            S = S[:pca_target_dim]
+        else:
+            U, S, V = torch.pca_lowrank(data.x, q=pca_target_dim)
 
-    # normalize the eigenvectors direction
-    if sign_normalize:
-        for i in range(pca_target_dim):
-            feature_vector = U[:, i] * S[i]
-            max_idx = torch.argmax(torch.abs(feature_vector))
-            if feature_vector[max_idx] < 0:
-                U[:, i] = -U[:, i]
+        # normalize the eigenvectors direction
+        if sign_normalize:
+            for i in range(pca_target_dim):
+                feature_vector = U[:, i] * S[i]
+                max_idx = torch.argmax(torch.abs(feature_vector))
+                if feature_vector[max_idx] < 0:
+                    U[:, i] = -U[:, i]
 
-    data.x_pca = torch.mm(U, torch.diag(S)).to(device)
+        data.x_pca = torch.mm(U, torch.diag(S))
+    
+    # Handle device placement for PCA results
+    if pca_device != 'cpu':
+        # GPU PCA result -> move to device as usual
+        data.x_pca = data.x_pca.to(device)
+    else:
+        # CPU Incremental PCA result -> keep on CPU, will move to GPU per-dataset during training
+        if rank == 0:
+            print(f"Dataset {data.name}: Keeping Incremental PCA result on CPU ({data.x_pca.shape})")
     
     # Handle different pathways
     if data.needs_projection:
@@ -157,20 +294,23 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         if data.x_pca.size(1) < hidden:
             padding_size = hidden - data.x_pca.size(1)
             
+            # Determine device for padding operations
+            pca_device = data.x_pca.device
+            
             if padding_strategy == 'zero':
-                                 # Zero padding (can harm performance due to distribution mismatch)
-                 padding = torch.zeros(data.x_pca.size(0), padding_size, device=device)
-                 data.x = torch.cat([data.x_pca, padding], dim=1)
-                 if rank == 0:
-                     print(f"Dataset {data.name}: Applied zero padding ({data.x_pca.size(1)} -> {hidden})")
+                # Zero padding (can harm performance due to distribution mismatch)
+                padding = torch.zeros(data.x_pca.size(0), padding_size, device=pca_device)
+                data.x = torch.cat([data.x_pca, padding], dim=1)
+                if rank == 0:
+                    print(f"Dataset {data.name}: Applied zero padding ({data.x_pca.size(1)} -> {hidden}) on {pca_device}")
             elif padding_strategy == 'random':
                 # Random padding from same distribution as real features
                 real_std = data.x_pca.std(dim=0, keepdim=True)
                 real_mean = data.x_pca.mean(dim=0, keepdim=True)
-                random_padding = torch.randn(data.x_pca.size(0), padding_size, device=device) * real_std.mean() + real_mean.mean()
+                random_padding = torch.randn(data.x_pca.size(0), padding_size, device=pca_device) * real_std.mean() + real_mean.mean()
                 data.x = torch.cat([data.x_pca, random_padding], dim=1)
                 if rank == 0:
-                    print(f"Dataset {data.name}: Applied random padding ({data.x_pca.size(1)} -> {hidden})")
+                    print(f"Dataset {data.name}: Applied random padding ({data.x_pca.size(1)} -> {hidden}) on {pca_device}")
             elif padding_strategy == 'repeat':
                 # Feature repetition
                 data.x = data.x_pca

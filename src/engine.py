@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
+import psutil
+import os
 from .utils import process_node_features, acc, apply_final_pca
 
 def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None, 
@@ -12,6 +14,9 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
           identity_projection=None, lambda_=1.0):
     st = time.time()
     print(f"[RANK {rank}] Starting training epoch {epoch} on device cuda:{rank}", flush=True)
+    
+    # Show detailed memory breakdown for first epoch and every 10th epoch
+    show_detailed = (epoch == 0 or epoch % 10 == 0)
 
     model.train()
     if att is not None:
@@ -30,18 +35,22 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     else:
         dataloader = DataLoader(range(train_idx.size(0)), batch_size, shuffle=True)
 
+    if rank == 0 and epoch == 0:
+        log_memory_usage(rank, f"AFTER_DATALOADER_SETUP", show_detailed=show_detailed)
+
     total_loss = 0
-    for perm in dataloader:
+    for batch_idx, perm in enumerate(dataloader):
         if isinstance(perm, torch.Tensor):
             perm = perm.tolist()
         train_perm_idx = train_idx[perm]
         
+        # Log memory for first batch of first epoch to understand memory spikes
+        if rank == 0 and epoch == 0 and batch_idx == 0:
+            log_memory_usage(rank, f"BATCH_START", show_detailed=show_detailed)
+        
         # Apply different projection strategies
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
-            # Apply identity projection
-            # print(f"Using identity projection for data.x with shape {data.x.shape}", flush=True)
             x_input = identity_projection(data.x)
-            # print(f"Projected x_input shape: {x_input.shape}", flush=True)
         elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
             projected_features = projector(data.x)
             # Apply final PCA to get features in proper PCA form
@@ -52,11 +61,27 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         else:
             x_input = data.x
         
-        # Standard forward pass
-        h = model(x_input, data.adj_t)
+        if rank == 0 and epoch == 0 and batch_idx == 0:
+            log_memory_usage(rank, f"AFTER_PROJECTION", show_detailed=show_detailed)
+        
+        # Memory-optimized forward pass with gradient checkpointing and chunking
+        if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
+            # Use gradient checkpointing to reduce memory
+            h = torch.utils.checkpoint.checkpoint(model, x_input, data.adj_t)
+        else:
+            # Standard forward pass
+            h = model(x_input, data.adj_t)
 
+        # Memory optimization: Extract needed embeddings immediately and delete large tensor
         context_h = h[data.context_sample]
         context_y = data.y[data.context_sample]
+        
+        # Extract target embeddings for this batch
+        target_h = h[train_perm_idx]
+        
+        # Immediately delete the large tensor to free memory
+        del h
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         # Fix type safety by properly handling None values
         class_h = process_node_features(
@@ -67,17 +92,14 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             normalize=normalize_class_h
         )
 
-        target_h = h[train_perm_idx]
-        score = pred(data, context_h, target_h, context_y, class_h)
+        target_y = data.y[train_perm_idx]
+        score, class_h = pred(data, context_h, target_h, context_y, class_h)
         score = F.log_softmax(score, dim=1)
         label = data.y[train_perm_idx].squeeze()
 
-        # Store class_h in data for orthogonal loss calculation
-        data.final_class_h = class_h
-        
         # Compute orthogonal loss with better numerical stability
-        if orthogonal_push > 0 and hasattr(data, 'final_class_h'):
-            class_h_norm = F.normalize(data.final_class_h, p=2, dim=1)
+        if orthogonal_push > 0:
+            class_h_norm = F.normalize(class_h, p=2, dim=1)
             class_matrix = class_h_norm @ class_h_norm.T
             # Remove diagonal elements
             mask = ~torch.eye(class_matrix.size(0), device=class_matrix.device, dtype=torch.bool)
@@ -92,6 +114,9 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         # Only perform optimization if optimizer is provided (for joint training compatibility)
         optimizer.zero_grad()
         loss.backward()
+        
+        if rank == 0 and epoch == 0 and batch_idx == 0:
+            log_memory_usage(rank, f"AFTER_BACKWARD", show_detailed=show_detailed)
         
         # Apply gradient clipping
         if clip_grad > 0:
@@ -108,9 +133,19 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                 nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
         
         optimizer.step()
+        
+        # Memory cleanup after optimization step
         total_loss += loss.item()
+        del context_h, target_h, class_h, score, label, loss, nll_loss, orthogonal_loss
+        if 'x_input' in locals() and x_input is not data.x:
+            del x_input
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        if rank == 0 and epoch == 0 and batch_idx == 0:
+            log_memory_usage(rank, f"AFTER_OPTIMIZER_STEP", show_detailed=show_detailed)
 
     en = time.time()
+    log_memory_usage(rank, f"TRAIN_END_EPOCH_{epoch}")
     if rank == 0:
         print(f"Train time: {en-st:.2f}s", flush=True)
     
@@ -137,6 +172,7 @@ def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, deg
 def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False, 
          att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None):
     st = time.time()
+    log_memory_usage(rank, "TEST_START")
     model.eval()
     predictor.eval()
     if projector is not None:
@@ -175,7 +211,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     valid_score = []
     for idx in valid_loader:
         target_h = h[valid_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
+        out, _ = predictor(data, context_h, target_h, context_y, class_h)
         out = out.argmax(dim=1).flatten()
         valid_score.append(out)
     valid_score = torch.cat(valid_score, dim=0)
@@ -183,7 +219,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     train_score = []
     for idx in train_loader:
         target_h = h[train_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
+        out, _ = predictor(data, context_h, target_h, context_y, class_h)
         out = out.argmax(dim=1).flatten()
         train_score.append(out)
     train_score = torch.cat(train_score, dim=0)
@@ -191,7 +227,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     test_score = []
     for idx in test_loader:
         target_h = h[test_idx[idx]]
-        out = predictor(data, context_h, target_h, context_y, class_h)
+        out, _ = predictor(data, context_h, target_h, context_y, class_h)
         out = out.argmax(dim=1).flatten()
         test_score.append(out)
     test_score = torch.cat(test_score, dim=0)
@@ -204,6 +240,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     test_y = data.y[test_idx]
     test_results = acc(test_y, test_score)
 
+    log_memory_usage(rank, "TEST_END")
     if rank == 0:
         print(f"Test time: {time.time()-st}", flush=True)
     return train_results, valid_results, test_results

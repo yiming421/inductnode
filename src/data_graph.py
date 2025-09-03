@@ -10,12 +10,150 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.datasets import TUDataset
 from torch_geometric.transforms import NormalizeFeatures
 from torch_geometric.loader import DataLoader
+from torch.utils.data import Subset
 import numpy as np
 import os
-from sklearn.model_selection import StratifiedKFold
-from collections import defaultdict
 import random
+import psutil, gc
+from torch_sparse import SparseTensor
+import time
+import math  # (possibly needed later)
+# FUG-specific loaders moved to separate module
+try:
+    from .data_graph_fug_simple import load_ogb_fug_dataset
+except ImportError:
+    # Fallback if relative import path differs when executed as script
+    try:
+        from data_graph_fug_simple import load_ogb_fug_dataset
+    except Exception:
+        load_ogb_fug_dataset = lambda *a, **k: None
 
+
+def load_gpse_embeddings(dataset_name, gpse_base_path="/home/maweishuo/GPSE/datasets"):
+    """
+    Load pre-computed GPSE embeddings for a dataset.
+    
+    Args:
+        dataset_name: Name of the dataset (should match GPSE naming)
+        gpse_base_path: Base path to GPSE datasets directory
+        
+    Returns:
+        tuple: (node_embeddings_tensor, slices_tensor) or (None, None) if not found
+    """
+    # Map inductnode dataset names to GPSE dataset names
+    dataset_mapping = {
+        'bace': 'OGB-ogbg-molbace',
+        'bbbp': 'OGB-ogbg-molbbbp', 
+        'chemhiv': 'OGB-ogbg-molhiv',
+        'tox21': 'OGB-ogbg-moltox21',
+        'toxcast': 'OGB-ogbg-moltoxcast',
+    }
+    
+    gpse_dataset_name = dataset_mapping.get(dataset_name)
+    if not gpse_dataset_name:
+        print(f"Warning: No GPSE embeddings available for dataset '{dataset_name}'")
+        print(f"Available datasets: {list(dataset_mapping.keys())}")
+        return None, None
+    
+    data_path = os.path.join(gpse_base_path, gpse_dataset_name, "pe_stats_GPSE", "1.0", "data.pt")
+    slices_path = os.path.join(gpse_base_path, gpse_dataset_name, "pe_stats_GPSE", "1.0", "slices.pt")
+    
+    if not os.path.exists(data_path) or not os.path.exists(slices_path):
+        print(f"Warning: GPSE files not found for {gpse_dataset_name}")
+        print(f"  Expected: {data_path}")
+        print(f"  Expected: {slices_path}")
+        return None, None
+    
+    try:
+        node_embeddings = torch.load(data_path, map_location='cpu')
+        slices = torch.load(slices_path, map_location='cpu')
+        
+        print(f"Loaded GPSE embeddings for {gpse_dataset_name}")
+        print(f"  Node embeddings shape: {node_embeddings.shape}")
+        print(f"  Number of graphs: {len(slices) - 1}")
+        print(f"  Embedding dimension: {node_embeddings.shape[1]}")
+        
+        return node_embeddings, slices
+        
+    except Exception as e:
+        print(f"Error loading GPSE embeddings: {e}")
+        return None, None
+
+
+def create_gpse_node_lookup_table(dataset, gpse_embeddings, gpse_slices):
+    """
+    Create a node lookup table from GPSE embeddings that matches the dataset's node indexing.
+    
+    Args:
+        dataset: The original dataset 
+        gpse_embeddings: Concatenated GPSE node embeddings [total_nodes, embedding_dim]
+        gpse_slices: Graph boundary slices [num_graphs + 1]
+        
+    Returns:
+        torch.Tensor: Node lookup table [num_unique_nodes, embedding_dim]
+    """
+    print("Creating GPSE node lookup table...")
+    
+    # Verify that we have embeddings for all graphs in the dataset
+    num_dataset_graphs = len(dataset)
+    num_gpse_graphs = len(gpse_slices) - 1
+    
+    if num_dataset_graphs != num_gpse_graphs:
+        print(f"Warning: Dataset has {num_dataset_graphs} graphs but GPSE has {num_gpse_graphs} graphs")
+        # Take the minimum to avoid index errors
+        num_graphs = min(num_dataset_graphs, num_gpse_graphs)
+        print(f"Using first {num_graphs} graphs from both")
+    else:
+        num_graphs = num_dataset_graphs
+    
+    # Collect all node embeddings from GPSE data
+    all_node_embeddings = []
+    
+    for graph_idx in range(num_graphs):
+        start_idx = gpse_slices[graph_idx]
+        end_idx = gpse_slices[graph_idx + 1]
+        graph_embeddings = gpse_embeddings[start_idx:end_idx]  # [num_nodes_in_graph, embedding_dim]
+        all_node_embeddings.append(graph_embeddings)
+    
+    # Create a single lookup table by concatenating all unique node embeddings
+    # For graph classification, we can simply concatenate all node embeddings
+    node_lookup_table = torch.cat(all_node_embeddings, dim=0)  # [total_nodes, embedding_dim]
+    
+    print(f"Created GPSE node lookup table: {node_lookup_table.shape}")
+    
+    return node_lookup_table
+
+
+def update_dataset_with_gpse_embeddings(dataset, dataset_name, gpse_path):
+    """
+    Update dataset to use GPSE embeddings instead of original node embeddings.
+    
+    Args:
+        dataset: The dataset to update
+        dataset_name: Name of the dataset for GPSE lookup
+        gpse_path: Path to GPSE datasets directory
+        
+    Returns:
+        bool: True if successfully updated, False otherwise
+    """
+    # Load GPSE embeddings
+    gpse_embeddings, gpse_slices = load_gpse_embeddings(dataset_name, gpse_path)
+    
+    if gpse_embeddings is None or gpse_slices is None:
+        print(f"Could not load GPSE embeddings for {dataset_name}, using original embeddings")
+        return False
+    
+    # Create new node lookup table from GPSE embeddings
+    gpse_node_table = create_gpse_node_lookup_table(dataset, gpse_embeddings, gpse_slices)
+    
+    # Update the dataset's node embedding table
+    dataset.node_embs = gpse_node_table
+    dataset.num_node_features = gpse_node_table.shape[1]
+    
+    print(f"Successfully updated dataset with GPSE embeddings!")
+    print(f"  New embedding dimension: {dataset.num_node_features}")
+    
+    return True
 
 def load_tsgfm_dataset(name, root='./dataset'):
     """
@@ -66,6 +204,8 @@ def load_tsgfm_dataset(name, root='./dataset'):
 
 def load_graph_classification_tsgfm(data_obj, metadata, name):
     """Load graph classification TSGFM dataset (batched format with boundaries)"""
+
+    st_time = time.time()
     
     # Extract graph boundaries from metadata
     node_boundaries = metadata['x']  # Indices where each graph's nodes start/end
@@ -74,11 +214,6 @@ def load_graph_classification_tsgfm(data_obj, metadata, name):
     num_graphs = len(node_boundaries) - 1  # Last boundary is the final endpoint
     
     print(f"Extracting {num_graphs} graphs from batched format")
-    
-    # Extract node features using lookup table
-    x_indices = data_obj.x  # Node type indices
-    node_embs = data_obj.node_embs  # Node type embeddings lookup table
-    node_text_feat = node_embs[x_indices]  # Reconstruct full node text features
     
     # Graph-level labels - handle both single-task and multi-task datasets
     graph_labels = data_obj.y
@@ -98,15 +233,23 @@ def load_graph_classification_tsgfm(data_obj, metadata, name):
     else:
         raise ValueError(f"Invalid label structure: {graph_labels.numel()} labels for {num_graphs} graphs")
     
-    # Extract edge features using lookup table (if available)
-    edge_text_feat = None
+    # Store embedding lookup tables and indices (NO eager reconstruction!)
+    x_indices = data_obj.x  # Node type indices
+    node_embs = data_obj.node_embs  # Node embedding lookup table
+    
+    # Edge embedding info (if available)
+    xe_indices = None
+    edge_embs = None
     if hasattr(data_obj, 'xe') and hasattr(data_obj, 'edge_embs'):
         xe_indices = data_obj.xe
         edge_embs = data_obj.edge_embs
-        edge_text_feat = edge_embs[xe_indices]
     
     # Split the batched data into individual graphs
     graphs = []
+
+    print(f'Time to extract graph boundaries: {time.time() - st_time:.2f} seconds')
+
+    st_time = time.time()
     
     for i in range(num_graphs):
         # Node range for this graph
@@ -122,76 +265,102 @@ def load_graph_classification_tsgfm(data_obj, metadata, name):
         edge_start = edge_boundaries[i].item()
         edge_end = edge_boundaries[i + 1].item()
         
-        # Extract nodes and edges for this graph
-        graph_node_feat = node_text_feat[node_start:node_end]  # Shape: [num_nodes_in_graph, 384]
+        # Extract node indices and edges for this graph (NO feature reconstruction!)
+        graph_node_indices = x_indices[node_start:node_end]  # Node type indices for this graph
         graph_edges = data_obj.edge_index[:, edge_start:edge_end]  # Shape: [2, num_edges_in_graph]
         
-        # Edge indices are already relative to each graph (starting from 0)
-        # No adjustment needed - they're already in range [0, num_nodes_in_graph)
-        
-        # Get graph-level label(s) 
-        graph_label = graph_labels[i]
+        # Get graph-level label(s) and add batch dimension to match OGB format [1, num_tasks]
+        graph_label = graph_labels[i].unsqueeze(0)  # [num_tasks] -> [1, num_tasks]
         
         # Create task mask for multi-task datasets (1 for valid labels, 0 for NaN)
-        if graph_label.dim() == 1 and len(graph_label) > 1:  # Multi-task
+        if graph_label.dim() == 2 and graph_label.size(1) > 1:  # Multi-task: [1, num_tasks]
             task_mask = (~torch.isnan(graph_label)).float()
-            # Replace NaN with 0 for computational stability and ensure integer labels for classification
             graph_label = torch.where(torch.isnan(graph_label), torch.zeros_like(graph_label), graph_label).long()
-        else:  # Single-task
+        else:  # Single-task: [1, 1]
             task_mask = torch.ones_like(graph_label)
         
-        # Create individual graph
+        # Extract edge indices for this graph (if available)
+        graph_edge_indices = None
+        if xe_indices is not None:
+            graph_edge_indices = xe_indices[edge_start:edge_end]
+        
+        # --- Self-loop fallback for empty-edge graphs ---
+        num_nodes = graph_node_indices.shape[0]
+        num_edges = graph_edges.size(1)
+        if num_edges == 0 and num_nodes > 0:
+            # Create identity self-loops to form an "idle" adjacency so later GNN layers do not crash
+            idle_edge_index = torch.arange(num_nodes, device=graph_node_indices.device)
+            idle_edge_index = idle_edge_index.unsqueeze(0).repeat(2, 1)  # [2, num_nodes]
+            original_num_edges = 0
+            edge_index_for_storage = idle_edge_index
+            idle_flag = True
+            # Build SparseTensor identity directly
+            adj_t = SparseTensor.eye(num_nodes, device=graph_node_indices.device)
+        else:
+            original_num_edges = num_edges
+            edge_index_for_storage = graph_edges
+            idle_flag = False
+            adj_t = SparseTensor.from_edge_index(
+                graph_edges,
+                sparse_sizes=(num_nodes, num_nodes)
+            ).to_symmetric().coalesce()
+        
+        # Create individual graph with INDICES not features
         graph = Data(
-            x=graph_node_feat,  # Use reconstructed text features
-            edge_index=graph_edges,
+            x=graph_node_indices,
+            edge_index=edge_index_for_storage,
             y=graph_label,
-            task_mask=task_mask,  # Add task mask for NaN handling
-            num_nodes=graph_node_feat.shape[0]
+            task_mask=task_mask,
+            num_nodes=num_nodes,
+            original_num_edges=original_num_edges,
+            idle_edges=idle_flag
         )
         
-        # Convert edge_index to SparseTensor format for GNN compatibility
-        from torch_sparse import SparseTensor
-        graph.adj_t = SparseTensor.from_edge_index(
-            graph_edges, 
-            sparse_sizes=(graph_node_feat.shape[0], graph_node_feat.shape[0])
-        ).to_symmetric().coalesce()
+        # Store edge indices if available (edge type indices, not features)
+        if graph_edge_indices is not None:
+            graph.edge_attr = graph_edge_indices
         
-        # Add edge features if available
-        if edge_text_feat is not None:
-            graph.edge_attr = edge_text_feat[edge_start:edge_end]
+        # Attach adjacency tensor
+        graph.adj_t = adj_t
         
         graphs.append(graph)
+
+    print(f'Time to create individual graphs: {time.time() - st_time:.2f} seconds')
+
+    st_time = time.time()
     
     # Create dataset class
     class GraphClassificationDataset:
-        def __init__(self, graphs, name):
+        def __init__(self, graphs, name, node_embs, edge_embs=None):
             self.graphs = graphs
             self.name = name
             
+            # Store embedding lookup tables for lazy computation
+            self.node_embs = node_embs  # [num_node_types, embedding_dim]
+            self.edge_embs = edge_embs  # [num_edge_types, embedding_dim] or None
+            
             if len(graphs) > 0:
                 sample = graphs[0]
-                self.num_node_features = sample.x.shape[1]
+                # Use embedding dimension instead of indices dimension
+                self.num_node_features = node_embs.shape[1]
                 
                 # All datasets now have labels in standardized format [num_tasks]
                 sample_y = sample.y
-                if sample_y.dim() == 1:  # Standardized format: [num_tasks]
-                    self.num_tasks = sample_y.shape[0]
-                    
-                    if self.num_tasks == 1:
-                        # Single-task: determine number of classes
-                        all_labels = [graph.y[0].item() for graph in graphs]
-                        unique_labels = sorted(set(label for label in all_labels if not np.isnan(label)))
-                        self.num_classes = len(unique_labels)
-                        print(f"Single-task graph classification: {len(graphs)} graphs, "
-                              f"{self.num_classes} classes, {self.num_node_features} text features per node")
-                    else:
-                        # Multi-task: typically binary classification per task
-                        self.num_classes = 2  # Binary per task
-                        print(f"Multi-task graph classification: {len(graphs)} graphs, "
-                              f"{self.num_tasks} tasks, {self.num_classes} classes per task, "
-                              f"{self.num_node_features} text features per node")
+                self.num_tasks = sample_y.shape[1]
+                
+                if self.num_tasks == 1:
+                    # Single-task: determine number of classes
+                    all_labels = [graph.y[0].item() for graph in graphs]
+                    unique_labels = sorted(set(label for label in all_labels if not np.isnan(label)))
+                    self.num_classes = len(unique_labels)
+                    print(f"Single-task graph classification: {len(graphs)} graphs, "
+                            f"{self.num_classes} classes, {self.num_node_features} text features per node")
                 else:
-                    raise ValueError(f"Unexpected label dimensionality: {sample_y.dim()}, expected 1D tensor")
+                    # Multi-task: typically binary classification per task
+                    self.num_classes = 2  # Binary per task
+                    print(f"Multi-task graph classification: {len(graphs)} graphs, "
+                            f"{self.num_tasks} tasks, {self.num_classes} classes per task, "
+                            f"{self.num_node_features} text features per node")
             else:
                 raise ValueError(f"Empty graph list for {name}")
         
@@ -205,7 +374,9 @@ def load_graph_classification_tsgfm(data_obj, metadata, name):
             """Support item assignment for dataset processing."""
             self.graphs[idx] = value
     
-    return GraphClassificationDataset(graphs, name)
+    dataset = GraphClassificationDataset(graphs, name, node_embs, edge_embs)
+    print(f"Time to create dataset class: {time.time() - st_time:.2f} seconds")
+    return dataset
 
 
 def load_tu_dataset(name, root='../dataset/TU'):
@@ -235,17 +406,147 @@ def load_tu_dataset(name, root='../dataset/TU'):
         return None
 
 
-def load_dataset(name, root='./dataset'):
+def _create_tag_dataset(data, slices, name):
+    """Helper to create TAGDataset from data and slices - simple PyG InMemoryDataset style."""
+    class TAGInMemoryDataset:
+        def __init__(self, data, slices, name):
+            self.data = data
+            self.slices = slices
+            self.name = name
+            
+            # Standard PyG dataset properties - handle None values safely
+            if hasattr(data, 'y') and data.y is not None:
+                self.num_classes = len(torch.unique(data.y))
+            else:
+                self.num_classes = 2  # Default binary
+                
+            if hasattr(data, 'x') and data.x is not None:
+                self.num_node_features = data.x.shape[1]
+            else:
+                self.num_node_features = 0
+        
+        def __len__(self):
+            # TAGDataset uses different slice keys than standard PyG
+            if 'edge_index' in self.slices:
+                return len(self.slices['edge_index']) - 1
+            elif 'x' in self.slices:
+                return len(self.slices['x']) - 1
+            else:
+                return 0
+        
+        def __getitem__(self, idx):
+            from torch_geometric.data import Data
+            graph_data = {}
+            
+            # TAGDataset has special handling for mapping features
+            if hasattr(self.data, 'keys'):
+                data_keys = self.data.keys()
+            else:
+                data_keys = []
+            
+            for key in data_keys:
+                if key in self.slices:
+                    start = self.slices[key][idx].item()
+                    end = self.slices[key][idx + 1].item()
+                    attr_value = getattr(self.data, key)
+                    if attr_value is not None:
+                        graph_data[key] = attr_value[start:end]
+                else:
+                    attr_value = getattr(self.data, key)
+                    if attr_value is not None:
+                        graph_data[key] = attr_value
+            
+            # TAGDataset might not have 'y' directly - check for labels via mapping
+            if 'y' not in graph_data:
+                # Look for label mapping in TAGDataset format
+                if hasattr(self.data, 'label_map') and self.data.label_map is not None:
+                    # Create a simple binary label for now (can be enhanced later)
+                    graph_data['y'] = torch.tensor([0], dtype=torch.long)  # Default label
+            
+            return Data(**graph_data)
+    
+    return TAGInMemoryDataset(data, slices, name)
+
+
+def load_tag_dataset(name, root='./TAGDataset', embedding_family='ST'):
     """
-    Load a graph classification dataset. Tries TSGFM format first, then TU format.
+    Load a TAGDataset using TAGLAS Lite with full pipeline integration.
     
     Args:
-        name (str): Dataset name
-        root (str): Root directory for datasets
+        name (str): Dataset name (e.g., 'bace', 'bbbp', 'hiv')
+        root (str): Root directory for TAG datasets
+        embedding_family (str): Text embedding family ('ST' for Sentence Transformer, 'e5' for E5 embeddings)
         
     Returns:
-        dataset: PyTorch Geometric dataset or None if loading fails
+        dataset: Pipeline-compatible dataset or None if loading fails
     """
+    try:
+        from src.taglas_lite import (
+            load_tag_dataset_with_pipeline_integration,
+            convert_tagdataset_to_tsgfm_format
+        )
+        
+        print(f"Loading TAGDataset {name} with TAGLAS Lite ({embedding_family} embeddings)...")
+        
+        # Load using TAGLAS Lite with full pipeline integration
+        tag_pipeline_dataset = load_tag_dataset_with_pipeline_integration(name, root, embedding_family)
+        
+        # Convert to TSGFM-compatible format for existing pipeline code
+        compatible_dataset = convert_tagdataset_to_tsgfm_format(tag_pipeline_dataset)
+        
+        print(f"Successfully loaded TAGDataset {name}: {len(compatible_dataset)} graphs")
+        print(f"  Node features: {compatible_dataset.num_node_features}D")
+        print(f"  Classes: {compatible_dataset.num_classes}")
+        print(f"  Text features: {compatible_dataset.has_text_features}")
+        print(f"  Embedding family: {embedding_family}")
+        
+        return compatible_dataset
+        
+    except Exception as e:
+        print(f"Failed to load TAGDataset {name} with TAGLAS Lite: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def load_dataset(name, root='./dataset', embedding_family='ST'):
+    """
+    Load a graph classification dataset. Extended with optional FUG+OGB path.
+    Priority:
+      0. FUG OGB embeddings (if env USE_FUG_EMB=1 and embeddings available)
+      1. TAGDataset (if TAG_DATASET_ROOT set)
+      2. TSGFM batched format
+      3. TU datasets
+    """
+    # --- FUG OGB path (simplified for unified embedding setting) ---
+    if os.environ.get('USE_FUG_EMB', '0') == '1':
+        fug_root = os.environ.get('FUG_EMB_ROOT', './fug')
+        ogb_root = os.environ.get('OGB_ROOT', './dataset/ogb')
+        
+        print(f"[Loader] Loading FUG dataset '{name}' (unified embedding setting)")
+        
+        # Simple unified loading - just one function needed
+        from .data_graph_fug_simple import load_ogb_fug_dataset
+        result = load_ogb_fug_dataset(name, ogb_root=ogb_root, fug_root=fug_root)
+        if result is not None:
+            dataset, fug_mapping = result  # Unpack pristine dataset and external mapping
+            print(f"[Loader] Successfully loaded FUG dataset '{name}'")
+            dataset.name = name
+            # Return both dataset and FUG mapping - let caller handle the mapping
+            return dataset, fug_mapping
+        else:
+            print(f"[Loader] FUG loading failed for '{name}'. Continuing...")
+
+    # Check if we should use TAG dataset format
+    tag_dataset_root = os.environ.get('TAG_DATASET_ROOT')
+    if tag_dataset_root and os.path.isdir(tag_dataset_root):
+        print(f"TAG dataset mode enabled - attempting to load {name} as TAGDataset...")
+        dataset = load_tag_dataset(name, tag_dataset_root, embedding_family)
+        if dataset is not None:
+            dataset.name = name
+            return dataset
+        print(f"Failed to load {name} as TAGDataset, falling back to standard formats...")
+
     # List of known TSGFM graph classification datasets (batched format)
     tsgfm_graph_datasets = ['bace', 'bbbp', 'chemhiv', 'chempcba', 'chemblpre', 'muv', 'tox21', 'toxcast']
     
@@ -254,20 +555,20 @@ def load_dataset(name, root='./dataset'):
         print(f"Attempting to load {name} as TSGFM dataset...")
         dataset = load_tsgfm_dataset(name, root)
         if dataset is not None:
+            dataset.name = name  # Set dataset name for consistency
             return dataset
-        
         print(f"Failed to load {name} as TSGFM dataset, trying TU format...")
-    
+
     # Try TU format
     print(f"Attempting to load {name} as TU dataset...")
     dataset = load_tu_dataset(name, os.path.join(root, 'TU'))
-    
-    return dataset
 
+    return dataset
 
 def load_precomputed_splits(dataset_name, root='./dataset'):
     """
     Load pre-computed splits from TSGFM datasets.
+    Supports use_tag_dataset mode by checking for TAG_DATASET_ROOT environment variable.
     
     Args:
         dataset_name (str): Name of the dataset
@@ -276,6 +577,11 @@ def load_precomputed_splits(dataset_name, root='./dataset'):
     Returns:
         dict: Contains 'train', 'val', 'test' indices or None if not found
     """
+    # Check if we should use TAG dataset root instead
+    tag_dataset_root = os.environ.get('TAG_DATASET_ROOT')
+    if tag_dataset_root and os.path.isdir(tag_dataset_root):
+        root = tag_dataset_root
+    
     split_path = os.path.join(root, dataset_name, 'e2e_graph_splits.pt')
     
     if not os.path.exists(split_path):
@@ -382,6 +688,7 @@ def create_random_splits(dataset, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2
 def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, seed=42, pretraining_mode=False):
     """
     Create dataset splits with priority order:
+    0. OGB official splits (when using OGB FUG datasets)
     1. Pre-computed splits (TSGFM)
     2. Scaffold splits (TODO)  
     3. Random splits (fallback)
@@ -391,8 +698,8 @@ def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0
         dataset_name (str): Name of the dataset
         root (str): Root directory for datasets
         train_ratio (float): Proportion for training (if creating new splits)
-        val_ratio (float): Proportion for validation (if creating new splits)
-        test_ratio (float): Proportion for testing (if creating new splits)
+        val_ratio (float): Proportion of data for validation (if creating new splits)
+        test_ratio (float): Proportion of data for testing (if creating new splits)
         seed (int): Random seed for reproducibility
         pretraining_mode (bool): If True, only create train/val splits (no test) with optimized ratios
         
@@ -407,7 +714,39 @@ def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0
         test_ratio = 0.0
         print(f"Pretraining mode: using {train_ratio:.1%} train / {val_ratio:.1%} val split (no test)")
     
-    # 1. Try to load pre-computed splits first
+    # 0. Check if this is an OGB dataset and use official OGB splits
+    use_ogb_fug = os.environ.get('USE_FUG_EMB', '0') == '1'
+    if use_ogb_fug and hasattr(dataset, 'get_idx_split'):
+        try:
+            ogb_splits = dataset.get_idx_split()
+            split_idx = {
+                'train': ogb_splits['train'].numpy() if hasattr(ogb_splits['train'], 'numpy') else ogb_splits['train'],
+                'val': ogb_splits['valid'].numpy() if hasattr(ogb_splits['valid'], 'numpy') else ogb_splits['valid'],
+                'test': ogb_splits['test'].numpy() if hasattr(ogb_splits['test'], 'numpy') else ogb_splits['test']
+            }
+            
+            # Handle pretraining mode for OGB datasets
+            if pretraining_mode and 'test' in split_idx:
+                print(f"[OGB] Merging test set into training for pretraining")
+                train_tensor = torch.tensor(split_idx['train']) if isinstance(split_idx['train'], np.ndarray) else split_idx['train']
+                test_tensor = torch.tensor(split_idx['test']) if isinstance(split_idx['test'], np.ndarray) else split_idx['test']
+                val_tensor = torch.tensor(split_idx['val']) if isinstance(split_idx['val'], np.ndarray) else split_idx['val']
+                
+                combined_train = torch.cat([train_tensor, test_tensor])
+                split_idx = {
+                    'train': combined_train,
+                    'val': val_tensor
+                }
+            
+            print(f"[OGB] Using official OGB splits for {dataset_name} - "
+                  f"Train: {len(split_idx['train'])}, Val: {len(split_idx['val'])}" + 
+                  (f", Test: {len(split_idx['test'])}" if 'test' in split_idx else ""))
+            return split_idx
+        except Exception as e:
+            print(f"[OGB] Failed to get official OGB splits for {dataset_name}: {e}")
+            # Fall through to other splitting methods
+    
+    # 1. Try to load pre-computed splits
     split_idx = load_precomputed_splits(dataset_name, root)
     if split_idx is not None:
         # If pretraining mode and splits have test set, merge test into train
@@ -438,21 +777,64 @@ def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0
 def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
     """
     Prepare graph data for PFN-based graph classification.
-    This function organizes graphs by class and prepares context samples.
+    Uses pre-computed task-aware context when available, otherwise samples context.
     
     Args:
-        dataset: PyTorch Geometric dataset
+        dataset: PyTorch Geometric dataset (may have pre-computed embeddings)
         split_idx (dict): Dictionary with 'train', 'val', 'test' indices
-        context_k (int): Number of context graphs per class
+        context_k (int): Number of context graphs per class (ignored if pre-computed)
         device (str): Device to load data onto
-        context_only_mode (bool): If True, sample minimal context data for memory efficiency
         
     Returns:
         dict: Processed data containing context and target information
     """
+    # Check if dataset has pre-computed task-aware context
+    if hasattr(dataset, 'has_precomputed_embeddings') and dataset.has_precomputed_embeddings:
+        print(f"Using pre-computed task-aware context structure")
+        return _prepare_graph_data_precomputed(dataset, split_idx, device)
+    
+    # Fallback to normal context sampling
+    return _prepare_graph_data_sampled(dataset, split_idx, context_k, device)
+
+
+def _prepare_graph_data_precomputed(dataset, split_idx, device):
+    """Prepare data using pre-computed task-aware embeddings."""
+    sample_graph = dataset[0]
+    
+    # Handle label structure - MOLPCBA has [1, 128] format
+    y_shape = sample_graph.y.shape
+    if len(y_shape) == 2 and y_shape[0] == 1:
+        num_tasks = y_shape[1]  # [1, 128] -> 128 tasks
+    elif len(y_shape) == 1:
+        num_tasks = y_shape[0]  # [128] -> 128 tasks
+    else:
+        num_tasks = y_shape[-1] if len(y_shape) > 1 else 1
+    
+    print(f"Pre-computed context: {num_tasks} tasks using task-aware structure")
+    
+    # Use the pre-computed context structure directly
+    final_context_graphs = dataset.task_context_structure  # {task_idx: {class: [indices]}}
+    context_labels = {task_idx: {0: 0, 1: 1} for task_idx in range(num_tasks)}
+    is_multitask_dataset = num_tasks > 1
+    
+    return {
+        'context_graphs': final_context_graphs,  # task_idx -> {class: [graph_indices]}
+        'context_labels': context_labels,        # task_idx -> {class: class_label}
+        'split_idx': split_idx,
+        'dataset': dataset,
+        'num_classes': getattr(dataset, 'num_classes', 2),
+        'num_features': getattr(dataset, 'num_node_features', 256),
+        'is_multitask': is_multitask_dataset,
+        'num_tasks': num_tasks,
+        'name': getattr(dataset, 'name', 'unknown')
+    }
+
+
+def _prepare_graph_data_sampled(dataset, split_idx, context_k, device):
+    """Prepare data by sampling context (fallback for datasets without pre-computed embeddings)."""
     # Check if this is a multi-task dataset
     sample_graph = dataset[0]
-    is_multitask = hasattr(sample_graph, 'task_mask') and sample_graph.y.numel() > 1
+    is_multitask = sample_graph.y.numel() > 1
     
     if is_multitask:
         # Smart incremental context sampling for multi-task datasets
@@ -461,7 +843,6 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
         start_time = time.time()
         num_tasks = sample_graph.y.numel()
         print(f"Starting smart context sampling for {num_tasks} tasks...")
-        
         
         # Single-pass multi-task sampling (much faster for large datasets)
         sampling_start = time.time()
@@ -487,21 +868,46 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
         completed_tasks = set()
         total_combinations = num_tasks * 2  # tasks × classes
         
+        graphs_processed = 0
         for idx in train_indices:
+            # Convert tensor index to integer for dataset access
+            idx_int = idx.item() if torch.is_tensor(idx) else idx
+            graphs_processed += 1
+            
             # Early termination: stop when all reservoirs are full
             if len(completed_tasks) >= total_combinations:
-                print(f"  Early termination: all reservoirs full after {idx - train_indices[0] + 1} graphs")
+                print(f"  Early termination: all reservoirs full after {graphs_processed} graphs")
                 break
                 
-            graph = dataset[idx]
-            valid_tasks = torch.where(graph.task_mask > 0)[0]
+            graph = dataset[idx_int]
+            
+            # Handle OGB caching: create task_mask on-the-fly if missing
+            if not hasattr(graph, 'task_mask'):
+                if graph.y.dtype.is_floating_point:
+                    graph.task_mask = (~torch.isnan(graph.y)).float()
+                else:
+                    graph.task_mask = (graph.y != -1).float()
+            
+            # FIX: Get column indices (task indices), not row indices
+            valid_tasks = torch.where(graph.task_mask.squeeze() > 0)[0]
             
             # Process all valid tasks for this graph efficiently
             for task_idx in valid_tasks:
                 task_idx_int = task_idx.item()
-                class_label = graph.y[task_idx].item()
+                
+                # Handle different y tensor shapes for multi-task datasets
+                if graph.y.dim() == 2 and graph.y.size(0) == 1:
+                    # Shape [1, num_tasks] - need to access [0, task_idx]
+                    class_label = graph.y[0, task_idx_int].item()
+                elif graph.y.dim() == 1:
+                    # Shape [num_tasks] - can access [task_idx] directly
+                    class_label = graph.y[task_idx_int].item()
+                else:
+                    # Flatten and access by index
+                    class_label = graph.y.flatten()[task_idx_int].item()
                 
                 if class_label in [0, 1]:
+                    
                     reservoir = reservoirs[task_idx_int][class_label]
                     count = counts[task_idx_int][class_label]
                     
@@ -524,27 +930,15 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
                     
                     counts[task_idx_int][class_label] = count
         
-        # Report efficiency
-        total_processed = min(len(train_indices), idx - train_indices[0] + 1) if 'idx' in locals() else len(train_indices)
-        efficiency = (len(train_indices) - total_processed) / len(train_indices) * 100 if total_processed < len(train_indices) else 0
-        print(f"  Early termination saved {efficiency:.1f}% of processing ({len(train_indices) - total_processed} graphs skipped)")
+        sampling_time = time.time() - sampling_start
         
-        # Copy results and pad if needed
+        # Step 2.5: Transfer reservoirs to task_contexts
         for task_idx in range(num_tasks):
             for class_label in [0, 1]:
-                reservoir = reservoirs[task_idx][class_label]
-                
-                # Fast padding with replacement if needed
-                if len(reservoir) < context_k and len(reservoir) > 0:
-                    # Extend efficiently instead of appending one by one
-                    needed = context_k - len(reservoir)
-                    padding = np.random.choice(reservoir, needed, replace=True)
-                    reservoir.extend(padding.tolist())
-                
-                # Store indices only (no graph loading yet)
-                task_contexts[task_idx][class_label] = reservoir
-        
-        sampling_time = time.time() - sampling_start
+                if task_idx in reservoirs and class_label in reservoirs[task_idx]:
+                    task_contexts[task_idx][class_label] = list(reservoirs[task_idx][class_label])
+                else:
+                    task_contexts[task_idx][class_label] = []
         
         # Step 3: GPU memory deduplication (only at the end)
         dedup_start = time.time()
@@ -561,13 +955,18 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
         # Load each unique graph only once
         gpu_graph_cache = {}
         for idx in unique_indices:
-            gpu_graph_cache[idx] = dataset[idx]  # Load once
-        
-        # Replace indices with actual graph objects using cache
+            idx_int = idx.item() if torch.is_tensor(idx) else idx
+            gpu_graph_cache[idx] = dataset[idx_int]  # Load once
+
+        # Replace indices with actual graph objects using cache, but preserve indices for FUG
         for task_idx in task_contexts:
             for class_label in task_contexts[task_idx]:
                 indices = task_contexts[task_idx][class_label]
-                task_contexts[task_idx][class_label] = [gpu_graph_cache[idx] for idx in indices]
+                graphs = [gpu_graph_cache[idx] for idx in indices]
+                task_contexts[task_idx][class_label] = {
+                    'graphs': graphs,
+                    'indices': indices
+                }
         
         dedup_time = time.time() - dedup_start
         total_time = time.time() - start_time
@@ -596,7 +995,10 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
             count = 0
             
             for idx in split_idx['train']:
-                graph = dataset[idx]
+                idx_int = idx.item() if torch.is_tensor(idx) else idx
+                
+                graph = dataset[idx_int]
+            
                 if graph.y.numel() == 1:
                     label = graph.y.item()
                 else:
@@ -634,16 +1036,23 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
         
         # Apply deduplication (load unique graphs only once)
         gpu_graph_cache = {}
-        for idx in unique_indices:
-            gpu_graph_cache[idx] = dataset[idx]
         
-        # Replace indices with graph objects
+        for idx in unique_indices:
+            idx_int = idx.item() if torch.is_tensor(idx) else idx
+            gpu_graph_cache[idx] = dataset[idx_int]
+        
+        # Replace indices with graph objects, but preserve indices for FUG
         for class_label in task_contexts[0]:
             indices = task_contexts[0][class_label]
-            task_contexts[0][class_label] = [gpu_graph_cache[idx] for idx in indices]
+            graphs = [gpu_graph_cache[idx] for idx in indices]
+            # Store both graphs and indices for FUG external mapping
+            task_contexts[0][class_label] = {
+                'graphs': graphs,
+                'indices': indices
+            }
         
         total_time = time.time() - start_time
-        total_samples = sum(len(indices) for indices in task_contexts[0].values())
+        total_samples = sum(len(context_data['indices']) for context_data in task_contexts[0].values())
         print(f"Single-task context sampling completed in {total_time:.2f}s")
         print(f"  - Classes found: {list(available_classes)}")
         print(f"  - Unique graphs: {len(unique_indices)} out of {total_samples} samples")
@@ -653,17 +1062,20 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
         final_context_graphs = task_contexts  # {0: {class: [...]}}
         context_labels = {0: {class_label: class_label for class_label in available_classes}}
         is_multitask_dataset = False
-    
-    return {
+
+    ret = {
         'context_graphs': final_context_graphs,  # task_idx -> {class: [graphs]}
-        'context_labels': context_labels,        # task_idx -> {class: class_label}
+        'context_labels': context_labels,
         'split_idx': split_idx,
         'dataset': dataset,
         'num_classes': dataset.num_classes,
         'num_features': dataset.num_node_features,
         'is_multitask': is_multitask_dataset,
-        'num_tasks': num_tasks if is_multitask_dataset else 1
+        'num_tasks': num_tasks if is_multitask_dataset else 1,
+        'name': dataset.name
     }
+    
+    return ret
 
 
 def create_graph_batch(graphs, device='cuda'):
@@ -706,7 +1118,7 @@ def graph_pooling(node_embeddings, batch, pooling_method='mean'):
         raise ValueError(f"Unsupported pooling method: {pooling_method}")
 
 
-def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False, context_k=32):
+def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False, context_k=32, embedding_family='ST'):
     """
     Load multiple graph classification datasets with memory-efficient context sampling.
     
@@ -715,6 +1127,7 @@ def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False
         device (str): Device to load data onto
         pretraining_mode (bool): If True, optimize splits for pretraining (train/val only)
         context_k (int): Number of context graphs per class to sample
+        embedding_family (str): Text embedding family ('ST' for Sentence Transformer, 'e5' for E5 embeddings)
         
     Returns:
         tuple: (datasets, processed_data_list)
@@ -730,12 +1143,21 @@ def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False
         
         # Time dataset loading
         load_start = time.time()
-        dataset = load_dataset(name)  # Use the unified loading function
+        result = load_dataset(name, embedding_family=embedding_family)  # Use the unified loading function
         load_time = time.time() - load_start
         
-        if dataset is None:
+        # Handle both single dataset and (dataset, fug_mapping) returns
+        if result is None:
             print(f"Skipping {name} due to loading error")
             continue
+        elif isinstance(result, tuple) and len(result) == 2:
+            # FUG dataset with external mapping
+            dataset, fug_mapping = result
+            print(f"  FUG dataset loaded with external mapping")
+        else:
+            # Regular dataset
+            dataset = result
+            fug_mapping = None
         print(f"  Dataset loading: {load_time:.2f}s")
         
         # Time split creation
@@ -746,9 +1168,16 @@ def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False
         
         # Time context preparation
         prep_start = time.time()
+        
         processed_data = prepare_graph_data_for_pfn(
             dataset, split_idx, device=device, context_k=context_k, 
         )
+        
+        # Add FUG mapping to processed data if available
+        if fug_mapping is not None:
+            processed_data['fug_mapping'] = fug_mapping
+            print(f"  FUG mapping attached to processed data")
+        
         prep_time = time.time() - prep_start
         print(f"  Context preparation: {prep_time:.2f}s")
         
@@ -780,12 +1209,11 @@ def create_task_filtered_datasets(dataset, split_idx, filter_split=None):
     """
     # Check if multi-task dataset
     sample_graph = dataset[0] if len(dataset) > 0 else None
-    is_multitask = (sample_graph is not None and 
-                   hasattr(sample_graph, 'task_mask') and 
-                   sample_graph.y.numel() > 1)
+    is_multitask = (sample_graph is not None and sample_graph.y.numel() > 1)
     
     if not is_multitask:
         # Single task: return original splits wrapped in task 0
+        print(f"Single-task dataset detected!")
         return {0: split_idx}
     
     # Validate filter_split parameter
@@ -812,9 +1240,18 @@ def create_task_filtered_datasets(dataset, split_idx, filter_split=None):
                 valid_indices = []
                 
                 for idx in indices:
-                    graph = dataset[idx]
-                    if hasattr(graph, 'task_mask') and graph.task_mask[task_idx]:
-                        valid_indices.append(idx)
+                    idx_int = idx.item() if torch.is_tensor(idx) else idx
+                    graph = dataset[idx_int]
+                    
+                    # Create task_mask on-the-fly if missing (same as context sampling)
+                    if not hasattr(graph, 'task_mask'):
+                        if graph.y.dtype.is_floating_point:
+                            graph.task_mask = (~torch.isnan(graph.y)).float()
+                        else:
+                            graph.task_mask = (graph.y != -1).float()
+                    
+                    if graph.task_mask[0][task_idx]:
+                        valid_indices.append(idx_int)
                 
                 task_filtered_splits[task_idx][split_name] = valid_indices
             else:
@@ -840,63 +1277,192 @@ def create_task_filtered_datasets(dataset, split_idx, filter_split=None):
     return task_filtered_splits
 
 
-def create_data_loaders(dataset, split_idx, batch_size=128, shuffle=True, task_idx=None):
+class IndexTrackingDataLoader:
+    """
+    Custom DataLoader that preserves original dataset indices for FUG external mapping.
+    Zero-overhead approach that only adds metadata to batch objects.
+    """
+    def __init__(self, dataset, indices, batch_size=128, shuffle=True, num_workers=0, pin_memory=True):
+        self.dataset = dataset
+        self.indices = indices  # The subset indices we want to sample from
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        
+        # Create the underlying DataLoader with Subset
+        self.subset = Subset(dataset, indices)
+        self.loader = DataLoader(
+            self.subset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory
+        )
+    
+    def __iter__(self):
+        """
+        Iterator that yields batches with original dataset indices attached.
+        """
+        # We need to track which subset indices are in each batch
+        # PyTorch DataLoader samples from subset indices, so we need to map back
+        
+        # Get the sampler indices
+        if self.shuffle:
+            # Shuffled indices from the subset
+            perm = torch.randperm(len(self.indices))
+            sampled_indices = [self.indices[perm[i]] for i in range(len(self.indices))]
+        else:
+            # Sequential indices from the subset  
+            sampled_indices = list(self.indices)
+        
+        # Group into batches and yield with original indices
+        for i in range(0, len(sampled_indices), self.batch_size):
+            batch_subset_indices = sampled_indices[i:i + self.batch_size]
+            
+            # Get the actual graphs
+            graphs = [self.dataset[idx] for idx in batch_subset_indices]
+            
+            # Create batch
+            batch = Batch.from_data_list(graphs)
+            
+            # Add original dataset indices to batch (this is the key!)
+            batch.original_graph_indices = torch.tensor(batch_subset_indices, dtype=torch.long)
+            
+            yield batch
+    
+    def __len__(self):
+        return (len(self.indices) + self.batch_size - 1) // self.batch_size
+
+
+def create_data_loaders(dataset, split_idx, batch_size=128, shuffle=True, task_idx=None, use_index_tracking=False):
     """
     Create PyTorch data loaders for train/validation/test splits.
     
     Args:
-        dataset: PyTorch Geometric dataset
-        split_idx (dict): Dictionary with split indices (can be task-filtered)
-        batch_size (int): Batch size for data loaders
-        shuffle (bool): Whether to shuffle training data
-        task_idx (int, optional): Task index for logging purposes
-        
-    Returns:
-        dict: Dictionary with 'train', 'val', 'test' data loaders
+        dataset: The dataset to create loaders for
+        split_idx: Dictionary with split indices
+        batch_size: Batch size
+        shuffle: Whether to shuffle training data
+        task_idx: Task index (for compatibility)
+        use_index_tracking: Whether to use index tracking DataLoader (for FUG)
     """
     loaders = {}
     
-    for split_name, indices in split_idx.items():
-        if len(indices) == 0:
-            # Handle empty splits gracefully
-            print(f"Warning: Empty {split_name} split for task {task_idx}")
-            loaders[split_name] = DataLoader([], batch_size=batch_size)
-            continue
-            
-        subset = [dataset[i] for i in indices]
+    num_workers = 0
+
+    for split_name, indices in split_idx.items():        
+        # DEBUG: Check subset graphs before DataLoader creation
+        subset = Subset(dataset, indices)
+        
         shuffle_data = shuffle if split_name == 'train' else False
+        use_pin_memory = torch.cuda.is_available()
         
-        loader = DataLoader(
-            subset,
-            batch_size=batch_size,
-            shuffle=shuffle_data,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues
-            pin_memory=False  # Disabled because data is already on GPU
-        )
+        if use_index_tracking:
+            loader = IndexTrackingDataLoader(
+                dataset=dataset,
+                indices=indices,
+                batch_size=batch_size,
+                shuffle=shuffle_data,
+                num_workers=num_workers,
+                pin_memory=use_pin_memory
+            )
+        else:
+            # Use standard DataLoader
+            loader = DataLoader(
+                subset,
+                batch_size=batch_size,
+                shuffle=shuffle_data,
+                num_workers=num_workers,
+                pin_memory=use_pin_memory,
+            )
         loaders[split_name] = loader
-        
-    # Create status message with available splits
-    status_parts = []
-    for split_name in ['train', 'val', 'test']:
-        if split_name in loaders:
-            status_parts.append(f"{split_name.capitalize()}: {len(loaders[split_name])} batches")
-    
-    print(f"Created data loaders - {', '.join(status_parts)}")
     
     return loaders
 
+def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pca_device, incremental_pca_batch_size, pca_sample_threshold=float('inf')):
+    """
+    Unified PCA application with support for sampling large datasets on GPU.
+    """
+    pca_start = time.time()
+    n_samples = data_tensor.shape[0]
+    print(f"Applying PCA on {n_samples:,} samples with target dimension {target_dim}, threshold {pca_sample_threshold:,}")
+    
+    if pca_device == 'cpu':
+        # Use CPU Incremental PCA
+        from .data_utils import apply_incremental_pca_cpu
+        processed_features = apply_incremental_pca_cpu(
+            data_tensor, target_dim, incremental_pca_batch_size, sign_normalize, rank=0
+        )
+        # Move back to original device if needed
+        processed_features = processed_features.to(data_tensor.device)
+        
+    elif n_samples > pca_sample_threshold:
+        # Use GPU Sampled PCA - sample subset for PCA fitting, apply to all
+        print(f"  Large dataset ({n_samples:,} nodes) - using sampled PCA with {pca_sample_threshold:,} samples")
+        
+        # Sample representative subset
+        sample_indices = torch.randperm(n_samples, device=data_tensor.device)[:pca_sample_threshold]
+        data_sample = data_tensor[sample_indices]
+        
+        # Fit PCA on sample
+        if use_full_pca:
+            U, S, V = torch.svd(data_sample)
+            U = U[:, :target_dim]
+            S = S[:target_dim]
+        else:
+            U, S, V = torch.pca_lowrank(data_sample, q=target_dim)
+        
+        # Apply transformation to ALL data using fitted components
+        processed_features = data_tensor @ V[:, :target_dim]
+        
+        # Scale by singular values
+        processed_features = processed_features * S[:target_dim]
+        
+        # Sign normalization on the sample (for consistency)
+        if sign_normalize:
+            sample_transformed = data_sample @ V[:, :target_dim] * S[:target_dim]
+            for i in range(target_dim):
+                feature_vector = sample_transformed[:, i]
+                if feature_vector.abs().argmax() < len(feature_vector) // 2:  # Simple sign heuristic
+                    processed_features[:, i] = -processed_features[:, i]
+        
+    else:
+        # Use standard GPU PCA (original method)
+        if use_full_pca:
+            U, S, V = torch.svd(data_tensor)
+            U = U[:, :target_dim]
+            S = S[:target_dim]
+        else:
+            U, S, V = torch.pca_lowrank(data_tensor, q=target_dim)
+        
+        # Sign normalization
+        if sign_normalize:
+            for i in range(target_dim):
+                feature_vector = U[:, i] * S[i]
+                max_idx = torch.argmax(torch.abs(feature_vector))
+                if feature_vector[max_idx] < 0:
+                    U[:, i] = -U[:, i]
+        
+        processed_features = torch.mm(U, torch.diag(S))
+    
+    pca_time = time.time() - pca_start
+    method = 'cpu' if pca_device == 'cpu' else ('sampled-gpu' if n_samples > pca_sample_threshold else 'gpu')
+    print(f"  PCA computation ({method}): {pca_time:.2f}s")
+    return processed_features
 
 def process_graph_features(dataset, hidden_dim, device='cuda', 
                          use_identity_projection=False, projection_small_dim=128, projection_large_dim=256,
                          use_full_pca=False, sign_normalize=False, normalize_data=False,
-                         padding_strategy='zero', use_batchnorm=False, split=None, split_idx=None,
-                         processed_data=None, process_context_graphs=False):
+                         padding_strategy='zero', use_batchnorm=False,
+                         use_gpse=False, gpse_path='/home/maweishuo/GPSE/datasets', dataset_name=None,
+                         pca_device='gpu', incremental_pca_batch_size=10000, pca_sample_threshold=float('inf'),
+                         processed_data=None, pcba_context_only_pca=False):
     """
-    Process graph features to match the required hidden dimension using PCA and padding.
-    Custom implementation for graph classification.
+    Process graph features using PCA directly on embedding table for maximum memory efficiency.
     
     Args:
-        dataset: PyTorch Geometric dataset
+        dataset: PyTorch Geometric dataset with node_embs embedding table
         hidden_dim (int): Target hidden dimension
         device (str): Device for computations
         use_identity_projection (bool): Whether to use identity projection
@@ -907,148 +1473,183 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         normalize_data (bool): Apply normalization to final features
         padding_strategy (str): Strategy for padding ('zero', 'random', 'repeat')
         use_batchnorm (bool): Use BatchNorm-style normalization
-        split (str, optional): Specific split to process ('train', 'val', 'test'). If None, processes all graphs.
-        split_idx (dict, optional): Dictionary with split indices. Required if split is specified.
-        processed_data (dict, optional): Processed data containing context graphs to also process.
-        process_context_graphs (bool): Whether to also process context graphs in processed_data.
+        use_gpse (bool): Whether to use pre-computed GPSE embeddings
+        gpse_path (str): Path to GPSE datasets directory
+        dataset_name (str): Name of dataset for GPSE lookup
+        pca_sample_threshold (int): Sample this many nodes for PCA if dataset is too large
+        processed_data (dict): Processed data with potential FUG mapping
+        pcba_context_only_pca (bool): Use only context + test graphs for PCA fitting
         
     Returns:
         dict: Processing information and flags
     """
     import time
     
-    # Validate split parameters
-    if split is not None and split_idx is None:
-        raise ValueError("split_idx is required when split is specified")
-    if split is not None and split not in ['train', 'val', 'test']:
-        raise ValueError(f"Invalid split '{split}'. Must be one of: 'train', 'val', 'test'")
-    if split is not None and split_idx is not None and split not in split_idx:
-        raise ValueError(f"Split '{split}' not found in split_idx. Available splits: {list(split_idx.keys())}")
+    # Auto-configure PCA sample threshold for FUG with PCBA datasets
+    use_fug = os.environ.get('USE_FUG_EMB', '0') == '1'
+    is_pcba_dataset = (dataset_name and 
+                       ('pcba' in dataset_name.lower() or 'chempcba' in dataset_name.lower()))
     
-    # Determine which graphs to process
-    if split is not None:
-        # Get indices for the specified split
-        target_indices = split_idx[split]
-        if hasattr(target_indices, 'tolist'):  # Convert tensor to list if needed
-            target_indices = target_indices.tolist()
-        target_indices_set = set(target_indices)
-        print(f"Processing only {split} split: {len(target_indices)} graphs")
-    else:
-        target_indices_set = None
-        print("Processing all graphs in dataset")
+    # Set sampled PCA threshold to 1M nodes for FUG+PCBA combination
+    if (use_fug and is_pcba_dataset and 
+        pca_sample_threshold == float('inf')):  # Only override if not explicitly set
+        pca_sample_threshold = 1000000
+        print(f"Auto-configured sampled PCA for FUG+PCBA: using {pca_sample_threshold:,} nodes for PCA fitting")
+    
+    # GPSE Integration: Replace dataset embeddings with GPSE embeddings if requested
+    if use_gpse and dataset_name is not None:
+        print(f"GPSE embeddings requested for dataset: {dataset_name}")
+        success = update_dataset_with_gpse_embeddings(dataset, dataset_name, gpse_path)
+        if success:
+            print("Successfully loaded GPSE embeddings - proceeding with GPSE-based processing")
+        else:
+            print("Failed to load GPSE embeddings - falling back to original embeddings")
+    elif use_gpse:
+        print("Warning: GPSE requested but dataset_name not provided - using original embeddings")
     
     # Check if dataset has node features
     sample = dataset[0] if len(dataset) > 0 else None
     if sample is None:
         raise ValueError("Empty dataset")
     
-    # Determine original dimension
-    if hasattr(sample, 'x') and sample.x is not None:
-        original_dim = sample.x.shape[1]
+    # Check for FUG mapping first (external embeddings)
+    fug_mapping = None
+    node_embs = None
+    if processed_data is not None and 'fug_mapping' in processed_data:
+        fug_mapping = processed_data['fug_mapping']
+        node_embs = fug_mapping['node_embs']
+        original_dim = node_embs.shape[1]
+        print(f"Using FUG external embeddings: {node_embs.shape}")
+    # Fall back to dataset.node_embs for unified setting
+    elif hasattr(dataset, 'node_embs') and dataset.node_embs is not None:
+        node_embs = dataset.node_embs
+        original_dim = node_embs.shape[1]
+        print(f"Using dataset node_embs: {node_embs.shape}")
     else:
-        raise ValueError("Dataset has no node features")
+        raise ValueError("Expected dataset.node_embs under unified setting or FUG mapping in processed_data")
     
     print(f"Processing graph features: {original_dim}D -> {hidden_dim}D")
     st = time.time()
     
-    # Collect all node features from graphs for PCA
-    collection_start = time.time()
-    all_node_features = []
-    node_counts = []
-    processed_graph_indices = []  # Track which graphs were processed
+    # Verify we have node embeddings available
+    if node_embs is None:
+        raise ValueError("No node embeddings available - check FUG mapping or dataset.node_embs")
     
-    for idx, graph in enumerate(dataset):
-        # Only process graphs from the specified split (or all graphs if no split specified)
-        if target_indices_set is None or idx in target_indices_set:
-            all_node_features.append(graph.x.to(device))
-            node_counts.append(graph.x.size(0))
-            processed_graph_indices.append(idx)
+    # Helper function to get node embeddings for a graph
+    def get_graph_node_embeddings(graph_idx):
+        """Get node embeddings for a specific graph, handling both FUG and regular datasets."""
+        if fug_mapping is not None:
+            # FUG dataset: use external node index mapping
+            node_indices = fug_mapping['node_index_mapping'][graph_idx]
+            return node_embs[node_indices]
+        else:
+            # Regular dataset: use graph.x as indices into dataset.node_embs
+            graph = dataset[graph_idx]
+            return node_embs[graph.x]
     
-    # Stack all features
-    stacked_features = torch.cat(all_node_features, dim=0)
-    collection_time = time.time() - collection_start
-    print(f"  Feature collection: {collection_time:.2f}s")
+    # Standard unified processing: apply PCA to node embeddings
+    print("Unified setting: applying PCA to node_embs")
+    
+    # Apply PCA/projection to node embeddings
+    # PCBA-specific: optionally use only context + test graphs for PCA
+    if (dataset_name and dataset_name.lower() == 'pcba' and 
+        pcba_context_only_pca and processed_data is not None):
+        print("PCBA mode: Using context + test graphs for PCA fitting")
+        
+        # Collect context graph node embeddings using preserved indices (MUCH faster!)
+        context_node_embs = []
+        context_graphs = processed_data['context_graphs']
+        for task_idx in context_graphs:
+            for class_label in context_graphs[task_idx]:
+                context_data = context_graphs[task_idx][class_label]
+                
+                # Use preserved indices instead of expensive linear search
+                if isinstance(context_data, dict) and 'indices' in context_data:
+                    # New format with preserved indices
+                    indices = context_data['indices']
+                    for graph_idx in indices:
+                        context_node_embs.append(get_graph_node_embeddings(graph_idx))
+                else:
+                    # Fallback: old format - this will be slow but shouldn't happen
+                    print("[WARNING] Using slow fallback for context graph indexing!")
+                    for graph in context_data:
+                        # Find the graph index in the dataset (slow!)
+                        graph_idx = None
+                        for i, dataset_graph in enumerate(dataset):
+                            if dataset_graph is graph:  # Identity check
+                                graph_idx = i
+                                break
+                        if graph_idx is not None:
+                            context_node_embs.append(get_graph_node_embeddings(graph_idx))
+        
+        # Collect test graph node embeddings
+        test_node_embs = []
+        test_split = processed_data['split_idx']['test']
+        for test_idx in test_split:
+            test_idx_int = test_idx.item() if torch.is_tensor(test_idx) else test_idx
+            test_node_embs.append(get_graph_node_embeddings(test_idx_int))
+        
+        # Concatenate all embeddings for PCA
+        stacked_features = torch.cat(context_node_embs + test_node_embs, dim=0)
+        print(f"PCBA PCA fitted on {stacked_features.size(0)} nodes from context + test graphs")
+    else:
+        # Standard: use all embeddings
+        stacked_features = node_embs
     
     if use_identity_projection:
         # Identity projection pathway: PCA to small_dim, then project to large_dim
         print(f"Using identity projection: {original_dim}D -> PCA to {projection_small_dim}D -> Project to {projection_large_dim}D")
+
+        # Determine maximum PCA dimensions available (limited by min(n_samples, n_features))
+        max_pca_dim = min(original_dim, stacked_features.size(0))
         
-        if original_dim >= projection_small_dim:
+        if max_pca_dim >= projection_small_dim:
             # Apply PCA to small dimension
-            pca_start = time.time()
-            if use_full_pca:
-                U, S, V = torch.svd(stacked_features)
-                U = U[:, :projection_small_dim]
-                S = S[:projection_small_dim]
-            else:
-                U, S, V = torch.pca_lowrank(stacked_features, q=projection_small_dim)
-            pca_time = time.time() - pca_start
-            print(f"  PCA computation: {pca_time:.2f}s")
-            
-            # Sign normalization
-            if sign_normalize:
-                for i in range(projection_small_dim):
-                    feature_vector = U[:, i] * S[i]
-                    max_idx = torch.argmax(torch.abs(feature_vector))
-                    if feature_vector[max_idx] < 0:
-                        U[:, i] = -U[:, i]
-            
-            processed_features = torch.mm(U, torch.diag(S))
+            processed_features = _apply_pca_unified(
+                stacked_features, projection_small_dim, use_full_pca, sign_normalize,
+                pca_device, incremental_pca_batch_size, pca_sample_threshold
+            )
         else:
-            # For small datasets, use all dimensions + padding if needed
-            processed_features = stacked_features
-            if processed_features.size(1) < projection_small_dim:
-                pad_size = projection_small_dim - processed_features.size(1)
-                padding = torch.zeros(processed_features.size(0), pad_size, device=device)
-                processed_features = torch.cat([processed_features, padding], dim=1)
+            # Not enough samples for full PCA to projection_small_dim, apply PCA to all available dimensions then pad
+            pca_dim = max_pca_dim
+            
+            pca_features = _apply_pca_unified(
+                stacked_features, pca_dim, use_full_pca, sign_normalize,
+                pca_device, incremental_pca_batch_size, pca_sample_threshold
+            )
+            
+            # Apply padding to reach projection_small_dim
+            if pca_features.size(1) < projection_small_dim:
+                padding_size = projection_small_dim - pca_features.size(1)
+                padding = torch.zeros(pca_features.size(0), padding_size, device=device)
+                processed_features = torch.cat([pca_features, padding], dim=1)
+                print(f"Applied zero padding ({pca_features.size(1)} -> {projection_small_dim})")
+            else:
+                processed_features = pca_features[:, :projection_small_dim]
         
         target_dim = projection_large_dim
         needs_identity_projection = True
         
     else:
         # Standard PCA pathway
+
+        original_dim = min(original_dim, stacked_features.size(0))
+
         if original_dim >= hidden_dim:
             # Apply PCA to target dimension
-            pca_start = time.time()
-            if use_full_pca:
-                U, S, V = torch.svd(stacked_features)
-                U = U[:, :hidden_dim]
-                S = S[:hidden_dim]
-            else:
-                U, S, V = torch.pca_lowrank(stacked_features, q=hidden_dim)
-            pca_time = time.time() - pca_start
-            print(f"  PCA computation: {pca_time:.2f}s")
-            
-            # Sign normalization
-            if sign_normalize:
-                for i in range(hidden_dim):
-                    feature_vector = U[:, i] * S[i]
-                    max_idx = torch.argmax(torch.abs(feature_vector))
-                    if feature_vector[max_idx] < 0:
-                        U[:, i] = -U[:, i]
-            
-            processed_features = torch.mm(U, torch.diag(S))
+            processed_features = _apply_pca_unified(
+                stacked_features, hidden_dim, use_full_pca, sign_normalize,
+                pca_device, incremental_pca_batch_size, pca_sample_threshold
+            )
             
         else:
             # Not enough features, apply PCA to all available dimensions then pad
             pca_dim = min(original_dim, stacked_features.size(1))
             
-            if use_full_pca:
-                U, S, V = torch.svd(stacked_features)
-                U = U[:, :pca_dim]
-                S = S[:pca_dim]
-            else:
-                U, S, V = torch.pca_lowrank(stacked_features, q=pca_dim)
-            
-            # Sign normalization
-            if sign_normalize:
-                for i in range(pca_dim):
-                    feature_vector = U[:, i] * S[i]
-                    max_idx = torch.argmax(torch.abs(feature_vector))
-                    if feature_vector[max_idx] < 0:
-                        U[:, i] = -U[:, i]
-            
-            pca_features = torch.mm(U, torch.diag(S))
+            pca_features = _apply_pca_unified(
+                stacked_features, pca_dim, use_full_pca, sign_normalize,
+                pca_device, incremental_pca_batch_size, pca_sample_threshold
+            )
             
             # Apply padding to reach target dimension
             if pca_features.size(1) < hidden_dim:
@@ -1096,12 +1697,15 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             processed_features = F.normalize(processed_features, p=2, dim=1)
             print("Applied LayerNorm-style normalization")
     
-    # Split the processed features back to individual graphs (only for processed graphs)
-    current_idx = 0
-    for i, graph_idx in enumerate(processed_graph_indices):
-        num_nodes = node_counts[i]
-        dataset[graph_idx].x = processed_features[current_idx:current_idx + num_nodes]
-        current_idx += num_nodes
+    # Update the embedding table with PCA-transformed embeddings
+    if fug_mapping is not None:
+        # FUG dataset: update the external mapping
+        fug_mapping['node_embs'] = processed_features
+        print(f"  Updated FUG mapping embeddings: {processed_features.shape} - all graphs now use reduced embeddings!")
+    else:
+        # Regular dataset: update dataset.node_embs
+        dataset.node_embs = processed_features
+        print(f"  Updated embedding table: {processed_features.shape} - all graphs now use reduced embeddings!")
     
     processing_info = {
         'original_dim': original_dim,
@@ -1111,37 +1715,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         'projection_target_dim': projection_large_dim if needs_identity_projection else None
     }
     
-    if split is not None:
-        print(f"Graph feature processing completed in {time.time()-st:.2f}s: {original_dim}D -> {processed_features.size(1)}D (processed {len(processed_graph_indices)} graphs from {split} split)")
-    else:
-        print(f"Graph feature processing completed in {time.time()-st:.2f}s: {original_dim}D -> {processed_features.size(1)}D (processed all {len(processed_graph_indices)} graphs)")
-    
-    # Process context graphs if requested
-    if process_context_graphs and processed_data is not None and 'context_graphs' in processed_data:
-        print("Processing context graphs with the same transformation...")
-        context_start = time.time()
-        
-        context_graphs = processed_data['context_graphs']
-        total_context_graphs = 0
-        
-        # Create a temporary dataset containing all context graphs
-        all_context_graphs = []
-        for task_idx, task_context in context_graphs.items():
-            for class_label, graphs in task_context.items():
-                all_context_graphs.extend(graphs)
-                total_context_graphs += len(graphs)
-        
-        # Apply the same processing to context graphs (recursively call without context processing)
-        if all_context_graphs:
-            process_graph_features(
-                all_context_graphs, hidden_dim, device,
-                use_identity_projection, projection_small_dim, projection_large_dim,
-                use_full_pca, sign_normalize, normalize_data,
-                padding_strategy, use_batchnorm
-            )
-        
-        context_time = time.time() - context_start
-        print(f"Context graph processing completed in {context_time:.2f}s: processed {total_context_graphs} context graphs")
+    print(f"Graph feature processing completed in {time.time()-st:.2f}s: {original_dim}D -> {processed_features.size(1)}D (optimized: processed embedding table directly!)")
     
     return processing_info
 
@@ -1151,7 +1725,7 @@ def select_graph_context(processed_data, context_k=32):
     
     Args:
         processed_data (dict): Processed data from prepare_graph_data_for_pfn
-        context_k (int): Number of context graphs per class
+        context_k (int): Number of context graphs per class to select
         
     Returns:
         dict: Context data with selected graphs and labels

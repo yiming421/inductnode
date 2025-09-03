@@ -130,7 +130,8 @@ def run_ddp(rank, world_size, args, results_dict=None):
             process_data(data, split_idx, args.hidden, args.context_num, args.sign_normalize, args.use_full_pca, 
                          args.normalize_data, args.use_projector, args.min_pca_dim, rank, 
                          args.padding_strategy, args.use_batchnorm, args.use_identity_projection,
-                         args.projection_small_dim, args.projection_large_dim)
+                         args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                         args.incremental_pca_batch_size)
 
         if args.skip_datasets:
             data_list = [data for i, data in enumerate(data_list) if i not in skip_idx]

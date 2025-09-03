@@ -18,9 +18,8 @@ sys.path.insert(0, project_root)
 
 from src.config import parse_graph_classification_args
 from src.data_graph import load_all_graph_datasets, process_graph_features
-from src.model import PureGCN_v1, PureGCN, GCN, PFNPredictorNodeCls
+from src.model import PureGCN_v1, PureGCN, GCN, PFNPredictorNodeCls, IdentityProjection
 from src.engine_graph import train_and_evaluate_graph_classification
-
 
 def create_model_and_predictor(args, device):
     """
@@ -34,16 +33,17 @@ def create_model_and_predictor(args, device):
         tuple: (model, predictor)
     """
     # Create GNN model
+    hidden = args.projection_large_dim if args.use_identity_projection else args.hidden
     if args.model == 'PureGCN':
         model = PureGCN(args.num_layers)
     elif args.model == 'PureGCN_v1':
         model = PureGCN_v1(
-            args.hidden, args.num_layers, args.hidden, args.dp, args.norm, 
+            hidden, args.num_layers, hidden, args.dp, args.norm, 
             args.res, args.relu, args.gnn_norm_affine
         )
     elif args.model == 'GCN':
         model = GCN(
-            args.hidden, args.hidden, args.norm, args.relu, args.num_layers, 
+            hidden, hidden, args.norm, args.relu, args.num_layers, 
             args.dp, args.multilayer, args.use_gin, args.res, args.gnn_norm_affine
         )
     else:
@@ -52,21 +52,27 @@ def create_model_and_predictor(args, device):
     # Create PFN predictor
     if args.predictor == 'PFN':
         predictor = PFNPredictorNodeCls(
-            args.hidden, args.nhead, args.transformer_layers, args.mlp_layers, 
+            hidden, args.nhead, args.transformer_layers, args.mlp_layers, 
             args.dp, args.norm, args.seperate, args.degree, None, None, 
             args.sim, args.padding, args.mlp_norm_affine, args.normalize_class_h
         )
     else:
         raise ValueError(f"Unsupported predictor: {args.predictor}")
     
+    # Create identity projection if needed
+    identity_projection = None
+    if args.use_identity_projection:
+        identity_projection = IdentityProjection(args.projection_small_dim, args.projection_large_dim)
+        identity_projection = identity_projection.to(device)
+    
     # Move models to device
     model = model.to(device)
     predictor = predictor.to(device)
     
-    return model, predictor
+    return model, predictor, identity_projection
 
 
-def setup_optimizer_and_scheduler(model, predictor, args):
+def setup_optimizer_and_scheduler(model, predictor, args, identity_projection=None):
     """
     Setup optimizer and learning rate scheduler.
     
@@ -80,6 +86,8 @@ def setup_optimizer_and_scheduler(model, predictor, args):
     """
     # Collect all parameters
     parameters = list(model.parameters()) + list(predictor.parameters())
+    if identity_projection is not None:
+        parameters += list(identity_projection.parameters())
     
     # Create optimizer
     if args.optimizer == 'adam':
@@ -123,22 +131,30 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
     final_num_features = args.hidden
     
     for dataset, dataset_info in zip(datasets, processed_data_list):
+        # Extract dataset name for GPSE lookup
+        dataset_name = dataset_info.get('name', None)
+        
         # Process features using PCA and padding
+        pcba_context_only_pca = getattr(args, 'pcba_context_only_pca', False)
         if test_datasets:
             processing_info = process_graph_features(
                 dataset, args.hidden, device, 
                 args.use_identity_projection, args.projection_small_dim, args.projection_large_dim,
                 args.use_full_pca, args.sign_normalize, args.normalize_data,
                 args.padding_strategy, args.use_batchnorm,
-                "test", dataset_info.get('split_idx', None),
-                dataset_info, True  # process_context_graphs=True for test datasets
+                args.use_gpse, args.gpse_path, dataset_name,
+                args.pca_device, args.incremental_pca_batch_size, args.pca_sample_threshold,
+                dataset_info, pcba_context_only_pca
             )
         else:
             processing_info = process_graph_features(
                 dataset, args.hidden, device, 
                 args.use_identity_projection, args.projection_small_dim, args.projection_large_dim,
                 args.use_full_pca, args.sign_normalize, args.normalize_data,
-                args.padding_strategy, args.use_batchnorm
+                args.padding_strategy, args.use_batchnorm,
+                args.use_gpse, args.gpse_path, dataset_name,
+                args.pca_device, args.incremental_pca_batch_size, args.pca_sample_threshold,
+                dataset_info, pcba_context_only_pca
             )
         
         processed_datasets.append(dataset)
@@ -165,6 +181,27 @@ def run_single_experiment(args, device='cuda:0'):
     print(f"Test datasets: {args.test_dataset}")
     print(f"Graph pooling method: {args.graph_pooling}")
     
+    # If user wants to source datasets from copied TAGDataset (e.g., molecular datasets preprocessed by TAGLAS),
+    # ensure the path is visible (already copied to inductnode/TAGDataset)
+    if args.use_tag_dataset:
+        tag_path = os.path.join(project_root, 'TAGDataset')
+        if os.path.isdir(tag_path):
+            print(f"Using TAGDataset at {tag_path} for dataset roots (TSGFM format)")
+            # Prepend to sys.path so that any relative imports inside loaders can find resources if needed
+            if tag_path not in sys.path:
+                sys.path.insert(0, tag_path)
+            # Override default dataset root environment variable consumed by data loaders if they check it
+            os.environ['TAG_DATASET_ROOT'] = tag_path
+        else:
+            print(f"Warning: --use_tag_dataset specified but {tag_path} not found.")
+    
+    # Configure OGB FUG embeddings if requested
+    if args.use_ogb_fug:
+        print(f"Enabling OGB FUG embeddings - FUG root: {args.fug_root}, OGB root: {args.ogb_root}")
+        os.environ['USE_FUG_EMB'] = '1'
+        os.environ['FUG_EMB_ROOT'] = args.fug_root
+        os.environ['OGB_ROOT'] = args.ogb_root
+    
     # Load training datasets
     train_dataset_names = args.train_dataset.split(',')
     # Use pretraining mode if we have separate test datasets (maximize training data utilization)
@@ -172,7 +209,7 @@ def run_single_experiment(args, device='cuda:0'):
     if pretraining_mode:
         print("Pretraining mode enabled: optimizing train/val splits for maximum data utilization")
     train_datasets, train_processed_data_list = load_all_graph_datasets(
-        train_dataset_names, device, pretraining_mode, args.context_k
+        train_dataset_names, device, pretraining_mode, args.context_k, embedding_family=args.embedding_family
     )
     
     if len(train_datasets) == 0:
@@ -182,16 +219,16 @@ def run_single_experiment(args, device='cuda:0'):
     train_datasets, train_processed_data_list, num_features = process_datasets_for_models(
         train_datasets, train_processed_data_list, args, device
     )
-    
+
     # Load and process test datasets if specified
     test_datasets = None
     test_processed_data_list = None
-    if args.test_dataset and args.test_dataset != args.train_dataset:
+    if args.test_dataset:
         print(f"Loading test datasets: {args.test_dataset}")
         test_dataset_names = args.test_dataset.split(',')
         # Use context sampling for memory efficiency (sample minimal context from train split)
         test_datasets, test_processed_data_list = load_all_graph_datasets(
-            test_dataset_names, device, context_k=args.context_k,
+            test_dataset_names, device, context_k=args.context_k, embedding_family=args.embedding_family
         )
         
         if len(test_datasets) > 0:
@@ -202,27 +239,28 @@ def run_single_experiment(args, device='cuda:0'):
             print(f"Loaded {len(test_datasets)} test datasets")
     
     # Create model and predictor
-    model, predictor = create_model_and_predictor(args, device)
-    
+    model, predictor, identity_projection = create_model_and_predictor(args, device)
+
     # Print model information
     total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in predictor.parameters())
+    if identity_projection is not None:
+        total_params += sum(p.numel() for p in identity_projection.parameters())
     print(f"Total parameters: {total_params:,}")
     
     # Setup optimizer and scheduler
-    optimizer, scheduler = setup_optimizer_and_scheduler(model, predictor, args)
+    optimizer, scheduler = setup_optimizer_and_scheduler(model, predictor, args, identity_projection)
     
     # Train and evaluate
     start_time = time.time()
     results = train_and_evaluate_graph_classification(
         model, predictor, train_datasets, train_processed_data_list, args,
-        optimizer, scheduler, device, test_datasets, test_processed_data_list
+        optimizer, scheduler, device, test_datasets, test_processed_data_list, identity_projection
     )
     total_time = time.time() - start_time
     
     print(f"\nTraining completed in {total_time:.2f} seconds")
     
     return results
-
 
 def main():
     """Main function for graph classification."""
@@ -242,15 +280,15 @@ def main():
     
     # Initialize wandb
     if args.sweep:
-        wandb.init(project='inductnode-graph')
+        run = wandb.init(project='inductnode-graph')
         # Update args with sweep configuration if needed
         config = wandb.config
         for key in config.keys():
             if hasattr(args, key):
                 setattr(args, key, config[key])
     else:
-        wandb.init(project='inductnode-graph', config=args)
-    
+        run = wandb.init(project='inductnode-graph', config=args)
+
     # Run multiple experiments
     all_results = []
     for run in range(args.runs):
@@ -317,9 +355,6 @@ def main():
                         split_label = split_name.capitalize()
                         print(f"  {split_label}: {np.mean(split_accs):.4f} ± {np.std(split_accs):.4f}")
         
-        # Log final metrics to wandb
-        wandb.log(final_metrics)
-        
         # Calculate overall average test accuracy for sweep optimization
         all_test_accs = []
         for result in all_results:
@@ -330,9 +365,12 @@ def main():
         
         if all_test_accs:
             avg_test_acc = np.mean(all_test_accs)
-            wandb.log({'avg_test_accuracy': avg_test_acc})
-            print(f"\nOverall average test accuracy: {avg_test_acc:.4f}")
-    
+            final_metrics['avg_test_metric'] = avg_test_acc
+            print(f"\nOverall average test metric: {avg_test_acc:.4f}")
+        
+        # Log final metrics to wandb (don't specify step to avoid interfering with training steps)
+        wandb.log(final_metrics)
+
     else:
         print("No successful runs completed.")
     

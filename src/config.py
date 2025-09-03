@@ -248,7 +248,7 @@ def parse_joint_training_args():
     parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=6, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
-    parser.add_argument('--transformer_layers', type=int, default=1, help='Number of transformer layers')
+    parser.add_argument('--transformer_layers', type=int, default=2, help='Number of transformer layers')
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
     parser.add_argument('--dp', type=float, default=0.4, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
@@ -261,17 +261,20 @@ def parse_joint_training_args():
     
     # === Training Configuration ===
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw'])
-    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.0000115, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.005, help='Weight decay')
     parser.add_argument('--schedule', type=str, default='warmup', choices=['cosine', 'step', 'warmup', 'none'])
-    parser.add_argument('--nc_batch_size', type=int, default=4096, help='Node classification batch size')
+    parser.add_argument('--nc_batch_size', type=int, default=16384, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=2048, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
+    parser.add_argument('--enable_nc', type=str2bool, default=False, help='Enable node classification task')
+    parser.add_argument('--enable_lp', type=str2bool, default=False, help='Enable link prediction task')
+    parser.add_argument('--enable_gc', type=str2bool, default=True, help='Enable graph classification task')
     parser.add_argument('--lambda_nc', type=float, default=1.0, help='Weight for node classification loss')
-    parser.add_argument('--lambda_lp', type=float, default=1.0, help='Weight for link prediction loss')
+    parser.add_argument('--lambda_lp', type=float, default=1.32238, help='Weight for link prediction loss')
     
     # === Dataset Configuration ===
     parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
@@ -280,7 +283,7 @@ def parse_joint_training_args():
                        help='Node classification test datasets')
     parser.add_argument('--lp_train_dataset', type=str, default='CS,Physics,Computers,Photo,Flickr,Wiki,BlogCatalog,FacebookPage', 
                        help='Link prediction training datasets')
-    parser.add_argument('--lp_test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab', 
+    parser.add_argument('--lp_test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab,ogbl-citation2', 
                        help='Link prediction test datasets')
     
     # === Model Components ===
@@ -296,6 +299,8 @@ def parse_joint_training_args():
     
     # === Data Processing ===
     parser.add_argument('--use_full_pca', type=str2bool, default=False, help='Use full PCA decomposition')
+    parser.add_argument('--pca_device', type=str, default='gpu', choices=['cpu', 'gpu'], help='Device to perform PCA computation (cpu=Incremental PCA, gpu=torch.pca_lowrank)')
+    parser.add_argument('--incremental_pca_batch_size', type=int, default=10000, help='Batch size for CPU Incremental PCA')
     parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize input data')
     parser.add_argument('--padding_strategy', type=str, default='random', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
     parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
@@ -309,6 +314,25 @@ def parse_joint_training_args():
     parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
     
+    # === Graph Classification Specific ===
+    parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')
+    parser.add_argument('--gc_test_dataset', type=str, default='hiv,pcba', help='Graph classification test datasets')
+    parser.add_argument('--gc_batch_size', type=int, default=4096, help='Graph classification batch size')
+    parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
+    parser.add_argument('--graph_pooling', type=str, default='mean', choices=['mean', 'max', 'sum'], help='Graph pooling method')
+    parser.add_argument('--lambda_gc', type=float, default=1.0, help='Weight for graph classification loss')
+    
+    # === OGB FUG embeddings arguments (for graph classification) ===
+    parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
+                        help='Use OGB datasets with FUG embeddings (replaces node features with FUG molecular embeddings)')
+    parser.add_argument('--fug_root', type=str, default='./fug',
+                        help='Root directory for FUG embeddings')
+    parser.add_argument('--ogb_root', type=str, default='./dataset/ogb',
+                        help='Root directory for OGB datasets')
+    
+    # === Joint Multi-Task Training (TSGFM-style) ===
+# Removed joint multitask arguments - only using task-specific and full batch training
+    
     # === Checkpointing ===
     parser.add_argument('--save_checkpoint', type=str2bool, default=False, help='Save model checkpoints')
     parser.add_argument('--checkpoint_dir', type=str, default='../checkpoints', help='Checkpoint directory')
@@ -321,7 +345,6 @@ def parse_joint_training_args():
                        choices=['QUIET', 'INFO', 'DEBUG', 'VERBOSE'])
     parser.add_argument('--log_interval', type=int, default=1, help='Logging interval (epochs)')
     parser.add_argument('--eval_interval', type=int, default=1, help='Evaluation interval (epochs)')
-    
     # === Experiment Tracking ===
     parser.add_argument('--sweep', type=str2bool, default=False, help='Running hyperparameter sweep')
     
@@ -339,10 +362,10 @@ def parse_graph_classification_args():
                         help='Path to a trained model checkpoint to load')
 
     # Model architecture (used if not loading a pretrained model)
-    parser.add_argument('--model', type=str, default='PureGCN_v1', help='GNN model type (e.g., PureGCN_v1, GCN)')
-    parser.add_argument("--hidden", default=256, type=int, help='Hidden dimension size')
+    parser.add_argument('--model', type=str, default='GCN', help='GNN model type (e.g., PureGCN_v1, GCN)')
+    parser.add_argument("--hidden", default=512, type=int, help='Hidden dimension size')
     parser.add_argument("--num_layers", default=4, type=int, help='Number of GNN layers')
-    parser.add_argument("--dp", default=0.2, type=float, help='Dropout rate')
+    parser.add_argument("--dp", default=0.058, type=float, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization in GNN')
     parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections in GNN')
     parser.add_argument('--relu', type=str2bool, default=False, help='Use ReLU activation in GNN')
@@ -355,7 +378,7 @@ def parse_graph_classification_args():
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of layers in MLP pool')
     parser.add_argument('--mlp_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in MLP norm')
     parser.add_argument('--nhead', type=int, default=4, help='Number of heads for attention pooling and PFN predictor')
-    parser.add_argument('--transformer_layers', type=int, default=2, help='Number of transformer layers in PFN predictor')
+    parser.add_argument('--transformer_layers', type=int, default=1, help='Number of transformer layers in PFN predictor')
     parser.add_argument('--seperate', type=str2bool, default=True, help='For PFN predictor')
     parser.add_argument('--degree', type=str2bool, default=False, help='For PFN predictor (not typically used for graphs)')
     parser.add_argument('--padding', type=str, default='zero', 
@@ -363,8 +386,8 @@ def parse_graph_classification_args():
                         help='Padding method for PFN predictor: zero/zeros padding or MLP padding')
     
     # Graph classification specific pooling
-    parser.add_argument('--graph_pooling', type=str, default='mean', 
-                        choices=['mean', 'max', 'sum', 'attention'],
+    parser.add_argument('--graph_pooling', type=str, default='max', 
+                        choices=['mean', 'max', 'sum'],
                         help='Graph-level pooling method for aggregating node embeddings')
     
     # Data arguments
@@ -377,28 +400,28 @@ def parse_graph_classification_args():
     parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize data features after preprocessing')
     
     # Training arguments
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument('--epochs', type=int, default=50,
                         help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=0.0001,
+    parser.add_argument('--lr', type=float, default=0.0000038,
                         help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=4096,
+    parser.add_argument('--batch_size', type=int, default=1024,
                         help='Batch size (number of graphs per batch)')
     parser.add_argument('--test_batch_size', type=int, default=4096,
                         help='Test batch size (number of graphs per batch)')
-    parser.add_argument('--weight_decay', type=float, default=0.005,
+    parser.add_argument('--weight_decay', type=float, default=0.0000025,
                         help='Weight decay')
-    parser.add_argument('--clip_grad', type=float, default=1.0,
+    parser.add_argument('--clip_grad', type=float, default=1.32,
                         help='Gradient clipping')
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'], help='Optimizer')
-    parser.add_argument('--schedule', type=str, default='none', choices=['none', 'cosine', 'step', 'warmup'], help='Learning rate schedule')
-    parser.add_argument('--orthogonal_push', type=float, default=0.0, help='Orthogonal push loss weight for prototypes')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw'], help='Optimizer')
+    parser.add_argument('--schedule', type=str, default='warmup', choices=['none', 'cosine', 'step', 'warmup'], help='Learning rate schedule')
+    parser.add_argument('--orthogonal_push', type=float, default=0.0078, help='Orthogonal push loss weight for prototypes')
     parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize prototype embeddings')
     
     # Graph classification specific
     parser.add_argument('--sim', type=str, default='dot',
                         choices=['dot', 'cos', 'mlp'],
                         help='Similarity function for PFN predictor')
-    parser.add_argument('--context_k', type=int, default=32,
+    parser.add_argument('--context_k', type=int, default=5,
                         help='Number of context graphs per class for prototype generation')
     
     # System arguments
@@ -419,8 +442,11 @@ def parse_graph_classification_args():
                         help='Log level: QUIET (minimal), INFO (standard), DEBUG (detailed), VERBOSE (everything)')
     parser.add_argument('--log_interval', type=int, default=1,
                         help='Interval for printing training progress (epochs)')
-    parser.add_argument('--eval_interval', type=int, default=1,
+    parser.add_argument('--eval_interval', type=int, default=5,
                         help='Interval for validation evaluation (epochs)')
+
+    # === Full Batch Training ===
+    parser.add_argument('--full_batch_training', type=str2bool, default=False, help='Use full batch training: accumulate gradients from all 128 tasks per batch, update once per batch')
     
     # Data processing arguments
     parser.add_argument('--min_pca_dim', type=int, default=32,
@@ -436,6 +462,20 @@ def parse_graph_classification_args():
     parser.add_argument('--projection_large_dim', type=int, default=256,
                         help='Large dimension for identity projection')
     
+    # GPSE embeddings arguments
+    parser.add_argument('--use_gpse', type=str2bool, default=False,
+                        help='Use pre-computed GPSE embeddings instead of original node embeddings')
+    parser.add_argument('--gpse_path', type=str, default='/home/maweishuo/GPSE/datasets',
+                        help='Path to GPSE datasets directory')
+    
+    # OGB FUG embeddings arguments
+    parser.add_argument('--use_ogb_fug', type=str2bool, default=False,
+                        help='Use OGB datasets with FUG embeddings (replaces node features with FUG molecular embeddings)')
+    parser.add_argument('--fug_root', type=str, default='./fug',
+                        help='Root directory for FUG embeddings')
+    parser.add_argument('--ogb_root', type=str, default='./dataset/ogb',
+                        help='Root directory for OGB datasets')
+    
     # Checkpointing arguments
     parser.add_argument('--save_checkpoint', type=str2bool, default=False,
                         help='Save checkpoint after training')
@@ -443,5 +483,15 @@ def parse_graph_classification_args():
                         help='Directory to save checkpoints')
     parser.add_argument('--checkpoint_name', type=str, default=None,
                         help='Custom checkpoint name (default: auto-generated)')
+
+    parser.add_argument('--use_tag_dataset', type=str2bool, default=False,
+                        help='Use tag dataset for graph classification')
+    parser.add_argument('--embedding_family', type=str, default='e5',
+                        help='Embedding family to use for graph classification (e.g., e5, st)')
+
+    parser.add_argument('--pca_device', type=str, default='gpu', choices=['cpu', 'gpu'], help='Device to perform PCA computation (cpu=Incremental PCA, gpu=torch.pca_lowrank)')
+    parser.add_argument('--incremental_pca_batch_size', type=int, default=500000, help='Batch size for CPU Incremental PCA')
+    parser.add_argument('--pca_sample_threshold', type=int, default=float('inf'), help='If node count exceeds this, sample this many nodes for PCA (default: inf = no sampling)')
+    parser.add_argument('--pcba_context_only_pca', type=str2bool, default=False, help='PCBA-specific: Use only context + test graphs for PCA fitting (avoids data leakage)')
     
     return parser.parse_args()
