@@ -1471,47 +1471,43 @@ def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pc
     
     if pca_device == 'cpu':
         # Use CPU Incremental PCA
-        with record_function("cpu_incremental_pca"):
-            from .data_utils import apply_incremental_pca_cpu
-            processed_features = apply_incremental_pca_cpu(
-                data_tensor, target_dim, incremental_pca_batch_size, sign_normalize, rank=0
-            )
-                
+        from .data_utils import apply_incremental_pca_cpu
+        processed_features = apply_incremental_pca_cpu(
+            data_tensor, target_dim, incremental_pca_batch_size, sign_normalize, rank=0
+        )
+            
         # Move back to original device if needed
-        with record_function("cpu_to_device_transfer"):
-            processed_features = processed_features.to(data_tensor.device)
+        processed_features = processed_features.to(data_tensor.device)
         
     else:
         # GPU PCA - unified path for both sampled and full data
         use_sampling = n_samples > pca_sample_threshold
         
         # Step 1: Determine what data to use for PCA fitting
-        with record_function("pca_data_preparation"):
-            if use_sampling:
-                print(f"  Large dataset ({n_samples:,} nodes) - using sampled PCA with {pca_sample_threshold:,} samples")
-                sample_indices = torch.randperm(n_samples, device=original_device)[:pca_sample_threshold]
-                pca_data = data_tensor[sample_indices]
-            else:
-                print(f"  Small dataset ({n_samples:,} nodes) - using full PCA")
-                pca_data = data_tensor
-            
-            # Transfer PCA data to GPU
-            if target_device is not None:
-                pca_data = pca_data.to(target_device)
+        if use_sampling:
+            print(f"  Large dataset ({n_samples:,} nodes) - using sampled PCA with {pca_sample_threshold:,} samples")
+            sample_indices = torch.randperm(n_samples, device=original_device)[:pca_sample_threshold]
+            pca_data = data_tensor[sample_indices]
+        else:
+            print(f"  Small dataset ({n_samples:,} nodes) - using full PCA")
+            pca_data = data_tensor
+        
+        # Transfer PCA data to GPU
+        if target_device is not None:
+            pca_data = pca_data.to(target_device)
         
         # Step 2: Fit PCA on the chosen data
-        with record_function("gpu_pca_fitting"):
-            if use_full_pca:
-                U, S, V = torch.svd(pca_data)
-                U = U[:, :target_dim]
-                S = S[:target_dim]
-            else:
-                U, S, V = torch.pca_lowrank(pca_data, q=target_dim)
-            
-            # Free PCA data GPU memory immediately
-            if target_device is not None:
-                del pca_data
-                torch.cuda.empty_cache()
+        if use_full_pca:
+            U, S, V = torch.svd(pca_data)
+            U = U[:, :target_dim]
+            S = S[:target_dim]
+        else:
+            U, S, V = torch.pca_lowrank(pca_data, q=target_dim)
+        
+        # Free PCA data GPU memory immediately
+        if target_device is not None:
+            del pca_data
+            torch.cuda.empty_cache()
         
         # Step 3: Apply transformation to ALL data (always in batches for consistency)
         batch_size = 500000
@@ -1521,29 +1517,28 @@ def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pc
         processed_features = torch.zeros(n_samples, target_dim, device=original_device).pin_memory()
         data_tensor_pinned = data_tensor.pin_memory()
         
-        with record_function("gpu_unified_transformation"):
-            # V_gpu is small, transfer once
-            V_gpu = V[:, :target_dim].to(target_device)
-            
-            # Create streams for overlapping operations
-            s = torch.cuda.Stream()
-            
-            with torch.cuda.stream(s):
-                for batch_idx in range(num_batches):
-                    start_idx = batch_idx * batch_size
-                    end_idx = min(start_idx + batch_size, n_samples)
-                    
-                    # Get batch from pinned memory
-                    data_batch_cpu = data_tensor_pinned[start_idx:end_idx]
-                    
-                    # Async transfer to GPU
-                    data_batch_gpu = data_batch_cpu.to(target_device, non_blocking=True)
-                    
-                    # Apply transformation (without S scaling)
-                    batch_transformed_gpu = data_batch_gpu @ V_gpu
-                    
-                    # Async transfer result back to CPU
-                    processed_features[start_idx:end_idx].copy_(batch_transformed_gpu, non_blocking=True)
+        # V_gpu is small, transfer once
+        V_gpu = V[:, :target_dim].to(target_device)
+        
+        # Create streams for overlapping operations
+        s = torch.cuda.Stream()
+        
+        with torch.cuda.stream(s):
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, n_samples)
+                
+                # Get batch from pinned memory
+                data_batch_cpu = data_tensor_pinned[start_idx:end_idx]
+                
+                # Async transfer to GPU
+                data_batch_gpu = data_batch_cpu.to(target_device, non_blocking=True)
+                
+                # Apply transformation (without S scaling)
+                batch_transformed_gpu = data_batch_gpu @ V_gpu
+                
+                # Async transfer result back to CPU
+                processed_features[start_idx:end_idx].copy_(batch_transformed_gpu, non_blocking=True)
             
             # Synchronize once at the end
             torch.cuda.synchronize()
@@ -1554,15 +1549,14 @@ def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pc
         
         # Sign normalization (compute on a sample for efficiency)
         if sign_normalize:
-            with record_function("gpu_sign_normalization"):
-                sign_sample_size = min(10000, n_samples)
-                sign_indices = torch.randperm(n_samples, device=original_device)[:sign_sample_size]
-                sample_transformed = processed_features[sign_indices]
-                
-                for i in range(target_dim):
-                    feature_vector = sample_transformed[:, i]
-                    if feature_vector.abs().argmax() < len(feature_vector) // 2:
-                        processed_features[:, i] = -processed_features[:, i]
+            sign_sample_size = min(10000, n_samples)
+            sign_indices = torch.randperm(n_samples, device=original_device)[:sign_sample_size]
+            sample_transformed = processed_features[sign_indices]
+            
+            for i in range(target_dim):
+                feature_vector = sample_transformed[:, i]
+                if feature_vector.abs().argmax() < len(feature_vector) // 2:
+                    processed_features[:, i] = -processed_features[:, i]
     
     pca_time = time.time() - pca_start
     method = 'cpu' if pca_device == 'cpu' else ('sampled-gpu' if n_samples > pca_sample_threshold else 'gpu')

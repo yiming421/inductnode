@@ -245,7 +245,7 @@ def parse_joint_training_args():
     # === Model Architecture ===
     parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN'])
-    parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
+    parser.add_argument('--hidden', type=int, default=512, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=6, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--transformer_layers', type=int, default=2, help='Number of transformer layers')
@@ -270,8 +270,8 @@ def parse_joint_training_args():
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
-    parser.add_argument('--enable_nc', type=str2bool, default=False, help='Enable node classification task')
-    parser.add_argument('--enable_lp', type=str2bool, default=False, help='Enable link prediction task')
+    parser.add_argument('--enable_nc', type=str2bool, default=True, help='Enable node classification task')
+    parser.add_argument('--enable_lp', type=str2bool, default=True, help='Enable link prediction task')
     parser.add_argument('--enable_gc', type=str2bool, default=True, help='Enable graph classification task')
     parser.add_argument('--lambda_nc', type=float, default=1.0, help='Weight for node classification loss')
     parser.add_argument('--lambda_lp', type=float, default=1.32238, help='Weight for link prediction loss')
@@ -283,7 +283,7 @@ def parse_joint_training_args():
                        help='Node classification test datasets')
     parser.add_argument('--lp_train_dataset', type=str, default='CS,Physics,Computers,Photo,Flickr,Wiki,BlogCatalog,FacebookPage', 
                        help='Link prediction training datasets')
-    parser.add_argument('--lp_test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab,ogbl-citation2', 
+    parser.add_argument('--lp_test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab', 
                        help='Link prediction test datasets')
     
     # === Model Components ===
@@ -306,7 +306,7 @@ def parse_joint_training_args():
     parser.add_argument('--pca_cache_dir', type=str, default='./pca_cache', help='Directory to store PCA cache files')
     parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize input data')
     parser.add_argument('--padding_strategy', type=str, default='random', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
-    parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
+    parser.add_argument('--use_batchnorm', type=str2bool, default=False, help='Use BatchNorm instead of LayerNorm')
     parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
     parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
     
@@ -324,6 +324,7 @@ def parse_joint_training_args():
     parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
     parser.add_argument('--graph_pooling', type=str, default='mean', choices=['mean', 'max', 'sum'], help='Graph pooling method')
     parser.add_argument('--lambda_gc', type=float, default=1.0, help='Weight for graph classification loss')
+    parser.add_argument('--context_graph_num', type=int, default=16, help='Number of context graphs for graph classification')
     
     # === OGB FUG embeddings arguments (for graph classification) ===
     parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
@@ -347,7 +348,7 @@ def parse_joint_training_args():
     parser.add_argument('--log_level', type=str, default='INFO', 
                        choices=['QUIET', 'INFO', 'DEBUG', 'VERBOSE'])
     parser.add_argument('--log_interval', type=int, default=1, help='Logging interval (epochs)')
-    parser.add_argument('--eval_interval', type=int, default=1, help='Evaluation interval (epochs)')
+    parser.add_argument('--eval_interval', type=int, default=5, help='Evaluation interval (epochs)')
     # === Experiment Tracking ===
     parser.add_argument('--sweep', type=str2bool, default=False, help='Running hyperparameter sweep')
     

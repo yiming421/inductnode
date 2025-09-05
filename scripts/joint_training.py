@@ -231,6 +231,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 pca_sample_threshold=500000,  # Default threshold for sampled PCA
                 processed_data=dataset_info,  # Pass FUG mapping info
                 pcba_context_only_pca=False,  # Use full optimization for test datasets
+                use_pca_cache=args.use_pca_cache, pca_cache_dir=args.pca_cache_dir,
                 dataset_name=getattr(dataset, 'name', None)
             )
         else:
@@ -243,6 +244,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 pca_sample_threshold=500000,  # Default threshold for sampled PCA
                 processed_data=dataset_info,  # Pass FUG mapping info
                 pcba_context_only_pca=False,  # Use full optimization for training datasets
+                use_pca_cache=args.use_pca_cache, pca_cache_dir=args.pca_cache_dir,
                 dataset_name=getattr(dataset, 'name', None)
             )
         
@@ -485,7 +487,7 @@ def load_and_preprocess_data(args, device):
         
         # Load training data for graph classification
         gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets(
-            gc_train_datasets, device, pretraining_mode=True, context_k=args.context_k
+            gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num
         )
         
         # Process graph classification training data
@@ -505,7 +507,7 @@ def load_and_preprocess_data(args, device):
         
         # Load test data for graph classification
         gc_test_data_list, gc_test_processed_data_list = load_all_graph_datasets(
-            gc_test_datasets, device, context_k=args.context_k
+            gc_test_datasets, device, context_k=args.context_graph_num
         )
         
         # Process graph classification test data
@@ -949,46 +951,24 @@ def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='v
     
     Returns:
         Dictionary with metrics for enabled tasks
-    """
-    from torch.profiler import profile, record_function, ProfilerActivity
+    """    
+
+    results = {'nc_metrics': {}, 'lp_metrics': {}, 'gc_metrics': {}}
     
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        with_stack=True,
-        profile_memory=True
-    ) as prof:
-        with record_function("joint_evaluation"):
-            results = {'nc_metrics': {}, 'lp_metrics': {}, 'gc_metrics': {}}
-            
-            # Evaluate node classification
-            if hasattr(args, 'enable_nc') and args.enable_nc and nc_data is not None and nc_data[0] is not None:
-                with record_function("nc_evaluation"):
-                    nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection)
-                    results['nc_metrics'] = nc_results
-            
-            # Evaluate link prediction  
-            if hasattr(args, 'enable_lp') and args.enable_lp and lp_data is not None and lp_data[0] is not None:
-                with record_function("lp_evaluation"):
-                    lp_results = evaluate_link_prediction_task(model, predictor, lp_data, args, split, identity_projection)
-                    results['lp_metrics'] = lp_results
-            
-            # Evaluate graph classification
-            if hasattr(args, 'enable_gc') and args.enable_gc and gc_data is not None and len(gc_data[0]) > 0:
-                with record_function("gc_evaluation"):
-                    gc_results = evaluate_graph_classification_task(model, predictor, gc_data, args, split, identity_projection)
-                    results['gc_metrics'] = gc_results
+    # Evaluate node classification
+    if hasattr(args, 'enable_nc') and args.enable_nc and nc_data is not None and nc_data[0] is not None:
+            nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection)
+            results['nc_metrics'] = nc_results
     
-    # Print profiling results
-    print("=" * 80)
-    print(f"EVALUATION PROFILER RESULTS ({split}) - Top CPU Operations:")
-    print("=" * 80)
-    print(prof.key_averages(group_by_stack_n=5).table(sort_by="cpu_time_total", row_limit=20))
-    print("=" * 80)
-    print(f"EVALUATION PROFILER RESULTS ({split}) - Memory Usage:")
-    print("=" * 80)
-    print(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=10))
-    print("=" * 80)
+    # Evaluate link prediction  
+    if hasattr(args, 'enable_lp') and args.enable_lp and lp_data is not None and lp_data[0] is not None:
+            lp_results = evaluate_link_prediction_task(model, predictor, lp_data, args, split, identity_projection)
+            results['lp_metrics'] = lp_results
+    
+    # Evaluate graph classification
+    if hasattr(args, 'enable_gc') and args.enable_gc and gc_data is not None and len(gc_data[0]) > 0:
+            gc_results = evaluate_graph_classification_task(model, predictor, gc_data, args, split, identity_projection)
+            results['gc_metrics'] = gc_results
     
     return results
 
@@ -1409,11 +1389,11 @@ def main():
     # Final sweep metric (for hyperparameter optimization)
     sweep_metric = 0.0
     if getattr(args, 'enable_nc', True):
-        sweep_metric += args.lambda_nc * avg_nc
+        sweep_metric += avg_nc
     if getattr(args, 'enable_lp', True):
-        sweep_metric += args.lambda_lp * avg_lp
+        sweep_metric += avg_lp
     if getattr(args, 'enable_gc', True):
-        sweep_metric += args.lambda_gc * avg_gc
+        sweep_metric += avg_gc
     print(f"Combined Score: {sweep_metric:.4f}")
     
     # Get dataset names

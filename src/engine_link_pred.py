@@ -10,46 +10,6 @@ import time
 import psutil
 import os
 
-def log_memory_usage(rank=0, stage=""):
-    """Log CPU and GPU memory usage with detailed breakdown"""
-    if rank == 0:
-        # CPU memory usage
-        process = psutil.Process(os.getpid())
-        cpu_memory_mb = process.memory_info().rss / 1024 / 1024
-        cpu_percent = process.memory_percent()
-        
-        # GPU memory usage
-        if torch.cuda.is_available():
-            gpu_memory_allocated = torch.cuda.memory_allocated() / 1024 / 1024
-            gpu_memory_reserved = torch.cuda.memory_reserved() / 1024 / 1024
-            gpu_memory_max = torch.cuda.max_memory_allocated() / 1024 / 1024
-            
-            # Calculate memory deltas if this is a paired start/end measurement
-            memory_delta = ""
-            if "START" in stage:
-                # Store current values for delta calculation
-                if not hasattr(log_memory_usage, 'start_values'):
-                    log_memory_usage.start_values = {}
-                epoch_key = stage.split('_')[-1] if '_' in stage else "0"
-                log_memory_usage.start_values[epoch_key] = {
-                    'gpu_allocated': gpu_memory_allocated,
-                    'cpu_memory': cpu_memory_mb
-                }
-            elif "END" in stage and hasattr(log_memory_usage, 'start_values'):
-                epoch_key = stage.split('_')[-1] if '_' in stage else "0"
-                if epoch_key in log_memory_usage.start_values:
-                    start_vals = log_memory_usage.start_values[epoch_key]
-                    gpu_delta = gpu_memory_allocated - start_vals['gpu_allocated']
-                    cpu_delta = cpu_memory_mb - start_vals['cpu_memory']
-                    memory_delta = f" | Δ GPU: {gpu_delta:+.1f}MB, Δ CPU: {cpu_delta:+.1f}MB"
-            
-            print(f"[MEMORY {stage}] CPU: {cpu_memory_mb:.1f}MB ({cpu_percent:.1f}%), "
-                  f"GPU Allocated: {gpu_memory_allocated:.1f}MB, "
-                  f"GPU Reserved: {gpu_memory_reserved:.1f}MB, "
-                  f"GPU Max: {gpu_memory_max:.1f}MB{memory_delta}", flush=True)
-        else:
-            print(f"[MEMORY {stage}] CPU: {cpu_memory_mb:.1f}MB ({cpu_percent:.1f}%), GPU: N/A", flush=True)
-
 def get_node_embeddings(model, data, projector=None, identity_projection=None, use_full_adj=False):
     """
     Get node embeddings using the same model and preprocessing as node classification.
@@ -151,7 +111,6 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
     
     try:
         print(f"Rank {rank}: Starting link prediction training for epoch {epoch}")
-        log_memory_usage(rank, f"LINK_TRAIN_START_EPOCH_{epoch}")
         model.train()
         predictor.train()
         if att: att.train()
@@ -327,7 +286,6 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     print(f"Error in training batch: {e}")
                 continue
 
-        log_memory_usage(rank, f"LINK_TRAIN_END_EPOCH_{epoch}")
         if rank == 0:
             loss_str = f"{total_loss:.4f}" if optimizer is not None else "tensor"
             print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {loss_str}, Batch count: {batch_count}")
@@ -396,7 +354,6 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                               when available. This is required for OGB standards (e.g., ogbl-collab).
     """
     try:
-        log_memory_usage(rank, "LINK_EVAL_START")
         model.eval()
         predictor.eval()
         if att: att.eval()
@@ -531,7 +488,6 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         if neg_edges is not None:
             neg_edges = neg_edges.cpu()
         
-        log_memory_usage(rank, "LINK_EVAL_END")
         return results
         
     except Exception as e:

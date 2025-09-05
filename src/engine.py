@@ -35,18 +35,11 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     else:
         dataloader = DataLoader(range(train_idx.size(0)), batch_size, shuffle=True)
 
-    if rank == 0 and epoch == 0:
-        log_memory_usage(rank, f"AFTER_DATALOADER_SETUP", show_detailed=show_detailed)
-
     total_loss = 0
     for batch_idx, perm in enumerate(dataloader):
         if isinstance(perm, torch.Tensor):
             perm = perm.tolist()
         train_perm_idx = train_idx[perm]
-        
-        # Log memory for first batch of first epoch to understand memory spikes
-        if rank == 0 and epoch == 0 and batch_idx == 0:
-            log_memory_usage(rank, f"BATCH_START", show_detailed=show_detailed)
         
         # Apply different projection strategies
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
@@ -60,9 +53,6 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                 x_input = projected_features
         else:
             x_input = data.x
-        
-        if rank == 0 and epoch == 0 and batch_idx == 0:
-            log_memory_usage(rank, f"AFTER_PROJECTION", show_detailed=show_detailed)
         
         # Memory-optimized forward pass with gradient checkpointing and chunking
         if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
@@ -115,9 +105,6 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         optimizer.zero_grad()
         loss.backward()
         
-        if rank == 0 and epoch == 0 and batch_idx == 0:
-            log_memory_usage(rank, f"AFTER_BACKWARD", show_detailed=show_detailed)
-        
         # Apply gradient clipping
         if clip_grad > 0:
             # Handle DDP wrapped models
@@ -141,11 +128,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             del x_input
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
-        if rank == 0 and epoch == 0 and batch_idx == 0:
-            log_memory_usage(rank, f"AFTER_OPTIMIZER_STEP", show_detailed=show_detailed)
-
     en = time.time()
-    log_memory_usage(rank, f"TRAIN_END_EPOCH_{epoch}")
     if rank == 0:
         print(f"Train time: {en-st:.2f}s", flush=True)
     
@@ -172,7 +155,6 @@ def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, deg
 def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False, 
          att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None):
     st = time.time()
-    log_memory_usage(rank, "TEST_START")
     model.eval()
     predictor.eval()
     if projector is not None:
@@ -240,7 +222,6 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     test_y = data.y[test_idx]
     test_results = acc(test_y, test_score)
 
-    log_memory_usage(rank, "TEST_END")
     if rank == 0:
         print(f"Test time: {time.time()-st}", flush=True)
     return train_results, valid_results, test_results
