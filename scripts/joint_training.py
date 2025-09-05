@@ -228,7 +228,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 args.use_full_pca, False, args.normalize_data,
                 args.padding_strategy, args.use_batchnorm,
                 pca_device=args.pca_device, incremental_pca_batch_size=args.incremental_pca_batch_size,
-                pca_sample_threshold=float('inf'),  # Auto-configured to 1M for FUG+PCBA
+                pca_sample_threshold=500000,  # Default threshold for sampled PCA
                 processed_data=dataset_info,  # Pass FUG mapping info
                 pcba_context_only_pca=False,  # Use full optimization for test datasets
                 dataset_name=getattr(dataset, 'name', None)
@@ -240,7 +240,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 args.use_full_pca, False, args.normalize_data,
                 args.padding_strategy, args.use_batchnorm,
                 pca_device=args.pca_device, incremental_pca_batch_size=args.incremental_pca_batch_size,
-                pca_sample_threshold=float('inf'),  # Auto-configured to 1M for FUG+PCBA
+                pca_sample_threshold=500000,  # Default threshold for sampled PCA
                 processed_data=dataset_info,  # Pass FUG mapping info
                 pcba_context_only_pca=False,  # Use full optimization for training datasets
                 dataset_name=getattr(dataset, 'name', None)
@@ -950,22 +950,45 @@ def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='v
     Returns:
         Dictionary with metrics for enabled tasks
     """
-    results = {'nc_metrics': {}, 'lp_metrics': {}, 'gc_metrics': {}}
+    from torch.profiler import profile, record_function, ProfilerActivity
     
-    # Evaluate node classification
-    if hasattr(args, 'enable_nc') and args.enable_nc and nc_data is not None and nc_data[0] is not None:
-        nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection)
-        results['nc_metrics'] = nc_results
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=True
+    ) as prof:
+        with record_function("joint_evaluation"):
+            results = {'nc_metrics': {}, 'lp_metrics': {}, 'gc_metrics': {}}
+            
+            # Evaluate node classification
+            if hasattr(args, 'enable_nc') and args.enable_nc and nc_data is not None and nc_data[0] is not None:
+                with record_function("nc_evaluation"):
+                    nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection)
+                    results['nc_metrics'] = nc_results
+            
+            # Evaluate link prediction  
+            if hasattr(args, 'enable_lp') and args.enable_lp and lp_data is not None and lp_data[0] is not None:
+                with record_function("lp_evaluation"):
+                    lp_results = evaluate_link_prediction_task(model, predictor, lp_data, args, split, identity_projection)
+                    results['lp_metrics'] = lp_results
+            
+            # Evaluate graph classification
+            if hasattr(args, 'enable_gc') and args.enable_gc and gc_data is not None and len(gc_data[0]) > 0:
+                with record_function("gc_evaluation"):
+                    gc_results = evaluate_graph_classification_task(model, predictor, gc_data, args, split, identity_projection)
+                    results['gc_metrics'] = gc_results
     
-    # Evaluate link prediction  
-    if hasattr(args, 'enable_lp') and args.enable_lp and lp_data is not None and lp_data[0] is not None:
-        lp_results = evaluate_link_prediction_task(model, predictor, lp_data, args, split, identity_projection)
-        results['lp_metrics'] = lp_results
-    
-    # Evaluate graph classification
-    if hasattr(args, 'enable_gc') and args.enable_gc and gc_data is not None and len(gc_data[0]) > 0:
-        gc_results = evaluate_graph_classification_task(model, predictor, gc_data, args, split, identity_projection)
-        results['gc_metrics'] = gc_results
+    # Print profiling results
+    print("=" * 80)
+    print(f"EVALUATION PROFILER RESULTS ({split}) - Top CPU Operations:")
+    print("=" * 80)
+    print(prof.key_averages(group_by_stack_n=5).table(sort_by="cpu_time_total", row_limit=20))
+    print("=" * 80)
+    print(f"EVALUATION PROFILER RESULTS ({split}) - Memory Usage:")
+    print("=" * 80)
+    print(prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=10))
+    print("=" * 80)
     
     return results
 

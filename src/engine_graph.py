@@ -43,6 +43,67 @@ def _get_node_embedding_table(dataset, task_idx, device, dataset_info=None):
     return None
 
 # ---- ADDED: safe lookup helper to prevent silent CUDA device-side asserts ----
+def _safe_lookup_node_embeddings_micro_optimized(node_emb_table: torch.Tensor, x: torch.Tensor, context: str="",
+                                                batch_data=None, dataset_info=None) -> torch.Tensor:
+    """
+    Micro-transfer optimized version - eliminates thousands of GPU-CPU transfers.
+    Same algorithm as original but with only 2 transfers total instead of 40,000+.
+    """
+    import time
+    import numpy as np
+    
+    # Case 4: FUG external mapping - handle original OGB features  
+    if (dataset_info and 'fug_mapping' in dataset_info and 
+        x.dim() == 2 and x.size(1) > 1 and not x.dtype.is_floating_point):
+        
+            
+        if batch_data is None or not hasattr(batch_data, 'original_graph_indices'):
+            raise ValueError(f"[FUG] Batch data with original_graph_indices required for external mapping in {context}")
+        
+        fug_mapping = dataset_info['fug_mapping']
+        node_mapping = fug_mapping['node_index_mapping']
+        
+        # OPTIMIZATION 1: Single GPU->CPU transfer for entire batch data
+        batch_vector_cpu = batch_data.batch.cpu().numpy()  # Single transfer
+        original_indices_cpu = batch_data.original_graph_indices.cpu().numpy()  # Single transfer
+        
+        embeddings_list = []
+        
+        # Process each graph in the batch (NO micro-transfers!)
+        for local_graph_idx, original_graph_idx in enumerate(original_indices_cpu):
+            original_graph_idx = int(original_graph_idx)  # Already CPU - no .item()!
+            
+            if original_graph_idx not in node_mapping:
+                raise ValueError(f"[FUG] Original graph {original_graph_idx} not found in node mapping")
+            
+            # Get nodes belonging to this graph (CPU operations only)
+            graph_node_mask = (batch_vector_cpu == local_graph_idx)
+            num_graph_nodes = int(np.sum(graph_node_mask))  # No .item()!
+            
+            # Get FUG embedding indices for this graph
+            fug_indices = node_mapping[original_graph_idx]  # CPU lookup
+            
+            if len(fug_indices) != num_graph_nodes:
+                raise ValueError(f"[FUG] Size mismatch: graph {original_graph_idx} has {len(fug_indices)} FUG indices but {num_graph_nodes} batch nodes")
+            
+            # CPU embedding lookup
+            graph_embeddings = node_emb_table[fug_indices]
+            embeddings_list.append(graph_embeddings)
+        
+        # Concatenate on CPU
+        processed_embeddings = torch.cat(embeddings_list, dim=0)
+        
+        # OPTIMIZATION 2: Single CPU->GPU transfer for final result  
+        target_device = x.device if x.numel() > 0 else 'cuda'
+        result = processed_embeddings.to(target_device)
+        
+        
+        return result
+    
+    # For non-FUG cases, fall back to original implementation
+    return _safe_lookup_node_embeddings_original(node_emb_table, x, context, batch_data, dataset_info)
+
+
 def _safe_lookup_node_embeddings(node_emb_table: torch.Tensor, x: torch.Tensor, context: str="", 
                                  batch_data=None, dataset_info=None) -> torch.Tensor:
     """Return embedded node features ensuring indices are valid.
@@ -54,49 +115,10 @@ def _safe_lookup_node_embeddings(node_emb_table: torch.Tensor, x: torch.Tensor, 
     Raises a clear Python exception instead of triggering a CUDA device-side assert.
     """
     
-    # Case 4: FUG external mapping - handle original OGB features  
+    # For FUG cases, use the micro-optimized version
     if (dataset_info and 'fug_mapping' in dataset_info and 
         x.dim() == 2 and x.size(1) > 1 and not x.dtype.is_floating_point):
-        
-        # For FUG mode, x contains the original OGB node features (e.g., [32, 9])
-        # We use the external mapping with original graph indices from batch_data
-        
-        if batch_data is None or not hasattr(batch_data, 'original_graph_indices'):
-            raise ValueError(f"[FUG] Batch data with original_graph_indices required for external mapping in {context}")
-        
-        fug_mapping = dataset_info['fug_mapping']
-        node_mapping = fug_mapping['node_index_mapping']
-        batch_vector = batch_data.batch  # [total_batch_nodes] -> local graph_idx in batch
-        original_graph_indices = batch_data.original_graph_indices  # [num_graphs] -> original dataset indices
-        
-        # Get embeddings for each node based on which graph it belongs to
-        embeddings_list = []
-        
-        # Process each graph in the batch
-        for local_graph_idx, original_graph_idx in enumerate(original_graph_indices):
-            original_graph_idx = int(original_graph_idx.item())
-            
-            if original_graph_idx not in node_mapping:
-                raise ValueError(f"[FUG] Original graph {original_graph_idx} not found in node mapping")
-            
-            # Get nodes belonging to this graph in the batch
-            graph_node_mask = (batch_vector == local_graph_idx)
-            num_graph_nodes = graph_node_mask.sum().item()
-            
-            # Get FUG embedding indices for this graph
-            fug_indices = node_mapping[original_graph_idx]  # Keep on CPU for lookup
-            
-            if len(fug_indices) != num_graph_nodes:
-                raise ValueError(f"[FUG] Size mismatch: graph {original_graph_idx} has {len(fug_indices)} FUG indices but {num_graph_nodes} batch nodes")
-            
-            # Get embeddings for this graph - CPU lookup then move to target device
-            graph_embeddings = node_emb_table[fug_indices]  # CPU lookup
-            target_device = x.device if x.numel() > 0 else 'cuda'  # Use x's device as target
-            graph_embeddings = graph_embeddings.to(target_device)  # Move small result to target device
-            embeddings_list.append(graph_embeddings)
-        
-        # Concatenate embeddings in batch order
-        return torch.cat(embeddings_list, dim=0)
+        return _safe_lookup_node_embeddings_micro_optimized(node_emb_table, x, context, batch_data, dataset_info)
     
     # Case 1: already embedded (float & 2D & width not 1)
     if x.dim() == 2 and x.size(1) > 1 and x.dtype.is_floating_point:
@@ -333,17 +355,17 @@ def calculate_metric(predictions, labels, probabilities, metric_type):
         # Debug: Check for unusual cases
         unique_labels = set(labels_np)
         if len(unique_labels) < 2:
-            print(f"[DEBUG] AUC: Only one class present: {unique_labels}")
+            pass
             return 0.0
         
         try:
             auc_score = roc_auc_score(labels_np, probs)
             if auc_score != auc_score:  # Check for NaN
-                print(f"[DEBUG] AUC: roc_auc_score returned NaN! labels unique: {unique_labels}, probs range: [{probs.min():.4f}, {probs.max():.4f}]")
+                pass
                 return 0.0
             return auc_score
         except ValueError as e:
-            print(f"[DEBUG] AUC: ValueError caught: {e}")
+            pass
             return 0.0
     elif metric_type == 'ap':
         # For binary classification, use probabilities of positive class
@@ -998,8 +1020,9 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
     # Pre-extract all batches to eliminate DataLoader iterator overhead
     train_batches = list(data_loaders['train'])
 
+    total_batches = len(train_batches)
     for batch_idx, batch_graphs in enumerate(train_batches):
-        
+        print(f"\rTraining batch {batch_idx+1}/{total_batches}", end="", flush=True)
         batch_data = batch_graphs.to(device)
         
         # Convert node indices to embeddings using unified node_embs
@@ -1112,8 +1135,10 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         
         total_loss += loss.item()
         num_batches += 1
+        print(f"\rTraining batch {batch_idx+1}/{total_batches} completed (loss: {loss.item():.4f})", end="", flush=True)
         torch.cuda.empty_cache()
     
+    print(f"\nTraining completed: {num_batches} batches, avg loss: {total_loss/num_batches if num_batches > 0 else 0.0:.4f}")
     return total_loss / num_batches if num_batches > 0 else 0.0
 
 @torch.no_grad()
@@ -1181,7 +1206,9 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         # Pre-extract all batches for evaluation to eliminate DataLoader iterator overhead  
         eval_batches = list(data_loader)
         
+        total_eval_batches = len(eval_batches)
         for batch_idx, batch_graphs in enumerate(eval_batches):
+            print(f"\rEvaluating batch {batch_idx+1}/{total_eval_batches}", end="", flush=True)
             batch_data = batch_graphs.to(device)
             
             # Convert node indices to embeddings - handle both standard and task-aware modes
@@ -1246,12 +1273,14 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             all_predictions.append(predictions.cpu())
             all_labels.append(batch_labels.cpu())
             all_probabilities.append(probabilities.cpu())
+            print(f"\rEvaluating batch {batch_idx+1}/{total_eval_batches} completed ({len(predictions)} samples)", end="", flush=True)
 
         # Concatenate all predictions and labels
         if all_predictions:
             all_predictions = torch.cat(all_predictions, dim=0)
             all_labels = torch.cat(all_labels, dim=0)
             all_probabilities = torch.cat(all_probabilities, dim=0)
+            print(f"\n{split_name} evaluation: {len(all_predictions)} total samples processed", end="")
             
             # Calculate the appropriate metric(s)
             if isinstance(metric_type, list):
@@ -1268,6 +1297,7 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             else:
                 results[split_name] = 0.0
 
+    print(f"\nEvaluation completed for task {task_idx}")
     
     return results
 
@@ -1419,6 +1449,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                     
                     dataset_loss += task_loss
                     dataset_tasks += 1
+                    print(f"Task {task_idx} completed: loss={task_loss:.4f}")
                 
                 # Average loss across tasks for this dataset
                 if dataset_tasks > 0:
@@ -1515,6 +1546,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                     )
                     task_train_accs.append(task_results['train'])
                     task_val_accs.append(task_results['val'])
+                    print(f"Task {task_idx} evaluation completed: train={task_results['train']:.4f}, val={task_results['val']:.4f}")
                 
                 # Aggregate results across tasks
                 if task_val_accs:

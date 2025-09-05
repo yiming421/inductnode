@@ -144,7 +144,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 args.padding_strategy, args.use_batchnorm,
                 args.use_gpse, args.gpse_path, dataset_name,
                 args.pca_device, args.incremental_pca_batch_size, args.pca_sample_threshold,
-                dataset_info, pcba_context_only_pca
+                dataset_info, pcba_context_only_pca, use_pca_cache=args.use_pca_cache, pca_cache_dir=args.pca_cache_dir
             )
         else:
             processing_info = process_graph_features(
@@ -154,7 +154,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 args.padding_strategy, args.use_batchnorm,
                 args.use_gpse, args.gpse_path, dataset_name,
                 args.pca_device, args.incremental_pca_batch_size, args.pca_sample_threshold,
-                dataset_info, pcba_context_only_pca
+                dataset_info, pcba_context_only_pca, use_pca_cache=args.use_pca_cache, pca_cache_dir=args.pca_cache_dir
             )
         
         processed_datasets.append(dataset)

@@ -18,6 +18,8 @@ import psutil, gc
 from torch_sparse import SparseTensor
 import time
 import math  # (possibly needed later)
+import hashlib
+from pathlib import Path
 # FUG-specific loaders moved to separate module
 try:
     from .data_graph_fug_simple import load_ogb_fug_dataset
@@ -1380,75 +1382,200 @@ def create_data_loaders(dataset, split_idx, batch_size=128, shuffle=True, task_i
     
     return loaders
 
-def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pca_device, incremental_pca_batch_size, pca_sample_threshold=float('inf')):
+def _save_pca_cache(dataset_name, target_dim, processed_features, cache_dir="./pca_cache"):
+    """
+    Save PCA-transformed embeddings to cache.
+    
+    Args:
+        dataset_name: Name of the dataset
+        target_dim: Target dimensionality
+        processed_features: PCA-transformed embeddings
+        cache_dir: Directory to store cache files
+    """
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    
+    cache_file = cache_path / f"{dataset_name}_dim{target_dim}.pt"
+    
+    cache_data = {
+        'processed_features': processed_features.cpu(),  # Always store on CPU
+        'dataset_name': dataset_name,
+        'target_dim': target_dim,
+        'timestamp': time.time()
+    }
+    
+    torch.save(cache_data, cache_file)
+    print(f"PCA cache saved: {cache_file}")
+
+
+def _load_pca_cache(dataset_name, target_dim, cache_dir="./pca_cache"):
+    """
+    Load PCA-transformed embeddings from cache.
+    
+    Args:
+        dataset_name: Name of the dataset
+        target_dim: Target dimensionality
+        cache_dir: Directory containing cache files
+        
+    Returns:
+        torch.Tensor or None: processed_features if found, None otherwise
+    """
+    cache_path = Path(cache_dir)
+    cache_file = cache_path / f"{dataset_name}_dim{target_dim}.pt"
+    
+    if not cache_file.exists():
+        return None
+    
+    try:
+        cache_data = torch.load(cache_file, map_location='cpu')
+        print(f"PCA cache hit: {cache_file}")
+        return cache_data['processed_features']
+    except Exception as e:
+        print(f"Error loading PCA cache {cache_file}: {e}")
+        return None
+
+
+def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pca_device, incremental_pca_batch_size, pca_sample_threshold=float('inf'), use_pca_cache=False, pca_cache_dir="./pca_cache", dataset_name=None, target_cuda_device=None):
     """
     Unified PCA application with support for sampling large datasets on GPU.
     """
+
+    
     pca_start = time.time()
     n_samples = data_tensor.shape[0]
     print(f"Applying PCA on {n_samples:,} samples with target dimension {target_dim}, threshold {pca_sample_threshold:,}")
     
+    # Check for cached results first
+    if use_pca_cache and dataset_name:
+        cached_result = _load_pca_cache(dataset_name, target_dim, pca_cache_dir)
+        if cached_result is not None:
+            return cached_result.to(data_tensor.device)
+    
+    # Cache miss - force CPU computation for accurate caching
+    cache_miss = use_pca_cache and dataset_name
+    if cache_miss:
+        pca_device = 'cpu'
+    
+    # Handle device for GPU operations - keep data on CPU, only move samples/batches as needed
+    original_device = data_tensor.device
+    target_device = None
+    if pca_device == 'gpu':
+        if torch.cuda.is_available():
+            if target_cuda_device is not None:
+                target_device = target_cuda_device
+            else:
+                target_device = torch.cuda.current_device()
+        else:
+            print(f"WARNING: GPU requested but CUDA not available, falling back to CPU")
+            pca_device = 'cpu'
+    
     if pca_device == 'cpu':
         # Use CPU Incremental PCA
-        from .data_utils import apply_incremental_pca_cpu
-        processed_features = apply_incremental_pca_cpu(
-            data_tensor, target_dim, incremental_pca_batch_size, sign_normalize, rank=0
-        )
+        with record_function("cpu_incremental_pca"):
+            from .data_utils import apply_incremental_pca_cpu
+            processed_features = apply_incremental_pca_cpu(
+                data_tensor, target_dim, incremental_pca_batch_size, sign_normalize, rank=0
+            )
+                
         # Move back to original device if needed
-        processed_features = processed_features.to(data_tensor.device)
-        
-    elif n_samples > pca_sample_threshold:
-        # Use GPU Sampled PCA - sample subset for PCA fitting, apply to all
-        print(f"  Large dataset ({n_samples:,} nodes) - using sampled PCA with {pca_sample_threshold:,} samples")
-        
-        # Sample representative subset
-        sample_indices = torch.randperm(n_samples, device=data_tensor.device)[:pca_sample_threshold]
-        data_sample = data_tensor[sample_indices]
-        
-        # Fit PCA on sample
-        if use_full_pca:
-            U, S, V = torch.svd(data_sample)
-            U = U[:, :target_dim]
-            S = S[:target_dim]
-        else:
-            U, S, V = torch.pca_lowrank(data_sample, q=target_dim)
-        
-        # Apply transformation to ALL data using fitted components
-        processed_features = data_tensor @ V[:, :target_dim]
-        
-        # Scale by singular values
-        processed_features = processed_features * S[:target_dim]
-        
-        # Sign normalization on the sample (for consistency)
-        if sign_normalize:
-            sample_transformed = data_sample @ V[:, :target_dim] * S[:target_dim]
-            for i in range(target_dim):
-                feature_vector = sample_transformed[:, i]
-                if feature_vector.abs().argmax() < len(feature_vector) // 2:  # Simple sign heuristic
-                    processed_features[:, i] = -processed_features[:, i]
+        with record_function("cpu_to_device_transfer"):
+            processed_features = processed_features.to(data_tensor.device)
         
     else:
-        # Use standard GPU PCA (original method)
-        if use_full_pca:
-            U, S, V = torch.svd(data_tensor)
-            U = U[:, :target_dim]
-            S = S[:target_dim]
-        else:
-            U, S, V = torch.pca_lowrank(data_tensor, q=target_dim)
+        # GPU PCA - unified path for both sampled and full data
+        use_sampling = n_samples > pca_sample_threshold
         
-        # Sign normalization
+        # Step 1: Determine what data to use for PCA fitting
+        with record_function("pca_data_preparation"):
+            if use_sampling:
+                print(f"  Large dataset ({n_samples:,} nodes) - using sampled PCA with {pca_sample_threshold:,} samples")
+                sample_indices = torch.randperm(n_samples, device=original_device)[:pca_sample_threshold]
+                pca_data = data_tensor[sample_indices]
+            else:
+                print(f"  Small dataset ({n_samples:,} nodes) - using full PCA")
+                pca_data = data_tensor
+            
+            # Transfer PCA data to GPU
+            if target_device is not None:
+                pca_data = pca_data.to(target_device)
+        
+        # Step 2: Fit PCA on the chosen data
+        with record_function("gpu_pca_fitting"):
+            if use_full_pca:
+                U, S, V = torch.svd(pca_data)
+                U = U[:, :target_dim]
+                S = S[:target_dim]
+            else:
+                U, S, V = torch.pca_lowrank(pca_data, q=target_dim)
+            
+            # Free PCA data GPU memory immediately
+            if target_device is not None:
+                del pca_data
+                torch.cuda.empty_cache()
+        
+        # Step 3: Apply transformation to ALL data (always in batches for consistency)
+        batch_size = 500000
+        num_batches = (n_samples + batch_size - 1) // batch_size
+        
+        # Use pinned memory for faster transfers
+        processed_features = torch.zeros(n_samples, target_dim, device=original_device).pin_memory()
+        data_tensor_pinned = data_tensor.pin_memory()
+        
+        with record_function("gpu_unified_transformation"):
+            # V_gpu is small, transfer once
+            V_gpu = V[:, :target_dim].to(target_device)
+            
+            # Create streams for overlapping operations
+            s = torch.cuda.Stream()
+            
+            with torch.cuda.stream(s):
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, n_samples)
+                    
+                    # Get batch from pinned memory
+                    data_batch_cpu = data_tensor_pinned[start_idx:end_idx]
+                    
+                    # Async transfer to GPU
+                    data_batch_gpu = data_batch_cpu.to(target_device, non_blocking=True)
+                    
+                    # Apply transformation (without S scaling)
+                    batch_transformed_gpu = data_batch_gpu @ V_gpu
+                    
+                    # Async transfer result back to CPU
+                    processed_features[start_idx:end_idx].copy_(batch_transformed_gpu, non_blocking=True)
+            
+            # Synchronize once at the end
+            torch.cuda.synchronize()
+            
+            # Clean up GPU memory
+            del V_gpu, U, S, V
+            torch.cuda.empty_cache()
+        
+        # Sign normalization (compute on a sample for efficiency)
         if sign_normalize:
-            for i in range(target_dim):
-                feature_vector = U[:, i] * S[i]
-                max_idx = torch.argmax(torch.abs(feature_vector))
-                if feature_vector[max_idx] < 0:
-                    U[:, i] = -U[:, i]
-        
-        processed_features = torch.mm(U, torch.diag(S))
+            with record_function("gpu_sign_normalization"):
+                sign_sample_size = min(10000, n_samples)
+                sign_indices = torch.randperm(n_samples, device=original_device)[:sign_sample_size]
+                sample_transformed = processed_features[sign_indices]
+                
+                for i in range(target_dim):
+                    feature_vector = sample_transformed[:, i]
+                    if feature_vector.abs().argmax() < len(feature_vector) // 2:
+                        processed_features[:, i] = -processed_features[:, i]
     
     pca_time = time.time() - pca_start
     method = 'cpu' if pca_device == 'cpu' else ('sampled-gpu' if n_samples > pca_sample_threshold else 'gpu')
     print(f"  PCA computation ({method}): {pca_time:.2f}s")
+    
+    # Save to cache if this was a cache miss
+    if cache_miss:
+        _save_pca_cache(dataset_name, target_dim, processed_features, pca_cache_dir)
+    
+    # Transfer result back to original device if we moved it for PCA
+    if target_device is not None and original_device != data_tensor.device:
+        processed_features = processed_features.to(original_device)
+    
     return processed_features
 
 def process_graph_features(dataset, hidden_dim, device='cuda', 
@@ -1456,8 +1583,9 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
                          use_full_pca=False, sign_normalize=False, normalize_data=False,
                          padding_strategy='zero', use_batchnorm=False,
                          use_gpse=False, gpse_path='/home/maweishuo/GPSE/datasets', dataset_name=None,
-                         pca_device='gpu', incremental_pca_batch_size=10000, pca_sample_threshold=float('inf'),
-                         processed_data=None, pcba_context_only_pca=False):
+                         pca_device='gpu', incremental_pca_batch_size=10000, pca_sample_threshold=500000,
+                         processed_data=None, pcba_context_only_pca=False,
+                         use_pca_cache=False, pca_cache_dir="./pca_cache"):
     """
     Process graph features using PCA directly on embedding table for maximum memory efficiency.
     
@@ -1485,16 +1613,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
     """
     import time
     
-    # Auto-configure PCA sample threshold for FUG with PCBA datasets
-    use_fug = os.environ.get('USE_FUG_EMB', '0') == '1'
-    is_pcba_dataset = (dataset_name and 
-                       ('pcba' in dataset_name.lower() or 'chempcba' in dataset_name.lower()))
-    
-    # Set sampled PCA threshold to 1M nodes for FUG+PCBA combination
-    if (use_fug and is_pcba_dataset and 
-        pca_sample_threshold == float('inf')):  # Only override if not explicitly set
-        pca_sample_threshold = 1000000
-        print(f"Auto-configured sampled PCA for FUG+PCBA: using {pca_sample_threshold:,} nodes for PCA fitting")
+    # PCA threshold is now strictly controlled by args parameter
     
     # GPSE Integration: Replace dataset embeddings with GPSE embeddings if requested
     if use_gpse and dataset_name is not None:
@@ -1607,7 +1726,8 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             # Apply PCA to small dimension
             processed_features = _apply_pca_unified(
                 stacked_features, projection_small_dim, use_full_pca, sign_normalize,
-                pca_device, incremental_pca_batch_size, pca_sample_threshold
+                pca_device, incremental_pca_batch_size, pca_sample_threshold,
+                use_pca_cache, pca_cache_dir, dataset_name, device
             )
         else:
             # Not enough samples for full PCA to projection_small_dim, apply PCA to all available dimensions then pad
@@ -1615,7 +1735,8 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             
             pca_features = _apply_pca_unified(
                 stacked_features, pca_dim, use_full_pca, sign_normalize,
-                pca_device, incremental_pca_batch_size, pca_sample_threshold
+                pca_device, incremental_pca_batch_size, pca_sample_threshold,
+                use_pca_cache, pca_cache_dir, dataset_name, device
             )
             
             # Apply padding to reach projection_small_dim
@@ -1639,7 +1760,8 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             # Apply PCA to target dimension
             processed_features = _apply_pca_unified(
                 stacked_features, hidden_dim, use_full_pca, sign_normalize,
-                pca_device, incremental_pca_batch_size, pca_sample_threshold
+                pca_device, incremental_pca_batch_size, pca_sample_threshold,
+                use_pca_cache, pca_cache_dir, dataset_name, device
             )
             
         else:
@@ -1648,7 +1770,8 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             
             pca_features = _apply_pca_unified(
                 stacked_features, pca_dim, use_full_pca, sign_normalize,
-                pca_device, incremental_pca_batch_size, pca_sample_threshold
+                pca_device, incremental_pca_batch_size, pca_sample_threshold,
+                use_pca_cache, pca_cache_dir, dataset_name, device
             )
             
             # Apply padding to reach target dimension

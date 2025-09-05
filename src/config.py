@@ -301,6 +301,9 @@ def parse_joint_training_args():
     parser.add_argument('--use_full_pca', type=str2bool, default=False, help='Use full PCA decomposition')
     parser.add_argument('--pca_device', type=str, default='gpu', choices=['cpu', 'gpu'], help='Device to perform PCA computation (cpu=Incremental PCA, gpu=torch.pca_lowrank)')
     parser.add_argument('--incremental_pca_batch_size', type=int, default=10000, help='Batch size for CPU Incremental PCA')
+    parser.add_argument('--pca_sample_threshold', type=int, default=100000, help='Threshold for using sampled PCA on GPU')
+    parser.add_argument('--use_pca_cache', type=str2bool, default=True, help='Enable PCA result caching for faster subsequent runs')
+    parser.add_argument('--pca_cache_dir', type=str, default='./pca_cache', help='Directory to store PCA cache files')
     parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize input data')
     parser.add_argument('--padding_strategy', type=str, default='random', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
     parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
@@ -404,7 +407,7 @@ def parse_graph_classification_args():
                         help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.0000038,
                         help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=1024,
+    parser.add_argument('--batch_size', type=int, default=4096,
                         help='Batch size (number of graphs per batch)')
     parser.add_argument('--test_batch_size', type=int, default=4096,
                         help='Test batch size (number of graphs per batch)')
@@ -490,8 +493,11 @@ def parse_graph_classification_args():
                         help='Embedding family to use for graph classification (e.g., e5, st)')
 
     parser.add_argument('--pca_device', type=str, default='gpu', choices=['cpu', 'gpu'], help='Device to perform PCA computation (cpu=Incremental PCA, gpu=torch.pca_lowrank)')
-    parser.add_argument('--incremental_pca_batch_size', type=int, default=500000, help='Batch size for CPU Incremental PCA')
-    parser.add_argument('--pca_sample_threshold', type=int, default=float('inf'), help='If node count exceeds this, sample this many nodes for PCA (default: inf = no sampling)')
+    parser.add_argument('--incremental_pca_batch_size', type=int, default=1000000, help='Batch size for CPU Incremental PCA')
+    parser.add_argument('--pca_sample_threshold', type=int, default=300000, help='If node count exceeds this, sample this many nodes for PCA (default: 500000)')
     parser.add_argument('--pcba_context_only_pca', type=str2bool, default=False, help='PCBA-specific: Use only context + test graphs for PCA fitting (avoids data leakage)')
+
+    parser.add_argument('--use_pca_cache', type=str2bool, default=True, help='Enable PCA result caching for faster subsequent runs')
+    parser.add_argument('--pca_cache_dir', type=str, default='./pca_cache', help='Directory to store PCA cache files')
     
     return parser.parse_args()
