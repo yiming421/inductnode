@@ -236,7 +236,7 @@ def parse_joint_training_args():
     
     # === Basic Configuration ===
     parser.add_argument('--runs', type=int, default=3, help='Number of training runs')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--gpu', type=str, default='0', help='GPU specification: "auto" for all GPUs, single GPU ID (e.g., "0"), or comma-separated list (e.g., "0,1,2,3")')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--port', type=int, default=12355, help='Port for DDP')
@@ -260,12 +260,12 @@ def parse_joint_training_args():
     parser.add_argument('--use_gin', type=str2bool, default=False, help='Use GIN variant for GCN')
     
     # === Training Configuration ===
-    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adam', 'adamw'])
-    parser.add_argument('--lr', type=float, default=0.0000115, help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
+    parser.add_argument('--lr', type=float, default=0.00001152103060806947, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.005, help='Weight decay')
     parser.add_argument('--schedule', type=str, default='warmup', choices=['cosine', 'step', 'warmup', 'none'])
     parser.add_argument('--nc_batch_size', type=int, default=16384, help='Node classification batch size')
-    parser.add_argument('--lp_batch_size', type=int, default=2048, help='Link prediction batch size')
+    parser.add_argument('--lp_batch_size', type=int, default=65536, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
@@ -274,7 +274,7 @@ def parse_joint_training_args():
     parser.add_argument('--enable_lp', type=str2bool, default=True, help='Enable link prediction task')
     parser.add_argument('--enable_gc', type=str2bool, default=True, help='Enable graph classification task')
     parser.add_argument('--lambda_nc', type=float, default=1.0, help='Weight for node classification loss')
-    parser.add_argument('--lambda_lp', type=float, default=1.32238, help='Weight for link prediction loss')
+    parser.add_argument('--lambda_lp', type=float, default=1.3223791896807502, help='Weight for link prediction loss')
     
     # === Dataset Configuration ===
     parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
@@ -306,7 +306,7 @@ def parse_joint_training_args():
     parser.add_argument('--pca_cache_dir', type=str, default='./pca_cache', help='Directory to store PCA cache files')
     parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize input data')
     parser.add_argument('--padding_strategy', type=str, default='random', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
-    parser.add_argument('--use_batchnorm', type=str2bool, default=False, help='Use BatchNorm instead of LayerNorm')
+    parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
     parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
     parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
     
@@ -327,12 +327,22 @@ def parse_joint_training_args():
     parser.add_argument('--context_graph_num', type=int, default=16, help='Number of context graphs for graph classification')
     
     # === OGB FUG embeddings arguments (for graph classification) ===
-    parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
+    parser.add_argument('--use_ogb_fug', type=str2bool, default=False,
                         help='Use OGB datasets with FUG embeddings (replaces node features with FUG molecular embeddings)')
     parser.add_argument('--fug_root', type=str, default='./fug',
                         help='Root directory for FUG embeddings')
     parser.add_argument('--ogb_root', type=str, default='./dataset/ogb',
                         help='Root directory for OGB datasets')
+    
+    # === TSGFM datasets arguments (for graph classification) ===
+    parser.add_argument('--use_tsgfm', type=str2bool, default=False,
+                        help='Use TSGFM datasets for graph classification (batched format with text features)')
+    parser.add_argument('--use_tag_dataset', type=str2bool, default=False,
+                        help='Use TAGDataset format with TAGLAS Lite embeddings')
+    parser.add_argument('--tag_dataset_root', type=str, default='./dataset/tag',
+                        help='Root directory for TAGDataset datasets')
+    parser.add_argument('--embedding_family', type=str, default='e5',
+                        help='Embedding family to use for graph classification (e.g., e5, st)')
     
     # === Joint Multi-Task Training (TSGFM-style) ===
 # Removed joint multitask arguments - only using task-specific and full batch training

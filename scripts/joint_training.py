@@ -198,17 +198,43 @@ class LinkPredictionTracker:
 lp_tracker = None
 
 
-def setup_fug_environment(args):
-    """Configure OGB FUG embeddings if requested."""
-    if args.enable_gc and hasattr(args, 'use_ogb_fug') and args.use_ogb_fug:
+def setup_graph_dataset_environment(args):
+    """Configure graph dataset embeddings (FUG, TSGFM, or TAGDataset) if requested."""
+    if not args.enable_gc:
+        # Clear all environment variables if graph classification is disabled
+        os.environ.pop('USE_FUG_EMB', None)
+        os.environ.pop('TAG_DATASET_ROOT', None)
+        return
+        
+    # Priority: FUG > TAGDataset > TSGFM
+    if hasattr(args, 'use_ogb_fug') and args.use_ogb_fug:
         print(f"Enabling OGB FUG embeddings for graph classification")
         print(f"FUG root: {args.fug_root}, OGB root: {args.ogb_root}")
         os.environ['USE_FUG_EMB'] = '1'
         os.environ['FUG_EMB_ROOT'] = args.fug_root
         os.environ['OGB_ROOT'] = args.ogb_root
-    else:
-        # Ensure FUG is disabled for non-FUG runs
+        # Clear other embedding settings
+        os.environ.pop('TAG_DATASET_ROOT', None)
+        
+    elif hasattr(args, 'use_tag_dataset') and args.use_tag_dataset:
+        print(f"Enabling TAGDataset embeddings for graph classification")
+        print(f"TAGDataset root: {args.tag_dataset_root}, Embedding family: {args.embedding_family}")
+        os.environ['TAG_DATASET_ROOT'] = args.tag_dataset_root
+        os.environ['EMBEDDING_FAMILY'] = args.embedding_family
+        # Clear FUG settings
         os.environ.pop('USE_FUG_EMB', None)
+        
+    elif hasattr(args, 'use_tsgfm') and args.use_tsgfm:
+        print(f"Using TSGFM datasets for graph classification")
+        # Clear other embedding settings
+        os.environ.pop('USE_FUG_EMB', None)
+        os.environ.pop('TAG_DATASET_ROOT', None)
+        
+    else:
+        print(f"Using standard TU datasets for graph classification")
+        # Clear all special embedding settings
+        os.environ.pop('USE_FUG_EMB', None)
+        os.environ.pop('TAG_DATASET_ROOT', None)
 
 
 def process_datasets_for_models(datasets, processed_data_list, args, device, test_datasets=False):
@@ -220,6 +246,13 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
     final_num_features = args.hidden
     
     for dataset, dataset_info in zip(datasets, processed_data_list):
+        # Check if this is a TSGFM dataset - if so, disable PCA caching
+        is_tsgfm_dataset = hasattr(args, 'use_tsgfm') and args.use_tsgfm and not (hasattr(args, 'use_ogb_fug') and args.use_ogb_fug) and not (hasattr(args, 'use_tag_dataset') and args.use_tag_dataset)
+        use_pca_cache_for_dataset = args.use_pca_cache and not is_tsgfm_dataset
+        
+        if is_tsgfm_dataset:
+            print(f"TSGFM dataset detected ({getattr(dataset, 'name', 'unknown')}): PCA caching disabled")
+        
         # Process features using PCA and padding
         if test_datasets:
             processing_info = process_graph_features(
@@ -229,9 +262,9 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 args.padding_strategy, args.use_batchnorm,
                 pca_device=args.pca_device, incremental_pca_batch_size=args.incremental_pca_batch_size,
                 pca_sample_threshold=500000,  # Default threshold for sampled PCA
-                processed_data=dataset_info,  # Pass FUG mapping info
+                processed_data=dataset_info,  # Pass embedding mapping info (FUG/TSGFM/TAGDataset)
                 pcba_context_only_pca=False,  # Use full optimization for test datasets
-                use_pca_cache=args.use_pca_cache, pca_cache_dir=args.pca_cache_dir,
+                use_pca_cache=use_pca_cache_for_dataset, pca_cache_dir=args.pca_cache_dir,
                 dataset_name=getattr(dataset, 'name', None)
             )
         else:
@@ -242,9 +275,9 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 args.padding_strategy, args.use_batchnorm,
                 pca_device=args.pca_device, incremental_pca_batch_size=args.incremental_pca_batch_size,
                 pca_sample_threshold=500000,  # Default threshold for sampled PCA
-                processed_data=dataset_info,  # Pass FUG mapping info
+                processed_data=dataset_info,  # Pass embedding mapping info (FUG/TSGFM/TAGDataset)
                 pcba_context_only_pca=False,  # Use full optimization for training datasets
-                use_pca_cache=args.use_pca_cache, pca_cache_dir=args.pca_cache_dir,
+                use_pca_cache=use_pca_cache_for_dataset, pca_cache_dir=args.pca_cache_dir,
                 dataset_name=getattr(dataset, 'name', None)
             )
         
@@ -479,8 +512,8 @@ def load_and_preprocess_data(args, device):
     if args.enable_gc:
         print("Loading graph classification datasets...")
         
-        # Setup FUG environment BEFORE loading datasets
-        setup_fug_environment(args)
+        # Setup graph dataset environment BEFORE loading datasets
+        setup_graph_dataset_environment(args)
         
         gc_train_datasets = args.gc_train_dataset.split(',')
         gc_test_datasets = args.gc_test_dataset.split(',')
@@ -519,17 +552,14 @@ def load_and_preprocess_data(args, device):
             # Precompute task-filtered splits once for efficiency
             print("Precomputing task-filtered splits for test datasets...")
             for dataset_info in gc_test_processed_data_list:
-                # Precompute both full splits and test-only splits
-                task_filtered_splits_full = create_task_filtered_datasets(
-                    dataset_info['dataset'], 
-                    dataset_info['split_idx']
-                )
+                # For test datasets, only filter the test split (no need to filter train/val)
                 task_filtered_splits_test = create_task_filtered_datasets(
                     dataset_info['dataset'], 
                     dataset_info['split_idx'],
                     "test"
                 )
-                dataset_info['task_filtered_splits'] = task_filtered_splits_full
+                # For test datasets, both references point to the same test-only filtered data
+                dataset_info['task_filtered_splits'] = task_filtered_splits_test
                 dataset_info['task_filtered_splits_test_only'] = task_filtered_splits_test
     else:
         print("Graph classification task disabled, skipping dataset loading...")
@@ -658,8 +688,10 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
             
             # Train on each task separately using prefiltered data
             for task_idx, task_splits in task_filtered_splits.items():
-                # Check if FUG mapping is present to use index tracking
-                use_fug_tracking = 'fug_mapping' in dataset_info
+                # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
+                use_index_tracking = ('fug_mapping' in dataset_info or 
+                                    'tsgfm_mapping' in dataset_info or 
+                                    'tag_mapping' in dataset_info)
                 
                 # Create task-specific data loaders
                 task_data_loaders = create_data_loaders(
@@ -668,7 +700,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     batch_size=args.gc_batch_size,
                     shuffle=True,
                     task_idx=task_idx,
-                    use_index_tracking=use_fug_tracking
+                    use_index_tracking=use_index_tracking
                 )
                 
                 # Train on this specific task
@@ -872,8 +904,10 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                 task_results = []
                 
                 for task_idx, task_splits in task_filtered_splits.items():
-                    # Check if FUG mapping is present to use index tracking
-                    use_fug_tracking = 'fug_mapping' in dataset_info
+                    # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
+                    use_index_tracking = ('fug_mapping' in dataset_info or 
+                                        'tsgfm_mapping' in dataset_info or 
+                                        'tag_mapping' in dataset_info)
                     
                     # Create task-specific data loaders for evaluation
                     if split == 'test':
@@ -885,7 +919,7 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             batch_size=args.gc_test_batch_size,
                             shuffle=False,
                             task_idx=task_idx,
-                            use_index_tracking=use_fug_tracking
+                            use_index_tracking=use_index_tracking
                         )
                     else:
                         # Use all splits for seen datasets
@@ -895,7 +929,7 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             batch_size=args.gc_test_batch_size,
                             shuffle=False,
                             task_idx=task_idx,
-                            use_index_tracking=use_fug_tracking
+                            use_index_tracking=use_index_tracking
                         )
                     
                     # Evaluate this specific task

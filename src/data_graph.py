@@ -1736,7 +1736,8 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             # Apply padding to reach projection_small_dim
             if pca_features.size(1) < projection_small_dim:
                 padding_size = projection_small_dim - pca_features.size(1)
-                padding = torch.zeros(pca_features.size(0), padding_size, device=device)
+                # Keep padding on the same device as pca_features
+                padding = torch.zeros(pca_features.size(0), padding_size, device=pca_features.device)
                 processed_features = torch.cat([pca_features, padding], dim=1)
                 print(f"Applied zero padding ({pca_features.size(1)} -> {projection_small_dim})")
             else:
@@ -1773,14 +1774,16 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
                 padding_size = hidden_dim - pca_features.size(1)
                 
                 if padding_strategy == 'zero':
-                    padding = torch.zeros(pca_features.size(0), padding_size, device=device)
+                    # Keep padding on the same device as pca_features
+                    padding = torch.zeros(pca_features.size(0), padding_size, device=pca_features.device)
                     processed_features = torch.cat([pca_features, padding], dim=1)
                     
                 elif padding_strategy == 'random':
                     # Random padding from same distribution as real features
+                    # Keep padding on the same device as pca_features
                     real_std = pca_features.std(dim=0, keepdim=True)
                     real_mean = pca_features.mean(dim=0, keepdim=True)
-                    random_padding = torch.randn(pca_features.size(0), padding_size, device=device) * real_std.mean() + real_mean.mean()
+                    random_padding = torch.randn(pca_features.size(0), padding_size, device=pca_features.device) * real_std.mean() + real_mean.mean()
                     processed_features = torch.cat([pca_features, random_padding], dim=1)
                     
                 elif padding_strategy == 'repeat':
