@@ -177,7 +177,7 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
         print(f"  Original model: {args.model} -> Checkpoint model: {checkpoint_args['model']}")
         print(f"  Original predictor: {args.predictor} -> Checkpoint predictor: {checkpoint_args['predictor']}")
     
-    # Override key model architecture parameters
+    # Override key model architecture parameters (with fallback for missing keys)
     args.hidden = checkpoint_args['hidden']
     args.num_layers = checkpoint_args['num_layers']
     args.transformer_layers = checkpoint_args['transformer_layers']
@@ -188,13 +188,9 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
     args.dp = checkpoint_args['dp']
     args.norm = checkpoint_args['norm']
     args.seperate = checkpoint_args['seperate']
-    args.degree = checkpoint_args['degree']
     args.padding = checkpoint_args['padding']
     args.sim = checkpoint_args['sim']
-    args.att_pool = checkpoint_args['att_pool']
-    args.mlp_pool = checkpoint_args['mlp_pool']
     args.normalize_class_h = checkpoint_args['normalize_class_h']
-    args.use_projector = checkpoint_args['use_projector']
     args.min_pca_dim = checkpoint_args['min_pca_dim']
     args.use_identity_projection = checkpoint_args['use_identity_projection']
     args.projection_small_dim = checkpoint_args['projection_small_dim']

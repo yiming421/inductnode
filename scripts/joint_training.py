@@ -982,7 +982,7 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                             model, predictor, data, link_data_all[split_key], context_data,
                             args.test_batch_size, None, None, None, identity_projection,
                             0, True, degree=False, k_values=[20, 50, 100], 
-                            use_full_adj_for_test=(split == 'test')
+                            use_full_adj_for_test=True
                         )
                         
                         # Move all data back to CPU to free GPU memory
