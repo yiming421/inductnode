@@ -327,13 +327,14 @@ def parse_joint_training_args():
     parser.add_argument('--context_graph_num', type=int, default=16, help='Number of context graphs for graph classification')
     
     # === OGB FUG embeddings arguments (for graph classification) ===
-    parser.add_argument('--use_ogb_fug', type=str2bool, default=False,
+    parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
                         help='Use OGB datasets with FUG embeddings (replaces node features with FUG molecular embeddings)')
     parser.add_argument('--fug_root', type=str, default='./fug',
                         help='Root directory for FUG embeddings')
     parser.add_argument('--ogb_root', type=str, default='./dataset/ogb',
                         help='Root directory for OGB datasets')
     
+
     # === TSGFM datasets arguments (for graph classification) ===
     parser.add_argument('--use_tsgfm', type=str2bool, default=False,
                         help='Use TSGFM datasets for graph classification (batched format with text features)')
@@ -343,6 +344,18 @@ def parse_joint_training_args():
                         help='Root directory for TAGDataset datasets')
     parser.add_argument('--embedding_family', type=str, default='e5',
                         help='Embedding family to use for graph classification (e.g., e5, st)')
+    
+    # === Dataset-Specific Context Shot Selection ===
+    parser.add_argument('--nc_context_overrides', type=str, default=None,
+                       help='Per-dataset context overrides for NC: "dataset1:shots1,dataset2:shots2"')
+    parser.add_argument('--lp_context_overrides', type=str, default=None, 
+                       help='Per-dataset context overrides for LP: "dataset1:shots1,dataset2:shots2"')
+    parser.add_argument('--gc_context_overrides', type=str, default=None,
+                       help='Per-dataset context overrides for GC: "dataset1:shots1,dataset2:shots2"')
+    
+    # === Dynamic Context Refresh ===
+    parser.add_argument('--context_refresh_interval', type=int, default=0,
+                       help='Refresh contexts every N epochs (0 = never refresh)')
     
     # === Joint Multi-Task Training (TSGFM-style) ===
 # Removed joint multitask arguments - only using task-specific and full batch training

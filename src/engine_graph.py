@@ -725,8 +725,6 @@ def train_graph_classification_full_batch(model, predictor, train_dataset_info, 
             optimizer.step()
             dataset_loss += accumulated_loss.item()
             dataset_batches += 1
-        
-        torch.cuda.empty_cache()
     
     return dataset_loss / dataset_batches if dataset_batches > 0 else 0.0
 
@@ -1136,7 +1134,6 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         total_loss += loss.item()
         num_batches += 1
         print(f"\rTraining batch {batch_idx+1}/{total_batches} completed (loss: {loss.item():.4f})", end="", flush=True)
-        torch.cuda.empty_cache()
     
     print(f"\nTraining completed: {num_batches} batches, avg loss: {total_loss/num_batches if num_batches > 0 else 0.0:.4f}")
     return total_loss / num_batches if num_batches > 0 else 0.0
@@ -1781,9 +1778,5 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
     print(f"Training completed. Best validation metric: {best_val_acc:.4f} at epoch {best_epoch}")
     print(f"Final GPU memory usage: {final_gpu_mem['allocated']:.2f}GB allocated, "
           f"{final_gpu_mem['max_allocated']:.2f}GB peak")
-    
-    # Memory cleanup
-    torch.cuda.empty_cache()
-    gc.collect()
     
     return best_results

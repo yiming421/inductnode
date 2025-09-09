@@ -69,10 +69,6 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         # Extract target embeddings for this batch
         target_h = h[train_perm_idx]
         
-        # Immediately delete the large tensor to free memory
-        del h
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        
         # Fix type safety by properly handling None values
         class_h = process_node_features(
             context_h, data, 
@@ -123,10 +119,6 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         
         # Memory cleanup after optimization step
         total_loss += loss.item()
-        del context_h, target_h, class_h, score, label, loss, nll_loss, orthogonal_loss
-        if 'x_input' in locals() and x_input is not data.x:
-            del x_input
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
     en = time.time()
     if rank == 0:

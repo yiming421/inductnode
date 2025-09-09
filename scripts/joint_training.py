@@ -25,7 +25,7 @@ from src.model import PureGCN_v1, PureGCN, PFNPredictorNodeCls, GCN, IdentityPro
 from src.data import load_all_data, load_all_data_train
 from src.data_link import load_all_data_link
 from src.data_graph import load_all_graph_datasets, process_graph_features, create_data_loaders, create_task_filtered_datasets
-from src.data_utils import process_data, prepare_link_data, select_link_context, process_link_data
+from src.data_utils import process_data, prepare_link_data, select_link_context, process_link_data, select_k_shot_context
 from src.engine import train_all, test_all, test_all_induct  # Node classification engines
 from src.engine_link_pred import train_link_prediction, evaluate_link_prediction  # Link prediction engines
 from src.engine_graph import (
@@ -47,6 +47,7 @@ from transformers import get_cosine_schedule_with_warmup
 from src.logger import TrainingLogger, LogLevel
 
 from src.config import parse_joint_training_args
+from src.checkpoint_utils import load_checkpoint_config, override_args_from_checkpoint, load_checkpoint_states, save_checkpoint
 
 
 # Memory and time tracking utilities for Link Prediction
@@ -196,6 +197,153 @@ class LinkPredictionTracker:
 
 # Global tracker instance
 lp_tracker = None
+
+
+def parse_context_overrides(override_string):
+    """
+    Parse "dataset1:shots1,dataset2:shots2" into dict.
+    
+    Args:
+        override_string (str): String in format "dataset1:shots1,dataset2:shots2"
+        
+    Returns:
+        dict: Mapping from dataset name to context shots
+    """
+    if not override_string:
+        return {}
+    
+    overrides = {}
+    for pair in override_string.split(','):
+        if ':' in pair:
+            dataset, shots = pair.strip().split(':')
+            overrides[dataset.strip()] = int(shots.strip())
+    return overrides
+
+
+def resolve_context_shots(dataset_name, task_type, args):
+    """
+    Resolve context shots for a specific dataset and task.
+    Falls back to global defaults if no override specified.
+    
+    Args:
+        dataset_name (str): Name of the dataset
+        task_type (str): Task type ('nc', 'lp', 'gc')
+        args: Parsed command line arguments
+        
+    Returns:
+        int: Number of context shots to use for this dataset
+    """
+    # Get override mapping for this task type
+    override_attr = f'{task_type}_context_overrides'
+    override_string = getattr(args, override_attr, None)
+    override_map = parse_context_overrides(override_string)
+    
+    # Return override if exists, else global default
+    if dataset_name in override_map:
+        print(f"[Context Override] {task_type.upper()} dataset '{dataset_name}': using {override_map[dataset_name]} context shots")
+        return override_map[dataset_name]
+    
+    # Fallback to global defaults
+    defaults = {
+        'nc': args.context_num,
+        'lp': args.context_k, 
+        'gc': args.context_graph_num
+    }
+    return defaults[task_type]
+
+
+def refresh_nc_contexts(nc_data):
+    """Refresh node classification context samples"""
+    if nc_data[0] is None:
+        return
+    
+    nc_data_list, nc_split_idx_list = nc_data
+    print("  🔄 Refreshing NC contexts...")
+    
+    for data, split_idx in zip(nc_data_list, nc_split_idx_list):
+        if hasattr(data, 'context_sample'):
+            # Get current context size
+            current_context_size = len(data.context_sample) // len(data.y.unique())
+            
+            # Resample context
+            new_context_sample = select_k_shot_context(data, current_context_size, split_idx['train'])
+            data.context_sample = new_context_sample.to(data.context_sample.device)
+            print(f"    ✓ Refreshed {data.name}: {len(new_context_sample)} context samples")
+
+
+def refresh_lp_contexts(lp_data, args):
+    """Refresh link prediction context samples"""
+    if lp_data[0] is None:
+        return
+    
+    lp_data_list, lp_split_idx_list, lp_context_data, lp_masks, lp_link_data_all = lp_data
+    print("  🔄 Refreshing LP contexts...")
+    
+    # Refresh context for each dataset
+    for i, (data, split_idx) in enumerate(zip(lp_data_list, lp_split_idx_list)):
+        context_shots = resolve_context_shots(data.name, 'lp', args)
+        
+        # Regenerate context
+        link_data = lp_link_data_all[i]
+        if 'train' in link_data and link_data['train']['edge_pairs'].size(0) > 0:
+            new_context_data, new_train_mask = select_link_context(
+                link_data['train'], context_shots, args.context_neg_ratio,
+                args.remove_context_from_train
+            )
+            
+            # Update stored context data
+            lp_context_data[i] = new_context_data
+            lp_masks[i] = new_train_mask
+            print(f"    ✓ Refreshed {data.name}: {context_shots} context shots")
+
+
+def refresh_gc_contexts(gc_data, args):
+    """Refresh graph classification context samples"""
+    if len(gc_data[0]) == 0:
+        return
+    
+    gc_data_list, gc_processed_data_list = gc_data
+    print("  🔄 Refreshing GC contexts...")
+    
+    # For graph classification, we need to regenerate task-filtered datasets
+    # This is more complex as it involves resampling from the original datasets
+    for dataset_info in gc_processed_data_list:
+        if 'dataset' in dataset_info:
+            # Regenerate task-filtered splits with new random sampling
+            task_filtered_splits = create_task_filtered_datasets(
+                dataset_info['dataset'], 
+                dataset_info['split_idx']
+            )
+            dataset_info['task_filtered_splits'] = task_filtered_splits
+            
+            dataset_name = dataset_info['dataset'].name if hasattr(dataset_info['dataset'], 'name') else 'GC dataset'
+            print(f"    ✓ Refreshed {dataset_name}: context samples regenerated")
+
+
+def refresh_contexts_if_needed(epoch, args, data_dict):
+    """Refresh contexts for all tasks if needed based on interval"""
+    
+    # Check if refresh is enabled and if it's time to refresh
+    if args.context_refresh_interval <= 0 or epoch % args.context_refresh_interval != 0:
+        return
+    
+    print(f"\n🔄 Refreshing contexts at epoch {epoch} (interval: {args.context_refresh_interval})")
+    
+    # Set different seed for each refresh to ensure diversity
+    refresh_seed = args.seed + epoch // args.context_refresh_interval
+    torch.manual_seed(refresh_seed)
+    
+    # Refresh each task
+    if getattr(args, 'enable_nc', True) and data_dict['nc_train'][0] is not None:
+        refresh_nc_contexts(data_dict['nc_train'])
+        
+    if getattr(args, 'enable_lp', True) and data_dict['lp_train'][0] is not None:
+        refresh_lp_contexts(data_dict['lp_train'], args)
+        
+    if getattr(args, 'enable_gc', True) and len(data_dict['gc_train'][0]) > 0:
+        refresh_gc_contexts(data_dict['gc_train'], args)
+    
+    print("  ✅ Context refresh completed\n")
 
 
 def setup_graph_dataset_environment(args):
@@ -369,7 +517,9 @@ def load_and_preprocess_data(args, device):
             data.x = data.x.to(device)
             data.adj_t = data.adj_t.to(device)
             data.y = data.y.to(device)
-            process_data(data, split_idx, args.hidden, args.context_num, False, args.use_full_pca, 
+            # Resolve context shots for this specific dataset
+            context_shots = resolve_context_shots(data.name, 'nc', args)
+            process_data(data, split_idx, args.hidden, context_shots, False, args.use_full_pca, 
                         args.normalize_data, False, 32, 0, args.padding_strategy, 
                         args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
                         args.incremental_pca_batch_size)
@@ -436,14 +586,13 @@ def load_and_preprocess_data(args, device):
                 
                 print(f"[MEMORY_FIX] Moved {data.name} processed features back to CPU")
                 
-                # Clean GPU memory after PCA
-                torch.cuda.empty_cache()
-                
                 # Prepare link data and select context
                 link_data = prepare_link_data(data, split_idx)
             
             with lp_tracker.time_operation('context_selection'):
-                context_data, train_mask = select_link_context(link_data['train'], args.context_k, args.context_neg_ratio,
+                # Resolve context shots for this specific dataset
+                context_shots = resolve_context_shots(data.name, 'lp', args)
+                context_data, train_mask = select_link_context(link_data['train'], context_shots, args.context_neg_ratio,
                                                                args.remove_context_from_train)
             
             lp_train_context_data.append(context_data)
@@ -490,14 +639,13 @@ def load_and_preprocess_data(args, device):
                 
                 print(f"[MEMORY_FIX] Moved {data.name} processed features back to CPU")
                 
-                # Clean GPU memory after PCA
-                torch.cuda.empty_cache()
-                
                 # Prepare link data and select context
                 link_data = prepare_link_data(data, split_idx)
             
             with lp_tracker.time_operation('context_selection'):
-                context_data, _ = select_link_context(link_data['train'], args.context_k, args.context_neg_ratio, False)
+                # Resolve context shots for this specific dataset
+                context_shots = resolve_context_shots(data.name, 'lp', args)
+                context_data, _ = select_link_context(link_data['train'], context_shots, args.context_neg_ratio, False)
             
             lp_test_context_data.append(context_data)
             lp_test_link_data_all.append(link_data)
@@ -539,9 +687,19 @@ def load_and_preprocess_data(args, device):
                 dataset_info['task_filtered_splits'] = task_filtered_splits
         
         # Load test data for graph classification
-        gc_test_data_list, gc_test_processed_data_list = load_all_graph_datasets(
-            gc_test_datasets, device, context_k=args.context_graph_num
-        )
+        # Handle per-dataset context resolution for GC test datasets
+        gc_test_data_list = []
+        gc_test_processed_data_list = []
+        for dataset_name in gc_test_datasets:
+            dataset_name = dataset_name.strip()
+            # Resolve context shots for this specific dataset
+            context_shots = resolve_context_shots(dataset_name, 'gc', args)
+            # Load each dataset individually with its specific context shots
+            single_data_list, single_processed_list = load_all_graph_datasets(
+                [dataset_name], device, context_k=context_shots
+            )
+            gc_test_data_list.extend(single_data_list)
+            gc_test_processed_data_list.extend(single_processed_list)
         
         # Process graph classification test data
         if len(gc_test_data_list) > 0:
@@ -656,12 +814,6 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                         data.x_pca = data.x_pca.cpu()
                     if hasattr(data, 'context_sample') and data.context_sample is not None:
                         data.context_sample = data.context_sample.cpu()
-                    
-                    # Force aggressive GPU cleanup
-                    import gc
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
                     
                     # Record memory after cleanup
                     lp_tracker.record_memory()
@@ -844,13 +996,7 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                             data.x_pca = data.x_pca.cpu()
                         if hasattr(data, 'context_sample') and data.context_sample is not None:
                             data.context_sample = data.context_sample.cpu()
-                        
-                        # Force aggressive GPU cleanup
-                        import gc
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                        
+
                         # Record memory after cleanup
                         lp_tracker.record_memory()
                         
@@ -1043,6 +1189,22 @@ def run_joint_training(args, device='cuda:0'):
     # Initialize wandb
     wandb.init(project='inductnode-joint', config=args)
     
+    # Check for checkpoint loading and override args if needed
+    checkpoint = None
+    if args.use_pretrained_model and args.load_checkpoint is not None:
+        print(f"Loading checkpoint from: {args.load_checkpoint}")
+        print("Extracting model configuration from checkpoint...")
+        
+        # Load checkpoint configuration
+        checkpoint_info, checkpoint = load_checkpoint_config(args.load_checkpoint)
+        
+        # Override current args with checkpoint's configuration
+        if 'args' in checkpoint:
+            checkpoint_args = checkpoint['args']
+            args = override_args_from_checkpoint(args, checkpoint_args, rank=0)
+        else:
+            print("Warning: No argument configuration found in checkpoint, using current arguments")
+    
     # Load and preprocess all data
     with lp_tracker.time_operation('data_preparation') if lp_tracker else nullcontext():
         data_dict = load_and_preprocess_data(args, device)
@@ -1086,6 +1248,74 @@ def run_joint_training(args, device='cuda:0'):
     
     print(f"Total parameters: {sum(p.numel() for p in parameters):,}")
     
+    # Load checkpoint states if checkpoint was provided
+    if checkpoint is not None:
+        print("Loading model states from checkpoint...")
+        best_epoch, best_valid, final_test = load_checkpoint_states(
+            checkpoint, model, predictor, optimizer, identity_projection=identity_projection,
+            scheduler=scheduler, rank=0
+        )
+        print(f"Checkpoint loaded - Best epoch: {best_epoch}, Best valid: {best_valid:.4f}, Final test: {final_test:.4f}")
+        
+        # If loading from checkpoint, skip training and go directly to final evaluation
+        if args.use_pretrained_model:
+            print("\n=== Skipping Training - Using Pretrained Model ===")
+            
+            # Final evaluation on test sets
+            print("\n=== Final Test Evaluation (From Checkpoint) ===")
+            
+            # Initialize empty results
+            nc_test_results = {}
+            lp_test_results = {}
+            gc_test_results = {}
+            
+            # Node Classification Test on unseen datasets
+            if getattr(args, 'enable_nc', True) and data_dict['nc_test'][0] is not None:
+                nc_test_results = evaluate_node_classification(
+                    model, predictor, data_dict['nc_test'], args, 'test', identity_projection
+                )
+            
+            # Link Prediction Test on unseen datasets
+            if getattr(args, 'enable_lp', True) and data_dict['lp_test'][0] is not None:
+                lp_test_results = evaluate_link_prediction_task(
+                    model, predictor, data_dict['lp_test'], args, 'test', identity_projection
+                )
+            
+            # Graph Classification Test on unseen datasets
+            if getattr(args, 'enable_gc', True) and len(data_dict['gc_test'][0]) > 0:
+                gc_test_results = evaluate_graph_classification_task(
+                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection
+                )
+            
+            # Print and log final results
+            nc_test_metric = nc_test_results.get('test', 0.0)
+            lp_test_metric = lp_test_results.get('test', 0.0)
+            gc_test_metric = gc_test_results.get('test', 0.0)
+            
+            final_results_msg = (f"Node Classification Test: {nc_test_metric:.4f}\n"
+                                f"Link Prediction Test: {lp_test_metric:.4f}\n"
+                                f"Graph Classification Test: {gc_test_metric:.4f}")
+            print(final_results_msg)
+            logger.info(final_results_msg, LogLevel.INFO)
+            
+            # Final wandb log
+            final_wandb_log = {
+                'test/nc_metric': nc_test_metric,
+                'test/lp_metric': lp_test_metric,
+                'test/gc_metric': gc_test_metric,
+                'test/combined_score': nc_test_metric + lp_test_metric + gc_test_metric,
+                'loaded_from_checkpoint': True,
+                'checkpoint_path': args.load_checkpoint
+            }
+            wandb.log(final_wandb_log)
+            
+            # Return results
+            nc_individual = nc_test_results.get('individual_test_metrics', [])
+            lp_individual = lp_test_results.get('individual_test_metrics', [])
+            gc_individual = gc_test_results.get('individual_test_metrics', [])
+            
+            return nc_test_metric, lp_test_metric, gc_test_metric, nc_individual, lp_individual, gc_individual
+    
     # Final memory checkpoint before training starts
     if lp_tracker:
         lp_tracker.record_memory()
@@ -1107,6 +1337,9 @@ def run_joint_training(args, device='cuda:0'):
     
     for epoch in range(args.epochs):
         start_time = time.time()
+        
+        # Refresh contexts if needed
+        refresh_contexts_if_needed(epoch, args, data_dict)
         
         # Joint training step
         train_results = joint_training_step(
@@ -1325,6 +1558,37 @@ def run_joint_training(args, device='cuda:0'):
     
     wandb.log(final_wandb_log)
     
+    # Save checkpoint after training completion
+    if args.save_checkpoint and checkpoint is None:  # Only save if we didn't load from checkpoint
+        print("\n=== Saving Final Checkpoint ===")
+        
+        # Prepare best metrics for checkpoint
+        best_metrics = {
+            'train_metric': 0.0,  # Not tracked in joint training currently
+            'valid_metric': best_valid_score,
+            'test_metric': nc_test_metric + lp_test_metric + gc_test_metric,
+            'nc_test_metric': nc_test_metric,
+            'lp_test_metric': lp_test_metric,
+            'gc_test_metric': gc_test_metric,
+            'best_valid': best_valid_score,
+            'final_test': nc_test_metric + lp_test_metric + gc_test_metric
+        }
+        
+        # Save the final checkpoint
+        checkpoint_path = save_checkpoint(
+            model, predictor, optimizer,  # Include optimizer state
+            args, best_metrics, best_epoch,
+            identity_projection=identity_projection, rank=0
+        )
+        
+        # Update wandb log with checkpoint path
+        wandb.log({'checkpoint_path': checkpoint_path})
+        print(f"✅ Final checkpoint saved to: {checkpoint_path}")
+        
+    elif args.save_checkpoint and checkpoint is not None:
+        print("ℹ️  Skipping checkpoint save since model was loaded from checkpoint")
+        print(f"   Original checkpoint: {args.load_checkpoint}")
+    
     # Return both average metrics and individual dataset metrics
     nc_individual = nc_test_results.get('individual_test_metrics', [])
     lp_individual = lp_test_results.get('individual_test_metrics', [])
@@ -1345,6 +1609,19 @@ def main():
     
     # Parse arguments
     args = parse_joint_training_args()
+    
+    # Validate checkpoint arguments
+    if args.use_pretrained_model and args.load_checkpoint is None:
+        print("Error: Must provide --load_checkpoint when --use_pretrained_model is True.")
+        sys.exit(1)
+    
+    if args.load_checkpoint is not None and not os.path.exists(args.load_checkpoint):
+        print(f"Error: Checkpoint file does not exist: {args.load_checkpoint}")
+        sys.exit(1)
+    
+    if args.load_checkpoint is not None:
+        print(f"✓ Checkpoint validation passed: {args.load_checkpoint}")
+        print(f"✓ Use pretrained model: {args.use_pretrained_model}")
     
     # GPU setup
     try:

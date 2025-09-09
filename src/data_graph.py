@@ -1504,11 +1504,6 @@ def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pc
         else:
             U, S, V = torch.pca_lowrank(pca_data, q=target_dim)
         
-        # Free PCA data GPU memory immediately
-        if target_device is not None:
-            del pca_data
-            torch.cuda.empty_cache()
-        
         # Step 3: Apply transformation to ALL data (always in batches for consistency)
         batch_size = 500000
         num_batches = (n_samples + batch_size - 1) // batch_size
@@ -1542,10 +1537,6 @@ def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pc
             
             # Synchronize once at the end
             torch.cuda.synchronize()
-            
-            # Clean up GPU memory
-            del V_gpu, U, S, V
-            torch.cuda.empty_cache()
         
         # Sign normalization (compute on a sample for efficiency)
         if sign_normalize:
