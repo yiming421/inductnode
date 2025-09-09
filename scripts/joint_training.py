@@ -476,10 +476,13 @@ def create_unified_model(args, input_dim, device):
     return model, predictor, identity_projection
 
 
-def load_and_preprocess_data(args, device):
+def load_and_preprocess_data(args, device, skip_training_data=False):
     """
     Load and preprocess data for enabled tasks.
     Returns processed datasets for node classification, link prediction, and graph classification.
+    
+    Args:
+        skip_training_data: If True, skip loading training datasets (for pretrained model evaluation)
     """
     global lp_tracker
     
@@ -494,20 +497,23 @@ def load_and_preprocess_data(args, device):
         nc_train_datasets = args.nc_train_dataset.split(',')
         nc_test_datasets = args.nc_test_dataset.split(',')
         
-        # Load training data for node classification
-        nc_train_data_list, nc_train_split_idx_list = load_all_data_train(nc_train_datasets)
-        
-        # Process node classification training data
-        for data, split_idx in zip(nc_train_data_list, nc_train_split_idx_list):
-            data.x = data.x.to(device)
-            data.adj_t = data.adj_t.to(device)
-            data.y = data.y.to(device)
-            # Apply node classification specific preprocessing
+        # Load training data for node classification (skip if using pretrained model)
+        if not skip_training_data:
+            nc_train_data_list, nc_train_split_idx_list = load_all_data_train(nc_train_datasets)
+            
+            # Process node classification training data
+            for data, split_idx in zip(nc_train_data_list, nc_train_split_idx_list):
+                data.x = data.x.to(device)
+                data.adj_t = data.adj_t.to(device)
+                data.y = data.y.to(device)
+                # Apply node classification specific preprocessing
 
-            process_data(data, split_idx, args.hidden, args.context_num, False, args.use_full_pca, 
-                        args.normalize_data, False, 32, 0, args.padding_strategy, 
-                        args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
-                        args.incremental_pca_batch_size)
+                process_data(data, split_idx, args.hidden, args.context_num, False, args.use_full_pca, 
+                            args.normalize_data, False, 32, 0, args.padding_strategy, 
+                            args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                            args.incremental_pca_batch_size)
+        else:
+            print("  Skipping NC training data loading (using pretrained model)")
 
         # Load test data for node classification
         nc_test_data_list, nc_test_split_idx_list = load_all_data(nc_test_datasets)
@@ -547,23 +553,28 @@ def load_and_preprocess_data(args, device):
         before_lp_data = lp_tracker.get_memory_stats()
         print(f"[LP_TRACKER] Before LP Data Loading - GPU: {before_lp_data['gpu_allocated']:.2f}GB, CPU: {before_lp_data['cpu_memory']:.2f}GB")
         
-        # Load training data for link prediction (keep on CPU to save GPU memory)
-        with lp_tracker.time_operation('data_preparation'):
-            lp_train_data_list, lp_train_split_idx_list = load_all_data_link(lp_train_datasets, device='cpu')
-            print(f"[MEMORY_FIX] Loaded {len(lp_train_data_list)} training datasets on CPU (was loading to GPU before!)")
+        # Load training data for link prediction (skip if using pretrained model)
+        if not skip_training_data:
+            with lp_tracker.time_operation('data_preparation'):
+                lp_train_data_list, lp_train_split_idx_list = load_all_data_link(lp_train_datasets, device='cpu')
+                print(f"[MEMORY_FIX] Loaded {len(lp_train_data_list)} training datasets on CPU (was loading to GPU before!)")
+        else:
+            lp_train_data_list, lp_train_split_idx_list = [], []
+            print("  Skipping LP training data loading (using pretrained model)")
         
         # Record memory after loading link prediction data
         lp_tracker.record_memory() 
         after_lp_data = lp_tracker.get_memory_stats()
         print(f"[LP_TRACKER] After LP Data Loading - GPU: {after_lp_data['gpu_allocated']:.2f}GB, CPU: {after_lp_data['cpu_memory']:.2f}GB")
         
-        # Process link prediction training data
+        # Process link prediction training data (skip if using pretrained model)
         lp_train_context_data = []
         lp_train_masks = []
         lp_train_link_data_all = []
         
-        for i, (data, split_idx) in enumerate(zip(lp_train_data_list, lp_train_split_idx_list)):
-            with lp_tracker.time_operation('data_preparation'):
+        if not skip_training_data:
+            for i, (data, split_idx) in enumerate(zip(lp_train_data_list, lp_train_split_idx_list)):
+                with lp_tracker.time_operation('data_preparation'):
                 # Move data.x to GPU temporarily for fast PCA computation
                 original_x_device = data.x.device
                 if data.x.device.type == 'cpu':
@@ -595,10 +606,12 @@ def load_and_preprocess_data(args, device):
                 context_data, train_mask = select_link_context(link_data['train'], context_shots, args.context_neg_ratio,
                                                                args.remove_context_from_train)
             
-            lp_train_context_data.append(context_data)
-            lp_train_masks.append(train_mask)
-            lp_train_link_data_all.append(link_data)
-            lp_tracker.operation_counts['datasets_processed'] += 1
+                lp_train_context_data.append(context_data)
+                lp_train_masks.append(train_mask)
+                lp_train_link_data_all.append(link_data)
+                lp_tracker.operation_counts['datasets_processed'] += 1
+        else:
+            print("  Skipping LP training data processing (using pretrained model)")
         
         # Record memory after processing all link prediction training data
         lp_tracker.record_memory()
@@ -666,25 +679,29 @@ def load_and_preprocess_data(args, device):
         gc_train_datasets = args.gc_train_dataset.split(',')
         gc_test_datasets = args.gc_test_dataset.split(',')
         
-        # Load training data for graph classification
-        gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets(
-            gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num
-        )
-        
-        # Process graph classification training data
-        if len(gc_train_data_list) > 0:
-            gc_train_data_list, gc_train_processed_data_list, _ = process_datasets_for_models(
-                gc_train_data_list, gc_train_processed_data_list, args, device
+        # Load training data for graph classification (skip if using pretrained model)
+        if not skip_training_data:
+            gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets(
+                gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num
             )
             
-            # Precompute task-filtered splits once for efficiency
-            print("Precomputing task-filtered splits for training datasets...")
-            for dataset_info in gc_train_processed_data_list:
-                task_filtered_splits = create_task_filtered_datasets(
-                    dataset_info['dataset'], 
-                    dataset_info['split_idx']
+            # Process graph classification training data
+            if len(gc_train_data_list) > 0:
+                gc_train_data_list, gc_train_processed_data_list, _ = process_datasets_for_models(
+                    gc_train_data_list, gc_train_processed_data_list, args, device
                 )
-                dataset_info['task_filtered_splits'] = task_filtered_splits
+                
+                # Precompute task-filtered splits once for efficiency
+                print("Precomputing task-filtered splits for training datasets...")
+                for dataset_info in gc_train_processed_data_list:
+                    task_filtered_splits = create_task_filtered_datasets(
+                        dataset_info['dataset'], 
+                        dataset_info['split_idx']
+                    )
+                    dataset_info['task_filtered_splits'] = task_filtered_splits
+        else:
+            gc_train_data_list, gc_train_processed_data_list = [], []
+            print("  Skipping GC training data loading (using pretrained model)")
         
         # Load test data for graph classification
         # Handle per-dataset context resolution for GC test datasets
@@ -1205,9 +1222,9 @@ def run_joint_training(args, device='cuda:0'):
         else:
             print("Warning: No argument configuration found in checkpoint, using current arguments")
     
-    # Load and preprocess all data
+    # Load and preprocess data (skip training data if using pretrained model)
     with lp_tracker.time_operation('data_preparation') if lp_tracker else nullcontext():
-        data_dict = load_and_preprocess_data(args, device)
+        data_dict = load_and_preprocess_data(args, device, skip_training_data=args.use_pretrained_model)
     
     if lp_tracker:
         lp_tracker.record_memory()
@@ -1706,6 +1723,26 @@ def main():
     if getattr(args, 'enable_gc', True):
         sweep_metric += avg_gc
     print(f"Combined Score: {sweep_metric:.4f}")
+    
+    # Print individual dataset results
+    if avg_nc_individual:
+        print(f"\nNode Classification Individual Results:")
+        nc_test_datasets = args.nc_test_dataset.split(',')
+        for dataset_name, metric in zip(nc_test_datasets, avg_nc_individual):
+            print(f"  {dataset_name.strip()}: {metric:.4f}")
+    
+    if avg_lp_individual:
+        print(f"\nLink Prediction Individual Results:")
+        lp_test_datasets = args.lp_test_dataset.split(',')
+        for dataset_name, metric in zip(lp_test_datasets, avg_lp_individual):
+            print(f"  {dataset_name.strip()}: {metric:.4f}")
+    
+    if avg_gc_individual:
+        print(f"\nGraph Classification Individual Results:")
+        gc_test_datasets = args.gc_test_dataset.split(',')
+        for dataset_name, metric in zip(gc_test_datasets, avg_gc_individual):
+            metric_str = format_metric_results(metric) if isinstance(metric, dict) else f"{metric:.4f}"
+            print(f"  {dataset_name.strip()}: {metric_str}")
     
     # Get dataset names
     nc_test_datasets = args.nc_test_dataset.split(',') if getattr(args, 'enable_nc', True) and hasattr(args, 'nc_test_dataset') else []

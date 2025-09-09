@@ -191,7 +191,6 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
     args.padding = checkpoint_args['padding']
     args.sim = checkpoint_args['sim']
     args.normalize_class_h = checkpoint_args['normalize_class_h']
-    args.min_pca_dim = checkpoint_args['min_pca_dim']
     args.use_identity_projection = checkpoint_args['use_identity_projection']
     args.projection_small_dim = checkpoint_args['projection_small_dim']
     args.projection_large_dim = checkpoint_args['projection_large_dim']
