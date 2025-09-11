@@ -13,6 +13,62 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from .data_graph import create_graph_batch, create_task_filtered_datasets
 from .utils import process_node_features
 import numpy as np
+from torch.profiler import profile, record_function, ProfilerActivity
+
+def refresh_gc_context_if_needed(dataset_info, batch_idx, epoch, args, device='cuda', task_idx=None):
+    """
+    Refresh graph classification context if batch-level refresh is enabled.
+    
+    Args:
+        dataset_info (dict): Dataset information including context structure
+        batch_idx (int): Current batch index
+        epoch (int): Current epoch
+        args: Arguments containing refresh settings
+        device (str): Device for computation
+        task_idx (int, optional): Specific task to refresh. If None, refresh all tasks
+    """
+    # Check if batch refresh is enabled and it's time to refresh
+    if getattr(args, 'context_batch_refresh_interval', 0) <= 0:
+        return
+        
+    if batch_idx > 0 and batch_idx % args.context_batch_refresh_interval == 0:
+        # Refresh context for this dataset
+        refresh_seed = args.seed + epoch * 10000 + batch_idx
+        torch.manual_seed(refresh_seed)
+        
+        dataset = dataset_info['dataset']
+        dataset_name = getattr(dataset, 'name', 'unknown')
+        
+        # Refresh context_graphs structure
+        if 'context_graphs' in dataset_info:
+            refresh_gc_context_graphs(dataset_info, args, device, task_idx)
+            if task_idx is not None:
+                print(f"🔄 GC Dataset {dataset_name} context refreshed for task {task_idx} at batch {batch_idx}")
+            else:
+                print(f"🔄 GC Dataset {dataset_name} context refreshed (all tasks) at batch {batch_idx}")
+
+def refresh_gc_context_graphs(dataset_info, args, device):
+    """
+    Refresh context graphs structure by resampling context graphs for each task/class.
+    """
+    from .data_graph import prepare_graph_data_for_pfn
+    
+    if 'context_graphs' not in dataset_info:
+        return
+    
+    # Get context size from args
+    context_k = getattr(args, 'context_k', 5)
+    
+    # Use the same function that originally created the context structure
+    refreshed_data = prepare_graph_data_for_pfn(
+        dataset_info['dataset'], 
+        dataset_info['split_idx'], 
+        context_k, 
+        device
+    )
+    
+    # Update the context_graphs in the dataset_info
+    dataset_info['context_graphs'] = refreshed_data['context_graphs']
 
 def _get_node_embedding_table(dataset, task_idx, device, dataset_info=None):
     """
@@ -49,7 +105,6 @@ def _safe_lookup_node_embeddings_micro_optimized(node_emb_table: torch.Tensor, x
     Micro-transfer optimized version - eliminates thousands of GPU-CPU transfers.
     Same algorithm as original but with only 2 transfers total instead of 40,000+.
     """
-    import time
     import numpy as np
     
     # Case 4: FUG external mapping - handle original OGB features  
@@ -63,39 +118,29 @@ def _safe_lookup_node_embeddings_micro_optimized(node_emb_table: torch.Tensor, x
         fug_mapping = dataset_info['fug_mapping']
         node_mapping = fug_mapping['node_index_mapping']
         
-        # OPTIMIZATION 1: Single GPU->CPU transfer for entire batch data
-        batch_vector_cpu = batch_data.batch.cpu().numpy()  # Single transfer
-        original_indices_cpu = batch_data.original_graph_indices.cpu().numpy()  # Single transfer
+        # 1. Single GPU->CPU transfer for original graph indices
+        original_indices_cpu = batch_data.original_graph_indices.cpu()
+
+        # 2. Build the list of FUG index tensors. This happens on the CPU since the
+        #    source tensors in 'node_mapping' are on the CPU.
+        try:
+            indices_list = [node_mapping[g_idx.item()] for g_idx in original_indices_cpu]
+        except KeyError as e:
+            raise ValueError(f"[FUG] Original graph index {e.args[0]} not found.") from e
+
+        # 3. Concatenate into a single index tensor on the CPU.
+        all_fug_indices_cpu = torch.cat(indices_list)
+
+        # 4. Perform the SINGLE, vectorized embedding lookup on the CPU table.
+        processed_embeddings_cpu = node_emb_table[all_fug_indices_cpu]
         
-        embeddings_list = []
-        
-        # Process each graph in the batch (NO micro-transfers!)
-        for local_graph_idx, original_graph_idx in enumerate(original_indices_cpu):
-            original_graph_idx = int(original_graph_idx)  # Already CPU - no .item()!
-            
-            if original_graph_idx not in node_mapping:
-                raise ValueError(f"[FUG] Original graph {original_graph_idx} not found in node mapping")
-            
-            # Get nodes belonging to this graph (CPU operations only)
-            graph_node_mask = (batch_vector_cpu == local_graph_idx)
-            num_graph_nodes = int(np.sum(graph_node_mask))  # No .item()!
-            
-            # Get FUG embedding indices for this graph
-            fug_indices = node_mapping[original_graph_idx]  # CPU lookup
-            
-            if len(fug_indices) != num_graph_nodes:
-                raise ValueError(f"[FUG] Size mismatch: graph {original_graph_idx} has {len(fug_indices)} FUG indices but {num_graph_nodes} batch nodes")
-            
-            # CPU embedding lookup
-            graph_embeddings = node_emb_table[fug_indices]
-            embeddings_list.append(graph_embeddings)
-        
-        # Concatenate on CPU
-        processed_embeddings = torch.cat(embeddings_list, dim=0)
-        
-        # OPTIMIZATION 2: Single CPU->GPU transfer for final result  
+        # --- Optional Sanity Check ---
+        if processed_embeddings_cpu.shape[0] != x.shape[0]:
+             raise ValueError(f"[FUG] Size mismatch after mapping.")
+             
+        # 5. Transfer the final result to the GPU in one go.
         target_device = x.device if x.numel() > 0 else 'cuda'
-        result = processed_embeddings.to(target_device)
+        result = processed_embeddings_cpu.to(target_device)
         
         
         return result
@@ -423,148 +468,6 @@ def pool_graph_embeddings(node_embeddings, batch, pooling_method='mean'):
         raise ValueError(f"Unsupported pooling method: {pooling_method}")
 
 
-def create_context_embeddings(model, context_structure, dataset, task_idx=0, pooling_method='mean', device='cuda', identity_projection=None, dataset_info=None, context_k=None):
-    """
-    Create context embeddings from task-aware context structure.
-    Uses pre-computed embeddings if available, otherwise computes them.
-    
-    Args:
-        model: GNN model
-        context_structure (dict): Task-aware context {task_idx: {class: [graphs]}}
-        dataset: Dataset with embedding lookup tables (may have pre-computed embeddings)
-        task_idx (int): Specific task to get context for
-        pooling_method (str): Graph pooling method
-        device (str): Device for computation
-        context_k (int, optional): Number of context samples per class to use (for dynamic sampling)
-        
-    Returns:
-        tuple: (context_embeddings, context_labels)
-    """
-    # Check if dataset has pre-computed task-aware embeddings
-    if hasattr(dataset, 'has_precomputed_embeddings') and dataset.has_precomputed_embeddings:
-        if task_idx == 0 and context_k is not None:  # Log once at the start
-            print(f"[Dynamic Context] Using {context_k} samples per class from pre-computed pools")
-        return _create_context_embeddings_precomputed(dataset, task_idx, device, context_k)
-    
-    # Fallback to computing embeddings normally
-    return _create_context_embeddings_computed(model, context_structure, dataset, task_idx, 
-                                              pooling_method, device, identity_projection, dataset_info)
-
-
-def _create_context_embeddings_precomputed(dataset, task_idx, device, context_k=None):
-    """
-    Use pre-computed task-aware context embeddings with proper graph-level sampling.
-    
-    For graph classification, we need to sample graphs (not individual node embeddings),
-    then pool the node embeddings of each sampled graph to get graph-level embeddings.
-    
-    Args:
-        dataset: Dataset with pre-computed embeddings and task_context_structure
-        task_idx (int): Task index to get context for
-        device (str): Device for computation
-        context_k (int, optional): Number of graphs per class to sample (enables dynamic sampling)
-    
-    Returns:
-        tuple: (context_embeddings, context_labels)
-    """
-    if not hasattr(dataset, 'task_context_structure'):
-        # Fallback for datasets without proper task-aware structure
-        return torch.empty(0, 256, device=device), torch.empty(0, dtype=torch.long, device=device)
-    
-    # Get context structure for this task (graph indices by class)
-    if task_idx not in dataset.task_context_structure:
-        # Task has no context
-        return torch.empty(0, 256, device=device), torch.empty(0, dtype=torch.long, device=device)
-    
-    task_structure = dataset.task_context_structure[task_idx]  # {class_label: [graph_indices]}
-    
-    # Handle different embedding storage formats
-    if hasattr(dataset, 'node_embs') and dataset.node_embs is not None:
-        # Standard FUG mode - unified node embeddings
-        node_embs = dataset.node_embs.to(device)
-    elif hasattr(dataset, 'task_context_embeddings') and task_idx in dataset.task_context_embeddings:
-        # Task-aware mode - embeddings stored per task/class
-        node_embs = None  # Will access task-specific embeddings directly
-    else:
-        # No suitable embeddings available
-        return torch.empty(0, 256, device=device), torch.empty(0, dtype=torch.long, device=device)
-    
-    context_embeddings_list = []
-    context_labels_list = []
-    total_graphs_available = 0
-    total_graphs_used = 0
-    
-    for class_label, graph_indices in task_structure.items():
-        if not graph_indices:  # Skip empty classes
-            continue
-            
-        available_graphs = len(graph_indices)
-        total_graphs_available += available_graphs
-        
-        # Dynamic sampling: sample graphs (not node embeddings!)
-        if context_k is not None and context_k < available_graphs:
-            # Randomly sample context_k graphs from available graphs
-            sampled_graph_indices = np.random.choice(graph_indices, context_k, replace=False)
-            num_used = context_k
-        else:
-            # Use all available graphs
-            sampled_graph_indices = graph_indices
-            num_used = available_graphs
-        
-        # For each sampled graph, get its graph-level embedding by pooling its nodes
-        for graph_idx in sampled_graph_indices:
-            # Get the data for this graph
-            graph_data = dataset[graph_idx]
-            
-            # Get node embeddings for this graph based on embedding storage format
-            if node_embs is not None:
-                # Standard FUG mode - unified node embeddings
-                graph_node_embs = node_embs[graph_data.x]  # [num_nodes_in_graph, emb_dim]
-            else:
-                # Task-aware mode - get embeddings from task_context_embeddings
-                task_embeddings = dataset.task_context_embeddings[task_idx][class_label].to(device)
-                task_offsets = dataset.task_context_offsets[task_idx][class_label]
-                
-                # Find the offset for this graph
-                graph_start = None
-                graph_end = None
-                for gid, start, end in task_offsets:
-                    if gid == graph_idx:
-                        graph_start = start
-                        graph_end = end
-                        break
-                        
-                if graph_start is None:
-                    # Graph not found in offsets, skip
-                    continue
-                    
-                graph_node_embs = task_embeddings[graph_start:graph_end]  # [num_nodes_in_graph, emb_dim]
-            
-            # Pool to get graph-level embedding (using mean pooling like in graph classification)
-            graph_embedding = torch.mean(graph_node_embs, dim=0, keepdim=True)  # [1, emb_dim]
-            
-            context_embeddings_list.append(graph_embedding)
-            context_labels_list.append(int(class_label))
-        
-        total_graphs_used += num_used
-    
-    if context_embeddings_list:
-        context_embeddings = torch.cat(context_embeddings_list, dim=0)  # [num_sampled_graphs, emb_dim]
-        context_labels = torch.tensor(context_labels_list, dtype=torch.long, device=device)
-        
-        # Log sampling statistics for first task only
-        if task_idx == 0:
-            print(f"  Task {task_idx}: Using {total_graphs_used}/{total_graphs_available} total graphs")
-            print(f"  Final context embeddings shape: {context_embeddings.shape}")
-    else:
-        # No context available for this task
-        emb_dim = node_embs.size(1) if node_embs is not None and node_embs.numel() > 0 else 256
-        context_embeddings = torch.empty(0, emb_dim, device=device)
-        context_labels = torch.empty(0, dtype=torch.long, device=device)
-    
-    return context_embeddings, context_labels
-
-
 def _create_context_embeddings_computed(model, context_structure, dataset, task_idx, pooling_method, device, identity_projection, dataset_info):
     """Compute context embeddings normally (fallback for datasets without pre-computed embeddings)."""
     # Get context graphs for the specific task
@@ -664,7 +567,7 @@ def prepare_pfn_data_structure(context_embeddings, context_labels, num_classes, 
 
 def train_graph_classification_full_batch(model, predictor, train_dataset_info, unfiltered_splits, optimizer,
                                          pooling_method='mean', device='cuda', batch_size=4096, clip_grad=1.0,
-                                         orthogonal_push=0.0, normalize_class_h=True, identity_projection=None, context_k=None):
+                                         orthogonal_push=0.0, normalize_class_h=True, identity_projection=None, context_k=None, args=None):
     """
     Full batch training: NO pre-filtering by tasks. Load ALL graphs, check ALL 128 tasks dynamically.
     Accumulate losses from all valid tasks before single parameter update.
@@ -696,10 +599,16 @@ def train_graph_classification_full_batch(model, predictor, train_dataset_info, 
     
     print(f"Full batch training: Processing ALL {num_tasks} tasks simultaneously per batch (no pre-filtering)")
     
+    batch_idx = 0
     for batch in data_loaders['train']:
+        # Batch-level context refresh
+        if args is not None:
+            refresh_gc_context_if_needed(train_dataset_info, batch_idx, 0, args, device)
+        
         optimizer.zero_grad()
         accumulated_loss = 0.0
         valid_task_count = 0
+        batch_idx += 1
         
         # Process ALL tasks for this unfiltered batch
         for task_idx in range(num_tasks):
@@ -828,10 +737,9 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
                     continue
                 
                 # Create task-specific context embeddings
-                context_embeddings, context_labels = create_context_embeddings(
-                    model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx=task_idx,
-                    pooling_method=pooling_method, device=device, identity_projection=identity_projection, 
-                    dataset_info=dataset_info
+                context_embeddings, context_labels = _create_context_embeddings_computed(
+                    model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx,
+                    pooling_method, device, identity_projection, dataset_info
                 )
                 
                 # Prepare PFN data structure
@@ -959,10 +867,9 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
     valid_labels = batch_labels[valid_mask].long()
     
     # Create task-specific context embeddings
-    context_embeddings, context_labels = create_context_embeddings(
-        model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx=task_idx,
-        pooling_method=pooling_method, device=device, identity_projection=identity_projection, 
-        dataset_info=dataset_info, context_k=context_k
+    context_embeddings, context_labels = _create_context_embeddings_computed(
+        model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx,
+        pooling_method, device, identity_projection, dataset_info
     )
     
     # Prepare PFN data structure
@@ -988,7 +895,7 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
 
 def train_graph_classification_single_task(model, predictor, dataset_info, data_loaders, optimizer, task_idx,
                                          pooling_method='mean', device='cuda', clip_grad=1.0,
-                                         orthogonal_push=0.0, normalize_class_h=True, identity_projection=None, context_k=None):
+                                         orthogonal_push=0.0, normalize_class_h=True, identity_projection=None, context_k=None, args=None):
     """
     Train graph classification for one epoch on a single task with prefiltered data.
     All samples in each batch are guaranteed to have valid labels for the specified task.
@@ -1020,6 +927,10 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
 
     total_batches = len(train_batches)
     for batch_idx, batch_graphs in enumerate(train_batches):
+        # Batch-level context refresh
+        if args is not None:
+            refresh_gc_context_if_needed(dataset_info, batch_idx, 0, args, device)
+            
         print(f"\rTraining batch {batch_idx+1}/{total_batches}", end="", flush=True)
         batch_data = batch_graphs.to(device)
         
@@ -1083,9 +994,9 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
             batch_labels = batch_labels.to(torch.long)
         
         # Create task-specific context embeddings
-        context_embeddings, context_labels = create_context_embeddings(
-            model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx=task_idx, 
-            pooling_method=pooling_method, device=device, identity_projection=identity_projection, dataset_info=dataset_info, context_k=context_k
+        context_embeddings, context_labels = _create_context_embeddings_computed(
+            model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx, 
+            pooling_method, device, identity_projection, dataset_info
         )
         
         # Prepare PFN data structure
@@ -1164,12 +1075,15 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
     predictor.eval()
     
     results = {}
-
+    
+    # Time context creation
+    context_start = time.perf_counter()
     # Create task-specific context embeddings once for this task
-    context_embeddings, context_labels = create_context_embeddings(
-        model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx=task_idx, 
-        pooling_method=pooling_method, device=device, identity_projection=identity_projection, dataset_info=dataset_info, context_k=context_k
+    context_embeddings, context_labels = _create_context_embeddings_computed(
+        model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx, 
+        pooling_method, device, identity_projection, dataset_info
     )
+    context_time = time.perf_counter() - context_start
     
     # Prepare PFN data structure
     pfn_data = prepare_pfn_data_structure(context_embeddings, context_labels, 
@@ -1207,8 +1121,6 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         for batch_idx, batch_graphs in enumerate(eval_batches):
             print(f"\rEvaluating batch {batch_idx+1}/{total_eval_batches}", end="", flush=True)
             batch_data = batch_graphs.to(device)
-            
-            # Convert node indices to embeddings - handle both standard and task-aware modes
             node_emb_table = _get_node_embedding_table(dataset_info['dataset'], task_idx, device, dataset_info)
             
             if node_emb_table is not None:
@@ -1223,14 +1135,12 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             else:
                 x_input = batch_data.x
 
-            # Get node embeddings from GNN
             batch_data.adj_t = SparseTensor.from_edge_index(
                 batch_data.edge_index,
                 sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
             ).to_symmetric().coalesce()
             node_embeddings = model(x_input, batch_data.adj_t)
             
-            # Pool to get graph embeddings
             target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
             
             # Get labels for this batch - all samples are valid for this task
@@ -1261,8 +1171,6 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             if batch_labels.dtype != torch.long:
                 batch_labels = batch_labels.to(torch.long)
             
-            # Get predictions using PFN predictor
-            # print(context_embeddings.shape, target_embeddings.shape, context_labels.shape, class_h.shape, flush=True)
             scores, _ = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
             probabilities = F.softmax(scores, dim=1)
             predictions = scores.argmax(dim=1)
@@ -1408,7 +1316,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                     pooling_method=args.graph_pooling, device=device, batch_size=args.batch_size,
                     clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
                     normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
-                    context_k=getattr(args, 'context_k', None)
+                    context_k=getattr(args, 'context_k', None), args=args
                 )
                 
                 total_train_loss += dataset_loss
@@ -1441,7 +1349,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         pooling_method=args.graph_pooling, device=device,
                         clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
                         normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
-                        context_k=getattr(args, 'context_k', None)
+                        context_k=getattr(args, 'context_k', None), args=args
                     )
                     
                     dataset_loss += task_loss
@@ -1626,6 +1534,8 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
             # Evaluate on unseen test datasets if provided
             if test_datasets is not None and test_processed_data_list is not None:
                 print(f"  Evaluating on unseen test datasets at epoch {epoch}...")
+                
+                
                 avg_test_metric = 0.0
                 
                 if use_full_batch_training:
@@ -1705,13 +1615,48 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                                 use_index_tracking=use_fug_tracking
                             )
                             
-                            # Evaluate this specific task - only test split
-                            task_results = evaluate_graph_classification_single_task(
-                                model, predictor, test_dataset_info, task_test_loaders, task_idx,
-                                pooling_method=args.graph_pooling, device=device,
-                                normalize_class_h=args.normalize_class_h, dataset_name=test_name, identity_projection=identity_projection,
-                                context_k=getattr(args, 'context_k', None)
-                            )
+                            # Debug: Check profiling setting
+                            profiling_enabled = getattr(args, 'enable_profiling', False)
+                            print(f"      [DEBUG] Task {task_idx}: enable_profiling = {profiling_enabled}")
+                            
+                            # Per-task profiling if enabled
+                            if profiling_enabled:
+                                prof = profile(
+                                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                                    record_shapes=True,
+                                    profile_memory=True,
+                                    with_stack=True
+                                )
+                                prof.start()
+                                with record_function(f"gc_eval_{test_name}_task_{task_idx}"):
+                                    # Evaluate this specific task - only test split
+                                    task_results = evaluate_graph_classification_single_task(
+                                        model, predictor, test_dataset_info, task_test_loaders, task_idx,
+                                        pooling_method=args.graph_pooling, device=device,
+                                        normalize_class_h=args.normalize_class_h, dataset_name=test_name, identity_projection=identity_projection,
+                                        context_k=getattr(args, 'context_k', None)
+                                    )
+                                prof.stop()
+                                
+                                # Save per-task profiling results
+                                profile_filename = f"gc_eval_{test_name}_task_{task_idx}_epoch_{epoch}.json"
+                                prof.export_chrome_trace(profile_filename)
+                                print(f"      [PROFILING] Task {task_idx}: Saved profiling to {profile_filename}")
+                                
+                                # Print top CPU functions for this task
+                                print(f"      [PROFILING] Task {task_idx} Top CPU ops:")
+                                cpu_table = prof.key_averages().table(sort_by="cpu_time_total", row_limit=5)
+                                for line in cpu_table.split('\n')[:7]:  # Header + top 5 rows
+                                    if line.strip():
+                                        print(f"        {line}")
+                            else:
+                                # Evaluate this specific task - only test split  
+                                task_results = evaluate_graph_classification_single_task(
+                                    model, predictor, test_dataset_info, task_test_loaders, task_idx,
+                                    pooling_method=args.graph_pooling, device=device,
+                                    normalize_class_h=args.normalize_class_h, dataset_name=test_name, identity_projection=identity_projection,
+                                    context_k=getattr(args, 'context_k', None)
+                                )
                             
                             # Only collect test results for unseen datasets
                             task_test_results['test'].append(task_results['test'])

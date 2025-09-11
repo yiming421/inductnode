@@ -10,6 +10,49 @@ import time
 import psutil
 import os
 
+
+def refresh_lp_context_if_needed(data, batch_idx, epoch, args, context_edges, train_mask, train_edges):
+    """
+    Proper dataset-specific context refresh for LP batch-level updates.
+    """
+    # Check if batch refresh is enabled and it's time to refresh
+    if getattr(args, 'context_batch_refresh_interval', 0) <= 0:
+        return context_edges, train_mask
+        
+    if batch_idx > 0 and batch_idx % args.context_batch_refresh_interval == 0:
+        # Refresh LP context for this specific dataset
+        refresh_seed = args.seed + epoch * 10000 + batch_idx
+        torch.manual_seed(refresh_seed)
+        
+        try:
+            # Import here to avoid circular imports
+            import sys
+            import os
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            if project_root not in sys.path:
+                sys.path.insert(0, project_root)
+            
+            from scripts.joint_training import resolve_context_shots
+            from src.data_utils import select_link_context
+            
+            # Get dynamic context shots using the same logic as epoch refresh
+            context_shots = resolve_context_shots(data.name, 'lp', args, epoch)
+            
+            # Regenerate context using the train_edges (which is the full training data)
+            if train_edges['edge_pairs'].size(0) > 0:
+                new_context_data, new_train_mask = select_link_context(
+                    train_edges, context_shots, args.context_neg_ratio,
+                    args.remove_context_from_train
+                )
+                
+                print(f"🔄 LP Dataset {data.name} context refreshed at batch {batch_idx} ({context_shots} context shots)")
+                return new_context_data, new_train_mask
+                
+        except Exception as e:
+            print(f"🔄 LP Dataset {data.name} context refresh failed at batch {batch_idx}: {e}")
+    
+    return context_edges, train_mask
+
 def get_node_embeddings(model, data, projector=None, identity_projection=None, use_full_adj=False):
     """
     Get node embeddings using the same model and preprocessing as node classification.
@@ -104,7 +147,7 @@ def get_link_prototypes(node_embeddings, context_data, att_pool, mlp_pool, norma
 def train_link_prediction(model, predictor, data, train_edges, context_edges, train_mask, optimizer, 
                           batch_size, att=None, mlp=None, projector=None, identity_projection=None, 
                           clip_grad=1.0, rank=0, orthogonal_push=0.0, normalize_class_h=False, 
-                          epoch=0, mask_target_edges=False, degree=False, lambda_=1.0):
+                          epoch=0, mask_target_edges=False, degree=False, lambda_=1.0, args=None):
     """
     Train link prediction using the PFN methodology.
     """
@@ -157,11 +200,15 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         total_loss = 0
         batch_count = 0
         
-        for batch_idx in dataloader:
+        for batch_indices in dataloader:
+            # Batch-level context refresh for this LP dataset
+            if args is not None:
+                context_edges, train_mask = refresh_lp_context_if_needed(data, batch_count, epoch, args, context_edges, train_mask, train_edges)
+            
             st = time.time()
             try:
-                # Convert batch indices back to device
-                batch_idx = batch_idx.to(device)
+                # batch_indices from DataLoader should already be on CPU
+                # No need to move them around
                 
                 # Only zero gradients if optimizer is provided (for joint training compatibility)
                 if optimizer is not None:
@@ -171,12 +218,12 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 adj_for_gnn = data.adj_t
                 if mask_target_edges:
                     # Get batch labels and find positive edges in current batch
-                    batch_labels_check = labels[batch_idx]
+                    batch_labels_check = labels[batch_indices]
                     batch_pos_mask = batch_labels_check == 1
                     
                     if batch_pos_mask.any():
                         # Get the actual batch indices that correspond to positive edges
-                        batch_pos_indices = batch_idx[batch_pos_mask]
+                        batch_pos_indices = batch_indices[batch_pos_mask]
                         
                         # Map these batch indices to positions in the pos_train_edges tensor
                         indices_to_mask_in_pos_list = []
@@ -209,8 +256,8 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
                 context_edge_embeds = context_src_embeds * context_dst_embeds
 
-                batch_labels = labels[batch_idx]
-                batch_edges = edge_pairs[batch_idx]
+                batch_labels = labels[batch_indices]
+                batch_edges = edge_pairs[batch_indices]
 
                 # Get embeddings for target edges
                 src_embeds = node_embeddings[batch_edges[:, 0]]
@@ -234,9 +281,10 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     if rank == 0:
                         print(f"Warning: train_mask size {train_mask.size(0)} doesn't match edge_pairs size {edge_pairs.size(0)}")
                     # Create a default mask that includes all edges in the batch
-                    mask_for_loss = torch.ones(batch_idx.size(0), dtype=torch.bool, device=device)
+                    mask_for_loss = torch.ones(batch_indices.size(0), dtype=torch.bool, device=device)
                 else:
-                    mask_for_loss = train_mask[batch_idx]
+                    # Index with CPU batch_indices, then move result to GPU
+                    mask_for_loss = train_mask[batch_indices].to(device)
                 
                 # Use CrossEntropyLoss for multi-class classification (link vs no-link)
                 nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())

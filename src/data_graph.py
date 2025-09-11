@@ -778,62 +778,17 @@ def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0
 
 def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
     """
-    Prepare graph data for PFN-based graph classification.
-    Uses pre-computed task-aware context when available, otherwise samples context.
+    Prepare graph data for PFN-based graph classification by sampling context graphs.
     
     Args:
-        dataset: PyTorch Geometric dataset (may have pre-computed embeddings)
-        split_idx (dict): Dictionary with 'train', 'val', 'test' indices
-        context_k (int): Number of context graphs per class (ignored if pre-computed)
-        device (str): Device to load data onto
+        dataset: PyTorch Geometric dataset containing graph data
+        split_idx (dict): Train/val/test split indices
+        context_k (int): Number of context samples per class
+        device (str): Device to place tensors on
         
     Returns:
         dict: Processed data containing context and target information
     """
-    # Check if dataset has pre-computed task-aware context
-    if hasattr(dataset, 'has_precomputed_embeddings') and dataset.has_precomputed_embeddings:
-        print(f"Using pre-computed task-aware context structure")
-        return _prepare_graph_data_precomputed(dataset, split_idx, device)
-    
-    # Fallback to normal context sampling
-    return _prepare_graph_data_sampled(dataset, split_idx, context_k, device)
-
-
-def _prepare_graph_data_precomputed(dataset, split_idx, device):
-    """Prepare data using pre-computed task-aware embeddings."""
-    sample_graph = dataset[0]
-    
-    # Handle label structure - MOLPCBA has [1, 128] format
-    y_shape = sample_graph.y.shape
-    if len(y_shape) == 2 and y_shape[0] == 1:
-        num_tasks = y_shape[1]  # [1, 128] -> 128 tasks
-    elif len(y_shape) == 1:
-        num_tasks = y_shape[0]  # [128] -> 128 tasks
-    else:
-        num_tasks = y_shape[-1] if len(y_shape) > 1 else 1
-    
-    print(f"Pre-computed context: {num_tasks} tasks using task-aware structure")
-    
-    # Use the pre-computed context structure directly
-    final_context_graphs = dataset.task_context_structure  # {task_idx: {class: [indices]}}
-    context_labels = {task_idx: {0: 0, 1: 1} for task_idx in range(num_tasks)}
-    is_multitask_dataset = num_tasks > 1
-    
-    return {
-        'context_graphs': final_context_graphs,  # task_idx -> {class: [graph_indices]}
-        'context_labels': context_labels,        # task_idx -> {class: class_label}
-        'split_idx': split_idx,
-        'dataset': dataset,
-        'num_classes': getattr(dataset, 'num_classes', 2),
-        'num_features': getattr(dataset, 'num_node_features', 256),
-        'is_multitask': is_multitask_dataset,
-        'num_tasks': num_tasks,
-        'name': getattr(dataset, 'name', 'unknown')
-    }
-
-
-def _prepare_graph_data_sampled(dataset, split_idx, context_k, device):
-    """Prepare data by sampling context (fallback for datasets without pre-computed embeddings)."""
     # Check if this is a multi-task dataset
     sample_graph = dataset[0]
     is_multitask = sample_graph.y.numel() > 1
@@ -1621,9 +1576,43 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
     node_embs = None
     if processed_data is not None and 'fug_mapping' in processed_data:
         fug_mapping = processed_data['fug_mapping']
-        node_embs = fug_mapping['node_embs']
-        original_dim = node_embs.shape[1]
-        print(f"Using FUG external embeddings: {node_embs.shape}")
+        
+        # Handle cache mode for FUG datasets
+        if fug_mapping.get('cache_mode', False) and use_pca_cache and dataset_name:
+            print(f"🚀 Cache mode enabled for {dataset_name} - attempting to load cached PCA features")
+            cached_result = _load_pca_cache(dataset_name, hidden_dim, pca_cache_dir)
+            if cached_result is not None:
+                print(f"✅ Successfully loaded cached PCA features for {dataset_name}")
+                
+                # CRITICAL FIX: Set the cached features as the node embedding table
+                fug_mapping['node_embs'] = cached_result
+                fug_mapping['cache_mode'] = False  # Disable cache mode now that we have embeddings
+                print(f"Set cached features as node_embs: {cached_result.shape}")
+                
+                # Continue with normal processing flow - don't return early
+                node_embs = cached_result
+                original_dim = cached_result.shape[1]
+                print(f"Cache mode: Using cached embeddings {node_embs.shape} as normal flow")
+            else:
+                print(f"❌ Cache miss for {dataset_name} in cache mode - this shouldn't happen!")
+                print(f"   Cache was detected during loading but file is missing/corrupted")
+                # For safety, fall back to loading embeddings if cache is missing
+                if fug_mapping.get('embedding_file'):
+                    print(f"🔄 Loading embeddings as fallback: {fug_mapping['embedding_file']}")
+                    try:
+                        node_embs = torch.load(fug_mapping['embedding_file'], map_location='cpu')
+                        fug_mapping['node_embs'] = node_embs
+                        fug_mapping['cache_mode'] = False  # Disable cache mode
+                        print(f"✅ Loaded fallback embeddings: {node_embs.shape}")
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to load fallback embeddings: {e}")
+        
+        # Normal FUG mode (embeddings already loaded or set from cache)
+        if fug_mapping.get('node_embs') is not None:
+            if 'node_embs' not in locals():  # Only set if not already set by cache mode
+                node_embs = fug_mapping['node_embs']
+                original_dim = node_embs.shape[1]
+                print(f"Using FUG external embeddings: {node_embs.shape}")
     # Fall back to dataset.node_embs for unified setting
     elif hasattr(dataset, 'node_embs') and dataset.node_embs is not None:
         node_embs = dataset.node_embs

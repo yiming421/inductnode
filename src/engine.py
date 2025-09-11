@@ -8,10 +8,43 @@ import torch.distributed as dist
 import psutil
 import os
 from .utils import process_node_features, acc, apply_final_pca
+from .data_utils import select_k_shot_context
+
+
+def refresh_dataset_context_if_needed(data, split_idx, batch_idx, epoch, args):
+    """
+    Simple dataset-specific context refresh for batch-level updates.
+    
+    Args:
+        data: Single dataset object
+        split_idx: Split indices for this dataset
+        batch_idx: Current batch index within this dataset
+        epoch: Current epoch
+        args: Arguments with refresh settings
+    """
+    # Check if batch refresh is enabled and it's time to refresh
+    if getattr(args, 'context_batch_refresh_interval', 0) <= 0:
+        return
+        
+    if batch_idx > 0 and batch_idx % args.context_batch_refresh_interval == 0:
+        # Refresh context for this specific dataset
+        refresh_seed = args.seed + epoch * 10000 + batch_idx
+        torch.manual_seed(refresh_seed)
+        
+        # Simple approach: just use basic context refresh without complex imports
+        # Get current context size
+        if hasattr(data, 'context_sample') and data.context_sample is not None:
+            current_context_size = len(data.context_sample) // len(data.y.unique())
+            
+            # Resample context
+            new_context_sample = select_k_shot_context(data, current_context_size, split_idx['train'])
+            data.context_sample = new_context_sample.to(data.context_sample.device)
+            
+            print(f"🔄 Dataset {data.name} context refreshed at batch {batch_idx} ({len(new_context_sample)} samples)")
 
 def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None, 
           orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, rank=0, epoch=0, 
-          identity_projection=None, lambda_=1.0):
+          identity_projection=None, lambda_=1.0, args=None):
     st = time.time()
     print(f"[RANK {rank}] Starting training epoch {epoch} on device cuda:{rank}", flush=True)
     
@@ -37,6 +70,10 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
     total_loss = 0
     for batch_idx, perm in enumerate(dataloader):
+        # Batch-level context refresh for this dataset
+        if args is not None:
+            refresh_dataset_context_if_needed(data, {'train': train_idx}, batch_idx, epoch, args)
+        
         if isinstance(perm, torch.Tensor):
             perm = perm.tolist()
         train_perm_idx = train_idx[perm]
@@ -131,13 +168,13 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
 def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, degree=False, att=None,
               mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, 
-              rank=0, epoch=0, identity_projection=None, lambda_=1.0):
+              rank=0, epoch=0, identity_projection=None, lambda_=1.0, args=None):
     tot_loss = 0
     for data, split_idx in zip(data_list, split_idx_list):
         train_idx = split_idx['train']
         loss = train(model, data, train_idx, optimizer, pred, batch_size, degree, att, mlp,
                      orthogonal_push, normalize_class_h, clip_grad, projector, rank, epoch, 
-                     identity_projection, lambda_)
+                     identity_projection, lambda_, args)
         if rank == 0:
             print(f"Dataset {data.name} Loss: {loss}", flush=True)
         tot_loss += loss

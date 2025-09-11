@@ -9,11 +9,12 @@ import time
 import copy
 import torch
 import wandb
-import traceback
 import signal
 import psutil
-import gc
+import numpy as np
 from contextlib import contextmanager, nullcontext
+from sknetwork.ranking import PageRank
+from torch_geometric.utils import to_scipy_sparse_matrix
 
 # Add the project root to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -21,26 +22,20 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Core imports - reuse from existing scripts
-from src.model import PureGCN_v1, PureGCN, PFNPredictorNodeCls, GCN, IdentityProjection
+from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection
 from src.data import load_all_data, load_all_data_train
 from src.data_link import load_all_data_link
 from src.data_graph import load_all_graph_datasets, process_graph_features, create_data_loaders, create_task_filtered_datasets
-from src.data_utils import process_data, prepare_link_data, select_link_context, process_link_data, select_k_shot_context
+from src.data_utils import process_data, prepare_link_data, select_link_context, process_link_data
 from src.engine import train_all, test_all, test_all_induct  # Node classification engines
 from src.engine_link_pred import train_link_prediction, evaluate_link_prediction  # Link prediction engines
 from src.engine_graph import (
-    train_and_evaluate_graph_classification, 
     train_graph_classification_single_task,
     evaluate_graph_classification_single_task,
-    pool_graph_embeddings,
-    create_context_embeddings,
-    prepare_pfn_data_structure,
-    get_dataset_metric,
-    calculate_metric,
     aggregate_task_metrics,
     format_metric_results
 )
-from src.gpu_utils import parse_gpu_spec, setup_cuda_visible_devices, get_effective_world_size, validate_gpu_availability, print_gpu_info
+from src.gpu_utils import parse_gpu_spec, setup_cuda_visible_devices, validate_gpu_availability, print_gpu_info
 from transformers import get_cosine_schedule_with_warmup
 
 # Logging and monitoring
@@ -195,8 +190,257 @@ class LinkPredictionTracker:
         print("------------------------------------------------")
 
 
-# Global tracker instance
+# Memory and time tracking utilities for Graph Classification
+class GraphClassificationTracker:
+    """Comprehensive memory and time tracker for graph classification operations."""
+    
+    def __init__(self, device='cuda'):
+        self.device = device
+        self.reset()
+    
+    def reset(self):
+        """Reset all tracking metrics."""
+        self.timing_data = {
+            'dataset_processing': [],
+            'pca_computation': [],
+            'feature_projection': [],
+            'data_loading': [],
+            'batch_processing': [],
+            'training': [],
+            'evaluation': [],
+            'forward_pass': [],
+            'backward_pass': [],
+            'loss_computation': [],
+            'task_processing': []
+        }
+        self.memory_data = {
+            'gpu_peak': [],
+            'gpu_allocated': [],
+            'gpu_cached': [],
+            'cpu_memory': [],
+            'cpu_percent': [],
+            'dataset_sizes': [],
+            'batch_sizes': []
+        }
+        self.operation_counts = {
+            'datasets_processed': 0,
+            'tasks_processed': 0,
+            'batches_processed': 0,
+            'training_steps': 0,
+            'evaluation_steps': 0,
+            'pca_operations': 0,
+            'feature_projections': 0
+        }
+        self.dataset_info = {}
+    
+    def get_memory_stats(self):
+        """Get current memory statistics with additional CPU details."""
+        stats = {}
+        
+        # GPU memory
+        if torch.cuda.is_available():
+            stats['gpu_allocated'] = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
+            stats['gpu_cached'] = torch.cuda.memory_reserved(self.device) / 1024**3  # GB
+            stats['gpu_peak'] = torch.cuda.max_memory_allocated(self.device) / 1024**3  # GB
+        else:
+            stats['gpu_allocated'] = 0
+            stats['gpu_cached'] = 0  
+            stats['gpu_peak'] = 0
+        
+        # CPU memory with more details
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        stats['cpu_memory'] = memory_info.rss / 1024**3  # GB (Resident Set Size)
+        stats['cpu_memory_vms'] = memory_info.vms / 1024**3  # GB (Virtual Memory Size)
+        stats['cpu_percent'] = process.cpu_percent()
+        
+        # System-wide memory info
+        system_memory = psutil.virtual_memory()
+        stats['system_memory_total'] = system_memory.total / 1024**3  # GB
+        stats['system_memory_available'] = system_memory.available / 1024**3  # GB
+        stats['system_memory_percent'] = system_memory.percent
+        
+        return stats
+    
+    def record_memory(self):
+        """Record current memory usage with enhanced CPU tracking."""
+        stats = self.get_memory_stats()
+        self.memory_data['gpu_allocated'].append(stats['gpu_allocated'])
+        self.memory_data['gpu_cached'].append(stats['gpu_cached'])
+        self.memory_data['gpu_peak'].append(stats['gpu_peak'])
+        self.memory_data['cpu_memory'].append(stats['cpu_memory'])
+        self.memory_data['cpu_percent'].append(stats['cpu_percent'])
+    
+    def log_memory(self, operation_name):
+        """Log memory usage with operation name for detailed tracking."""
+        stats = self.get_memory_stats()
+        self.record_memory()
+        
+        # Log significant memory usage
+        if stats['cpu_memory'] > 4.0:  # Log when CPU memory > 4GB
+            print(f"[GC-MEMORY] {operation_name}: CPU={stats['cpu_memory']:.2f}GB, "
+                  f"GPU={stats['gpu_allocated']:.2f}GB, System={stats['system_memory_percent']:.1f}%")
+        
+        # Check for memory spikes
+        self.log_memory_spike_warning()
+    
+    def record_dataset_info(self, dataset_name, num_graphs, num_features, avg_nodes_per_graph=None):
+        """Record dataset-specific information for memory analysis."""
+        self.dataset_info[dataset_name] = {
+            'num_graphs': num_graphs,
+            'num_features': num_features,
+            'avg_nodes_per_graph': avg_nodes_per_graph,
+            'memory_at_load': self.get_memory_stats()['cpu_memory']
+        }
+        self.memory_data['dataset_sizes'].append(num_graphs * num_features)
+    
+    def record_batch_info(self, batch_size, num_nodes_in_batch=None):
+        """Record batch processing information."""
+        self.memory_data['batch_sizes'].append(batch_size)
+        if num_nodes_in_batch:
+            # This helps track memory usage patterns with batch complexity
+            pass
+    
+    @contextmanager
+    def time_operation(self, operation_type, log_memory=True):
+        """Context manager to time operations with enhanced memory tracking."""
+        start_time = time.time()
+        if log_memory:
+            start_memory = self.get_memory_stats()
+            self.record_memory()
+        
+        try:
+            yield
+        finally:
+            end_time = time.time()
+            duration = end_time - start_time
+            
+            if operation_type in self.timing_data:
+                self.timing_data[operation_type].append(duration)
+            
+            if log_memory:
+                end_memory = self.get_memory_stats()
+                self.record_memory()
+                
+                # Calculate memory delta for this operation
+                memory_delta = end_memory['cpu_memory'] - start_memory['cpu_memory']
+                if abs(memory_delta) > 0.1:  # Only log significant memory changes (>100MB)
+                    print(f"[GC-MEMORY] {operation_type}: {memory_delta:+.2f} GB CPU memory change (Duration: {duration:.2f}s)")
+    
+    def log_memory_spike_warning(self, threshold_gb=8.0):
+        """Check for memory spikes and log warnings."""
+        current_stats = self.get_memory_stats()
+        if current_stats['cpu_memory'] > threshold_gb:
+            print(f"[GC-MEMORY-WARNING] High CPU memory usage: {current_stats['cpu_memory']:.2f} GB "
+                  f"(System: {current_stats['system_memory_percent']:.1f}% used)")
+        
+        if current_stats['gpu_allocated'] > 10.0:  # 10GB GPU threshold
+            print(f"[GC-MEMORY-WARNING] High GPU memory usage: {current_stats['gpu_allocated']:.2f} GB")
+    
+    def get_summary_stats(self):
+        """Get summary statistics for all tracked metrics with enhanced CPU analysis."""
+        summary = {}
+        
+        # Timing summaries
+        for op_type, times in self.timing_data.items():
+            if times:
+                summary[f'time_{op_type}_avg'] = sum(times) / len(times)
+                summary[f'time_{op_type}_total'] = sum(times)
+                summary[f'time_{op_type}_max'] = max(times)
+                summary[f'time_{op_type}_count'] = len(times)
+            else:
+                summary[f'time_{op_type}_avg'] = 0
+                summary[f'time_{op_type}_total'] = 0
+                summary[f'time_{op_type}_max'] = 0
+                summary[f'time_{op_type}_count'] = 0
+        
+        # Memory summaries with enhanced CPU tracking
+        for mem_type, values in self.memory_data.items():
+            if values:
+                summary[f'memory_{mem_type}_avg'] = sum(values) / len(values)
+                summary[f'memory_{mem_type}_peak'] = max(values)
+                summary[f'memory_{mem_type}_final'] = values[-1]
+                if len(values) > 1:
+                    summary[f'memory_{mem_type}_delta'] = values[-1] - values[0]
+            else:
+                summary[f'memory_{mem_type}_avg'] = 0
+                summary[f'memory_{mem_type}_peak'] = 0
+                summary[f'memory_{mem_type}_final'] = 0
+                summary[f'memory_{mem_type}_delta'] = 0
+        
+        # Operation counts
+        summary.update(self.operation_counts)
+        
+        # Dataset analysis
+        if self.dataset_info:
+            total_graphs = sum(info['num_graphs'] for info in self.dataset_info.values())
+            total_features = sum(info['num_features'] for info in self.dataset_info.values())
+            summary['total_graphs_processed'] = total_graphs
+            summary['total_features_processed'] = total_features
+        
+        return summary
+    
+    def log_to_wandb(self, prefix="gc_tracker"):
+        """Log tracking statistics to wandb."""
+        summary = self.get_summary_stats()
+        wandb_log = {f"{prefix}/{key}": value for key, value in summary.items()}
+        wandb.log(wandb_log)
+    
+    def print_detailed_summary(self, epoch=None):
+        """Print a comprehensive summary of tracking statistics."""
+        summary = self.get_summary_stats()
+        current_stats = self.get_memory_stats()
+        
+        epoch_str = f" (Epoch {epoch})" if epoch is not None else ""
+        print(f"\n=== Graph Classification Memory & Performance Summary{epoch_str} ===")
+        
+        print("🕒 Timing Statistics:")
+        critical_ops = ['dataset_processing', 'pca_computation', 'training', 'evaluation', 'batch_processing']
+        for op_type in critical_ops:
+            avg_time = summary.get(f'time_{op_type}_avg', 0)
+            total_time = summary.get(f'time_{op_type}_total', 0)
+            max_time = summary.get(f'time_{op_type}_max', 0)
+            count = summary.get(f'time_{op_type}_count', 0)
+            if count > 0:
+                print(f"  {op_type.replace('_', ' ').title()}: "
+                      f"avg={avg_time:.3f}s, total={total_time:.2f}s, max={max_time:.3f}s ({count} ops)")
+        
+        print("\n💾 CPU Memory Statistics:")
+        print(f"  Current Usage: {current_stats['cpu_memory']:.2f} GB")
+        print(f"  Peak Usage: {summary.get('memory_cpu_memory_peak', 0):.2f} GB")
+        print(f"  Average Usage: {summary.get('memory_cpu_memory_avg', 0):.2f} GB")
+        print(f"  Total Change: {summary.get('memory_cpu_memory_delta', 0):+.2f} GB")
+        print(f"  System Memory: {current_stats['system_memory_percent']:.1f}% used "
+              f"({current_stats['system_memory_available']:.1f} GB available)")
+        
+        print("\n🖥️  GPU Memory Statistics:")
+        print(f"  Current Allocated: {current_stats['gpu_allocated']:.2f} GB")
+        print(f"  Peak Allocated: {summary.get('memory_gpu_peak_peak', 0):.2f} GB")
+        print(f"  Cached: {current_stats['gpu_cached']:.2f} GB")
+        
+        print("\n📊 Operation Counts:")
+        print(f"  Datasets: {summary.get('datasets_processed', 0)}")
+        print(f"  Tasks: {summary.get('tasks_processed', 0)}")
+        print(f"  Batches: {summary.get('batches_processed', 0)}")
+        print(f"  PCA Operations: {summary.get('pca_operations', 0)}")
+        print(f"  Training Steps: {summary.get('training_steps', 0)}")
+        
+        if self.dataset_info:
+            print("\n🗃️  Dataset Information:")
+            for name, info in self.dataset_info.items():
+                print(f"  {name}: {info['num_graphs']} graphs, {info['num_features']} features, "
+                      f"memory at load: {info['memory_at_load']:.2f} GB")
+        
+        print("=" * 70)
+    
+    def print_summary(self, epoch=None):
+        """Alias for print_detailed_summary for compatibility."""
+        self.print_detailed_summary(epoch)
+
+
+# Global tracker instances
 lp_tracker = None
+gc_tracker = None
 
 
 def parse_context_overrides(override_string):
@@ -220,15 +464,189 @@ def parse_context_overrides(override_string):
     return overrides
 
 
-def resolve_context_shots(dataset_name, task_type, args):
+def parse_context_bounds(bounds_string):
     """
-    Resolve context shots for a specific dataset and task.
+    Parse context bounds string like "(10,30)(64,192)(8,24)" into bounds for NC/LP/GC.
+    
+    Args:
+        bounds_string (str): String in format "(lower,upper)(lower,upper)(lower,upper)"
+        
+    Returns:
+        dict: Dictionary with 'nc', 'lp', 'gc' keys, each containing (lower, upper) tuple
+    """
+    import re
+    
+    if not bounds_string:
+        # Default bounds
+        return {
+            'nc': (10, 30),
+            'lp': (64, 192), 
+            'gc': (8, 24)
+        }
+    
+    # Extract all (lower,upper) pairs using regex
+    pattern = r'\((\d+),(\d+)\)'
+    matches = re.findall(pattern, bounds_string)
+    
+    if len(matches) != 3:
+        raise ValueError(f"Expected 3 bound pairs for NC/LP/GC, got {len(matches)}: {bounds_string}")
+    
+    # Convert to integers and create bounds dict
+    bounds = {
+        'nc': (int(matches[0][0]), int(matches[0][1])),
+        'lp': (int(matches[1][0]), int(matches[1][1])), 
+        'gc': (int(matches[2][0]), int(matches[2][1]))
+    }
+    
+    # Validate bounds
+    for task_type, (lower, upper) in bounds.items():
+        if lower >= upper:
+            raise ValueError(f"Invalid bounds for {task_type.upper()}: lower ({lower}) must be < upper ({upper})")
+        if lower <= 0:
+            raise ValueError(f"Invalid bounds for {task_type.upper()}: lower bound ({lower}) must be > 0")
+    
+    return bounds
+
+
+def filter_candidates_with_pagerank(data, candidate_indices, max_candidates):
+    """
+    Efficiently filter candidate nodes using PageRank on the original graph.
+    
+    Args:
+        data: Graph data object with adjacency information
+        candidate_indices: Tensor of candidate node indices
+        max_candidates (int): Maximum number of candidates to keep
+        
+    Returns:
+        torch.Tensor: Filtered candidate indices based on PageRank scores
+    """
+    if len(candidate_indices) <= max_candidates:
+        return candidate_indices
+    
+    device = candidate_indices.device
+    
+    # Convert to SciPy sparse matrix
+    row, col, _ = data.adj_t.coo()  # torch_sparse.SparseTensor.coo() returns (row, col, values)
+    edge_index = torch.stack([row, col], dim=0)
+    adj = to_scipy_sparse_matrix(edge_index, num_nodes=data.x.shape[0])
+    
+    # Compute PageRank using scikit-network
+    pagerank = PageRank()
+    pagerank.fit(adj)
+    scores = pagerank.scores_
+    
+    # Extract scores for candidates using direct numpy indexing
+    candidate_nodes = candidate_indices.cpu().numpy()
+    candidate_scores = scores[candidate_nodes]
+    
+    # Use simple argsort for sorting (descending order)
+    top_k_indices = np.argsort(candidate_scores)[-max_candidates:][::-1]
+    top_candidates = candidate_nodes[top_k_indices]
+    
+    # Convert back to tensor
+    filtered_candidates = torch.tensor(top_candidates, dtype=torch.long, device=device)
+    
+    print(f"[PageRank] Filtered {len(candidate_indices)} candidates to {len(filtered_candidates)} using PageRank")
+    return filtered_candidates
+
+
+def sample_context_with_kmedoids(data, k_shot, train_indices, use_kmedoids=False, random_state=None):
+    """
+    Sample context nodes using K-Medoids clustering for better representativeness.
+    
+    Args:
+        data: Graph data object with node features and labels
+        k_shot (int): Number of context samples per class
+        train_indices: Training node indices
+        use_kmedoids (bool): Whether to use K-Medoids clustering
+        random_state (int): Random seed
+        
+    Returns:
+        context_sample (torch.Tensor): Indices of selected context nodes
+    """
+    if not use_kmedoids:
+        # Fallback to original random sampling
+        from src.data_utils import select_k_shot_context
+        return select_k_shot_context(data, k_shot, train_indices)
+    
+    try:
+        from sklearn_extra.cluster import KMedoids
+    except ImportError:
+        print("[K-Medoids] scikit-learn-extra not available, falling back to random sampling")
+        from src.data_utils import select_k_shot_context
+        return select_k_shot_context(data, k_shot, train_indices)
+    
+    device = data.x.device
+    context_samples = []
+    
+    # Get unique classes
+    unique_classes = data.y.unique()
+    
+    for class_label in unique_classes:
+        # Get training nodes for this class
+        class_mask = data.y == class_label
+        class_train_mask = torch.zeros_like(data.y, dtype=torch.bool)
+        class_train_mask[train_indices] = True
+        
+        # Find intersection: nodes that are both in this class and in training set
+        class_train_nodes = torch.where(class_mask & class_train_mask)[0]
+        
+        if len(class_train_nodes) == 0:
+            continue
+            
+        if len(class_train_nodes) <= k_shot:
+            # If we have fewer nodes than k_shot, take all of them
+            context_samples.append(class_train_nodes)
+        else:
+            # Check if candidate pool is too large (>10x k_shot)
+            if len(class_train_nodes) > 10 * k_shot:
+                # Use PageRank to pre-filter candidates
+                max_candidates = 10 * k_shot
+                class_train_nodes = filter_candidates_with_pagerank(data, class_train_nodes, max_candidates)
+            
+            # Use K-Medoids clustering to find representative nodes for this class
+            class_features = data.x[class_train_nodes].detach().cpu().numpy()
+            
+            # Apply K-Medoids clustering
+            n_clusters = min(k_shot, len(class_train_nodes))
+            kmedoids = KMedoids(
+                n_clusters=n_clusters,
+                metric='cosine',  # Use cosine distance for node features
+                init='k-medoids++',  # Smart initialization
+                max_iter=100,
+                random_state=random_state
+            )
+            
+            kmedoids.fit(class_features)
+            medoid_indices_in_class = kmedoids.medoid_indices_
+            
+            # Map medoid indices back to original node indices
+            selected_nodes = class_train_nodes[medoid_indices_in_class]
+            context_samples.append(selected_nodes)
+    
+    if not context_samples:
+        # Fallback if no samples found
+        from src.data_utils import select_k_shot_context
+        return select_k_shot_context(data, k_shot, train_indices)
+    
+    # Concatenate all context samples
+    context_sample = torch.cat(context_samples, dim=0)
+    
+    print(f"[K-Medoids] Sampled {len(context_sample)} context nodes using clustering (target: {k_shot} per class)")
+    
+    return context_sample
+
+
+def resolve_context_shots(dataset_name, task_type, args, epoch=None):
+    """
+    Resolve context shots for a specific dataset and task using the configured sampling plan.
     Falls back to global defaults if no override specified.
     
     Args:
         dataset_name (str): Name of the dataset
         task_type (str): Task type ('nc', 'lp', 'gc')
         args: Parsed command line arguments
+        epoch (int, optional): Current training epoch (needed for decay plan)
         
     Returns:
         int: Number of context shots to use for this dataset
@@ -238,12 +656,59 @@ def resolve_context_shots(dataset_name, task_type, args):
     override_string = getattr(args, override_attr, None)
     override_map = parse_context_overrides(override_string)
     
-    # Return override if exists, else global default
+    # Return override if exists (overrides always use original fixed behavior)
     if dataset_name in override_map:
         print(f"[Context Override] {task_type.upper()} dataset '{dataset_name}': using {override_map[dataset_name]} context shots")
         return override_map[dataset_name]
     
-    # Fallback to global defaults
+    # Check sampling plan
+    sampling_plan = getattr(args, 'context_sampling_plan', 'ori')
+    
+    if sampling_plan == 'ori':
+        # Original behavior: use global defaults
+        defaults = {
+            'nc': args.context_num,
+            'lp': args.context_k, 
+            'gc': args.context_graph_num
+        }
+        return defaults[task_type]
+        
+    elif sampling_plan == 'random':
+        # Random sampling within bounds
+        import random
+        bounds = parse_context_bounds(getattr(args, 'context_bounds', None))
+        lower, upper = bounds[task_type]
+        context_shots = random.randint(lower, upper)
+        print(f"[Context Random] {task_type.upper()} dataset '{dataset_name}': using {context_shots} context shots (range: {lower}-{upper})")
+        return context_shots
+        
+    elif sampling_plan == 'decay':
+        # Gradual decay from upper to lower bound over training
+        if epoch is None:
+            # If no epoch provided, use upper bound
+            bounds = parse_context_bounds(getattr(args, 'context_bounds', None))
+            context_shots = bounds[task_type][1]  # upper bound
+            print(f"[Context Decay] {task_type.upper()} dataset '{dataset_name}': using {context_shots} context shots (no epoch provided, using upper bound)")
+            return context_shots
+            
+        bounds = parse_context_bounds(getattr(args, 'context_bounds', None))
+        lower, upper = bounds[task_type]
+        
+        # Linear decay from upper to lower over training epochs
+        total_epochs = getattr(args, 'epochs', 100)
+        progress = min(1.0, epoch / max(1, total_epochs - 1))  # 0 to 1
+        
+        # Interpolate: start at upper, end at lower
+        context_shots = int(upper - progress * (upper - lower))
+        context_shots = max(lower, min(upper, context_shots))  # Clamp to bounds
+        
+        print(f"[Context Decay] {task_type.upper()} dataset '{dataset_name}': using {context_shots} context shots (epoch {epoch}, progress {progress:.3f})")
+        return context_shots
+    
+    else:
+        raise ValueError(f"Unknown context sampling plan: {sampling_plan}")
+    
+    # Fallback to global defaults (should not reach here)
     defaults = {
         'nc': args.context_num,
         'lp': args.context_k, 
@@ -252,7 +717,7 @@ def resolve_context_shots(dataset_name, task_type, args):
     return defaults[task_type]
 
 
-def refresh_nc_contexts(nc_data):
+def refresh_nc_contexts(nc_data, args=None, epoch=None):
     """Refresh node classification context samples"""
     if nc_data[0] is None:
         return
@@ -262,16 +727,35 @@ def refresh_nc_contexts(nc_data):
     
     for data, split_idx in zip(nc_data_list, nc_split_idx_list):
         if hasattr(data, 'context_sample'):
-            # Get current context size
-            current_context_size = len(data.context_sample) // len(data.y.unique())
+            # Determine context size based on sampling plan
+            if args is not None:
+                # Use new sampling strategy
+                context_shots = resolve_context_shots(data.name, 'nc', args, epoch)
+                current_context_size = context_shots
+            else:
+                # Fallback to original behavior: get current context size
+                current_context_size = len(data.context_sample) // len(data.y.unique())
             
-            # Resample context
-            new_context_sample = select_k_shot_context(data, current_context_size, split_idx['train'])
+            # Check if K-Medoids sampling is enabled
+            use_kmedoids = getattr(args, 'use_kmedoids_sampling', False) if args is not None else False
+            
+            if use_kmedoids:
+                # Use K-Medoids clustering for context sampling
+                new_context_sample = sample_context_with_kmedoids(
+                    data, current_context_size, split_idx['train'], 
+                    use_kmedoids=True, random_state=epoch
+                )
+            else:
+                # Use original random sampling
+                from src.data_utils import select_k_shot_context
+                new_context_sample = select_k_shot_context(data, current_context_size, split_idx['train'])
+            
             data.context_sample = new_context_sample.to(data.context_sample.device)
-            print(f"    ✓ Refreshed {data.name}: {len(new_context_sample)} context samples")
+            sampling_method = "K-Medoids clustering" if use_kmedoids else "random sampling"
+            print(f"    ✓ Refreshed {data.name}: {len(new_context_sample)} context samples ({current_context_size} per class, {sampling_method})")
 
 
-def refresh_lp_contexts(lp_data, args):
+def refresh_lp_contexts(lp_data, args, epoch=None):
     """Refresh link prediction context samples"""
     if lp_data[0] is None:
         return
@@ -281,7 +765,7 @@ def refresh_lp_contexts(lp_data, args):
     
     # Refresh context for each dataset
     for i, (data, split_idx) in enumerate(zip(lp_data_list, lp_split_idx_list)):
-        context_shots = resolve_context_shots(data.name, 'lp', args)
+        context_shots = resolve_context_shots(data.name, 'lp', args, epoch)
         
         # Regenerate context
         link_data = lp_link_data_all[i]
@@ -297,7 +781,7 @@ def refresh_lp_contexts(lp_data, args):
             print(f"    ✓ Refreshed {data.name}: {context_shots} context shots")
 
 
-def refresh_gc_contexts(gc_data, args):
+def refresh_gc_contexts(gc_data, args, epoch=None):
     """Refresh graph classification context samples"""
     if len(gc_data[0]) == 0:
         return
@@ -309,15 +793,21 @@ def refresh_gc_contexts(gc_data, args):
     # This is more complex as it involves resampling from the original datasets
     for dataset_info in gc_processed_data_list:
         if 'dataset' in dataset_info:
-            # Regenerate task-filtered splits with new random sampling
+            dataset_name = dataset_info['dataset'].name if hasattr(dataset_info['dataset'], 'name') else 'GC dataset'
+            
+            # Get dynamic context shots for this dataset
+            context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch)
+            
+            # Regenerate task-filtered splits with new context size
+            # Note: This requires modifying create_task_filtered_datasets to accept context_k parameter
+            # For now, we'll regenerate with the current logic and note the context change
             task_filtered_splits = create_task_filtered_datasets(
                 dataset_info['dataset'], 
                 dataset_info['split_idx']
             )
             dataset_info['task_filtered_splits'] = task_filtered_splits
             
-            dataset_name = dataset_info['dataset'].name if hasattr(dataset_info['dataset'], 'name') else 'GC dataset'
-            print(f"    ✓ Refreshed {dataset_name}: context samples regenerated")
+            print(f"    ✓ Refreshed {dataset_name}: context samples regenerated (target: {context_shots} context shots)")
 
 
 def refresh_contexts_if_needed(epoch, args, data_dict):
@@ -328,22 +818,59 @@ def refresh_contexts_if_needed(epoch, args, data_dict):
         return
     
     print(f"\n🔄 Refreshing contexts at epoch {epoch} (interval: {args.context_refresh_interval})")
+    print(f"   Sampling plan: {getattr(args, 'context_sampling_plan', 'ori')}")
     
     # Set different seed for each refresh to ensure diversity
     refresh_seed = args.seed + epoch // args.context_refresh_interval
     torch.manual_seed(refresh_seed)
     
-    # Refresh each task
+    # Refresh each task with epoch information
     if getattr(args, 'enable_nc', True) and data_dict['nc_train'][0] is not None:
-        refresh_nc_contexts(data_dict['nc_train'])
+        refresh_nc_contexts(data_dict['nc_train'], args, epoch)
         
     if getattr(args, 'enable_lp', True) and data_dict['lp_train'][0] is not None:
-        refresh_lp_contexts(data_dict['lp_train'], args)
+        refresh_lp_contexts(data_dict['lp_train'], args, epoch)
         
     if getattr(args, 'enable_gc', True) and len(data_dict['gc_train'][0]) > 0:
-        refresh_gc_contexts(data_dict['gc_train'], args)
+        refresh_gc_contexts(data_dict['gc_train'], args, epoch)
     
     print("  ✅ Context refresh completed\n")
+
+
+def refresh_contexts_if_needed_batch(batch_idx, epoch, args, data_dict, task_type='all'):
+    """
+    Simple batch-level context refresh. Much more efficient than epoch-level.
+    
+    Args:
+        batch_idx (int): Current batch index within the task
+        epoch (int): Current epoch (for decay/random seed)
+        args: Command line arguments
+        data_dict: Data dictionary with contexts
+        task_type (str): Which task to refresh ('nc', 'lp', 'gc', 'all')
+    """
+    # Check if batch refresh is enabled and it's time to refresh
+    if args.context_batch_refresh_interval <= 0 or batch_idx % args.context_batch_refresh_interval != 0:
+        return
+    
+    # Skip if batch_idx is 0 (first batch of each task - no need to refresh immediately)
+    if batch_idx == 0:
+        return
+    
+    print(f"🔄 Batch refresh at batch {batch_idx} (interval: {args.context_batch_refresh_interval})")
+    
+    # Use batch index + epoch for seed diversity
+    refresh_seed = args.seed + epoch * 1000 + batch_idx
+    torch.manual_seed(refresh_seed)
+    
+    # Refresh specific task or all tasks
+    if task_type in ['nc', 'all'] and getattr(args, 'enable_nc', True) and data_dict['nc_train'][0] is not None:
+        refresh_nc_contexts(data_dict['nc_train'], args, epoch)
+        
+    if task_type in ['lp', 'all'] and getattr(args, 'enable_lp', True) and data_dict['lp_train'][0] is not None:
+        refresh_lp_contexts(data_dict['lp_train'], args, epoch)
+        
+    if task_type in ['gc', 'all'] and getattr(args, 'enable_gc', True) and len(data_dict['gc_train'][0]) > 0:
+        refresh_gc_contexts(data_dict['gc_train'], args, epoch)
 
 
 def setup_graph_dataset_environment(args):
@@ -476,7 +1003,7 @@ def create_unified_model(args, input_dim, device):
     return model, predictor, identity_projection
 
 
-def load_and_preprocess_data(args, device, skip_training_data=False):
+def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=None):
     """
     Load and preprocess data for enabled tasks.
     Returns processed datasets for node classification, link prediction, and graph classification.
@@ -512,6 +1039,14 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
                             args.normalize_data, False, 32, 0, args.padding_strategy, 
                             args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
                             args.incremental_pca_batch_size)
+                
+                # Apply K-Medoids sampling if enabled
+                if getattr(args, 'use_kmedoids_sampling', False):
+                    new_context_sample = sample_context_with_kmedoids(
+                        data, args.context_num, split_idx['train'], 
+                        use_kmedoids=True, random_state=args.seed
+                    )
+                    data.context_sample = new_context_sample.to(data.context_sample.device)
         else:
             print("  Skipping NC training data loading (using pretrained model)")
 
@@ -524,11 +1059,19 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
             data.adj_t = data.adj_t.to(device)
             data.y = data.y.to(device)
             # Resolve context shots for this specific dataset
-            context_shots = resolve_context_shots(data.name, 'nc', args)
+            context_shots = resolve_context_shots(data.name, 'nc', args, epoch=None)
             process_data(data, split_idx, args.hidden, context_shots, False, args.use_full_pca, 
                         args.normalize_data, False, 32, 0, args.padding_strategy, 
                         args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
                         args.incremental_pca_batch_size)
+            
+            # Apply K-Medoids sampling if enabled
+            if getattr(args, 'use_kmedoids_sampling', False):
+                new_context_sample = sample_context_with_kmedoids(
+                    data, context_shots, split_idx['train'], 
+                    use_kmedoids=True, random_state=args.seed
+                )
+                data.context_sample = new_context_sample.to(data.context_sample.device)
     else:
         print("Node classification task disabled, skipping dataset loading...")
     
@@ -575,41 +1118,41 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
         if not skip_training_data:
             for i, (data, split_idx) in enumerate(zip(lp_train_data_list, lp_train_split_idx_list)):
                 with lp_tracker.time_operation('data_preparation'):
-                # Move data.x to GPU temporarily for fast PCA computation
-                original_x_device = data.x.device
-                if data.x.device.type == 'cpu':
-                    print(f"[MEMORY_FIX] Moving {data.name} features to GPU for fast PCA computation")
-                    data.x = data.x.to(device)
+                    # Move data.x to GPU temporarily for fast PCA computation
+                    original_x_device = data.x.device
+                    if data.x.device.type == 'cpu':
+                        print(f"[MEMORY_FIX] Moving {data.name} features to GPU for fast PCA computation")
+                        data.x = data.x.to(device)
+                    
+                    # Process link-specific data (PCA will run on GPU now)
+                    process_link_data(data, args, rank=0)
+                    
+                    # Move ALL processed data back to CPU (not just data.x!)
+                    data.x = data.x.to(original_x_device)
+                    
+                    # Clean up additional GPU attributes created by process_link_data
+                    if hasattr(data, 'x_pca') and data.x_pca is not None:
+                        data.x_pca = data.x_pca.to(original_x_device)
+                    
+                    if hasattr(data, 'context_sample') and data.context_sample is not None:
+                        data.context_sample = data.context_sample.to(original_x_device)
+                        print(f"[MEMORY_FIX] Moved {data.name} context_sample back to CPU")
+                    
+                    print(f"[MEMORY_FIX] Moved {data.name} processed features back to CPU")
+                    
+                    # Prepare link data and select context
+                    link_data = prepare_link_data(data, split_idx)
                 
-                # Process link-specific data (PCA will run on GPU now)
-                process_link_data(data, args, rank=0)
+                with lp_tracker.time_operation('context_selection'):
+                    # Resolve context shots for this specific dataset
+                    context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
+                    context_data, train_mask = select_link_context(link_data['train'], context_shots, args.context_neg_ratio,
+                                                                   args.remove_context_from_train)
                 
-                # Move ALL processed data back to CPU (not just data.x!)
-                data.x = data.x.to(original_x_device)
-                
-                # Clean up additional GPU attributes created by process_link_data
-                if hasattr(data, 'x_pca') and data.x_pca is not None:
-                    data.x_pca = data.x_pca.to(original_x_device)
-                
-                if hasattr(data, 'context_sample') and data.context_sample is not None:
-                    data.context_sample = data.context_sample.to(original_x_device)
-                    print(f"[MEMORY_FIX] Moved {data.name} context_sample back to CPU")
-                
-                print(f"[MEMORY_FIX] Moved {data.name} processed features back to CPU")
-                
-                # Prepare link data and select context
-                link_data = prepare_link_data(data, split_idx)
-            
-            with lp_tracker.time_operation('context_selection'):
-                # Resolve context shots for this specific dataset
-                context_shots = resolve_context_shots(data.name, 'lp', args)
-                context_data, train_mask = select_link_context(link_data['train'], context_shots, args.context_neg_ratio,
-                                                               args.remove_context_from_train)
-            
-                lp_train_context_data.append(context_data)
-                lp_train_masks.append(train_mask)
-                lp_train_link_data_all.append(link_data)
-                lp_tracker.operation_counts['datasets_processed'] += 1
+                    lp_train_context_data.append(context_data)
+                    lp_train_masks.append(train_mask)
+                    lp_train_link_data_all.append(link_data)
+                    lp_tracker.operation_counts['datasets_processed'] += 1
         else:
             print("  Skipping LP training data processing (using pretrained model)")
         
@@ -657,7 +1200,7 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
             
             with lp_tracker.time_operation('context_selection'):
                 # Resolve context shots for this specific dataset
-                context_shots = resolve_context_shots(data.name, 'lp', args)
+                context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
                 context_data, _ = select_link_context(link_data['train'], context_shots, args.context_neg_ratio, False)
             
             lp_test_context_data.append(context_data)
@@ -673,23 +1216,51 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
     if args.enable_gc:
         print("Loading graph classification datasets...")
         
+        if gc_tracker:
+            gc_tracker.log_memory("gc_data_loading_start")
+        
         # Setup graph dataset environment BEFORE loading datasets
         setup_graph_dataset_environment(args)
+        
+        if gc_tracker:
+            gc_tracker.log_memory("gc_environment_setup_complete")
         
         gc_train_datasets = args.gc_train_dataset.split(',')
         gc_test_datasets = args.gc_test_dataset.split(',')
         
         # Load training data for graph classification (skip if using pretrained model)
         if not skip_training_data:
-            gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets(
-                gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num
-            )
+            if gc_tracker:
+                gc_tracker.log_memory("gc_train_data_loading_start")
+            
+            # Use cache-aware loading for training data
+            from src.data_graph_cache_aware import load_all_graph_datasets_cache_aware
+            try:
+                gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets_cache_aware(
+                    gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num,
+                    hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
+                )
+                print(f"✅ Used cache-aware loading for training datasets")
+            except ImportError:
+                print(f"⚠️  Cache-aware module not available, using standard loading")
+                gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets(
+                    gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num
+                )
+            
+            if gc_tracker:
+                gc_tracker.log_memory("gc_train_data_loaded_raw")
             
             # Process graph classification training data
             if len(gc_train_data_list) > 0:
+                if gc_tracker:
+                    gc_tracker.log_memory("gc_train_data_processing_start")
+                    
                 gc_train_data_list, gc_train_processed_data_list, _ = process_datasets_for_models(
                     gc_train_data_list, gc_train_processed_data_list, args, device
                 )
+                
+                if gc_tracker:
+                    gc_tracker.log_memory("gc_train_data_processed")
                 
                 # Precompute task-filtered splits once for efficiency
                 print("Precomputing task-filtered splits for training datasets...")
@@ -704,28 +1275,76 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
             print("  Skipping GC training data loading (using pretrained model)")
         
         # Load test data for graph classification
+        if gc_tracker:
+            gc_tracker.log_memory("gc_test_data_loading_start")
+            
         # Handle per-dataset context resolution for GC test datasets
         gc_test_data_list = []
         gc_test_processed_data_list = []
+        
+        # Use cache-aware loading for test datasets
+        from src.data_graph_cache_aware import load_all_graph_datasets_cache_aware, check_pca_cache_availability
+        
+        # Check cache status for all test datasets
+        cache_status = check_pca_cache_availability(gc_test_datasets, args.hidden, args.pca_cache_dir)
+        cache_hits = sum(cache_status.values())
+        total_datasets = len(gc_test_datasets)
+        print(f"📊 Test Dataset Cache Status: {cache_hits}/{total_datasets} datasets have PCA cache")
+        
+        # Estimate potential memory savings
+        if cache_hits > 0:
+            estimated_savings = cache_hits * 48  # Rough estimate: 48GB per dataset
+            print(f"🎉 Estimated memory savings: ~{estimated_savings}GB!")
+        
         for dataset_name in gc_test_datasets:
             dataset_name = dataset_name.strip()
+            if gc_tracker:
+                gc_tracker.log_memory(f"gc_test_dataset_{dataset_name}_loading_start")
+                
             # Resolve context shots for this specific dataset
-            context_shots = resolve_context_shots(dataset_name, 'gc', args)
-            # Load each dataset individually with its specific context shots
-            single_data_list, single_processed_list = load_all_graph_datasets(
-                [dataset_name], device, context_k=context_shots
-            )
+            context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch=None)
+            
+            # Use cache-aware loading for individual datasets
+            try:
+                single_data_list, single_processed_list = load_all_graph_datasets_cache_aware(
+                    [dataset_name], device, context_k=context_shots,
+                    hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
+                )
+                cache_used = cache_status.get(dataset_name, False)
+                memory_status = " (🚀 Cache used - 48GB saved!)" if cache_used else " (Full loading)"
+                print(f"  {dataset_name}: Loaded{memory_status}")
+            except ImportError:
+                print(f"⚠️  Cache-aware module not available for {dataset_name}, using standard loading")
+                single_data_list, single_processed_list = load_all_graph_datasets(
+                    [dataset_name], device, context_k=context_shots
+                )
+            
             gc_test_data_list.extend(single_data_list)
             gc_test_processed_data_list.extend(single_processed_list)
+            
+            if gc_tracker:
+                gc_tracker.log_memory(f"gc_test_dataset_{dataset_name}_loaded")
+        
+        if gc_tracker:
+            gc_tracker.log_memory("gc_test_data_all_datasets_loaded")
         
         # Process graph classification test data
         if len(gc_test_data_list) > 0:
+            if gc_tracker:
+                gc_tracker.log_memory("gc_test_data_processing_start")
+                
             gc_test_data_list, gc_test_processed_data_list, _ = process_datasets_for_models(
                 gc_test_data_list, gc_test_processed_data_list, args, device, test_datasets=True
             )
             
+            if gc_tracker:
+                gc_tracker.log_memory("gc_test_data_processed")
+            
             # Precompute task-filtered splits once for efficiency
             print("Precomputing task-filtered splits for test datasets...")
+            if gc_tracker:
+                gc_tracker.log_memory("gc_test_splits_filtering_start")
+                
             for dataset_info in gc_test_processed_data_list:
                 # For test datasets, only filter the test split (no need to filter train/val)
                 task_filtered_splits_test = create_task_filtered_datasets(
@@ -739,7 +1358,7 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
     else:
         print("Graph classification task disabled, skipping dataset loading...")
     
-    return {
+    data_dict = {
         'nc_train': (nc_train_data_list, nc_train_split_idx_list),
         'nc_test': (nc_test_data_list, nc_test_split_idx_list),
         'lp_train': (lp_train_data_list, lp_train_split_idx_list, lp_train_context_data, lp_train_masks, lp_train_link_data_all),
@@ -747,6 +1366,11 @@ def load_and_preprocess_data(args, device, skip_training_data=False):
         'gc_train': (gc_train_data_list, gc_train_processed_data_list),
         'gc_test': (gc_test_data_list, gc_test_processed_data_list)
     }
+    
+    if gc_tracker:
+        gc_tracker.log_memory("all_data_loading_complete")
+    
+    return data_dict
 
 
 def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch, 
@@ -783,7 +1407,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                           batch_size=args.nc_batch_size, degree=False, 
                           orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h, 
                           clip_grad=args.clip_grad, rank=0, epoch=epoch, 
-                          identity_projection=identity_projection, lambda_=args.lambda_nc)
+                          identity_projection=identity_projection, lambda_=args.lambda_nc, args=args)
         if nc_loss is not None:
             total_nc_loss = nc_loss
             nc_count = len(nc_data_list)
@@ -817,7 +1441,8 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                             identity_projection=identity_projection, 
                             clip_grad=args.clip_grad, rank=0, orthogonal_push=args.orthogonal_push, 
                             normalize_class_h=args.normalize_class_h, epoch=epoch, 
-                            mask_target_edges=args.mask_target_edges, degree=False, lambda_=args.lambda_lp
+                            mask_target_edges=args.mask_target_edges, degree=False, lambda_=args.lambda_lp,
+                            args=args
                         )
                     
                     # Move all data back to CPU to free GPU memory
@@ -845,18 +1470,25 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     
     # Graph Classification Loss
     if hasattr(args, 'enable_gc') and args.enable_gc and len(gc_data_list) > 0 and args.lambda_gc > 0:
+        gc_tracker.log_memory("gc_section_start")
         gc_loss_sum = 0.0
         gc_dataset_count = 0
         
         for dataset_idx, dataset_info in enumerate(gc_processed_data_list):
+            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_start")
+            
             # Use precomputed task-filtered splits
             task_filtered_splits = dataset_info['task_filtered_splits']
             
             dataset_loss = 0.0
             dataset_tasks = 0
             
+            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_splits_loaded")
+            
             # Train on each task separately using prefiltered data
             for task_idx, task_splits in task_filtered_splits.items():
+                gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_task_{task_idx}_start")
+                
                 # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
                 use_index_tracking = ('fug_mapping' in dataset_info or 
                                     'tsgfm_mapping' in dataset_info or 
@@ -872,6 +1504,9 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     use_index_tracking=use_index_tracking
                 )
                 
+                # Track memory before graph classification training
+                gc_tracker.log_memory(f"gc_task_{task_idx}_training_start")
+                
                 # Train on this specific task
                 task_loss = train_graph_classification_single_task(
                     model, predictor, dataset_info, task_data_loaders, optimizer, task_idx,
@@ -880,18 +1515,28 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     normalize_class_h=args.normalize_class_h, identity_projection=identity_projection
                 )
                 
+                # Track memory after graph classification training
+                gc_tracker.log_memory(f"gc_task_{task_idx}_training_complete")
+                
                 dataset_loss += task_loss
                 dataset_tasks += 1
+            
+            # Track memory after processing all tasks for this dataset
+            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_all_tasks_complete")
             
             # Average loss across tasks for this dataset
             if dataset_tasks > 0:
                 avg_dataset_loss = dataset_loss / dataset_tasks
                 gc_loss_sum += avg_dataset_loss
                 gc_dataset_count += 1
+                
+            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_complete")
         
         if gc_dataset_count > 0:
             total_gc_loss = args.lambda_gc * (gc_loss_sum / gc_dataset_count)
             gc_count = gc_dataset_count
+            
+        gc_tracker.log_memory("gc_section_complete")
     
     # Combined loss
     combined_loss = total_nc_loss + total_lp_loss + total_gc_loss
@@ -1035,7 +1680,7 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
     return results
 
 
-def evaluate_graph_classification_task(model, predictor, gc_data, args, split='valid', identity_projection=None):
+def evaluate_graph_classification_task(model, predictor, gc_data, args, split='valid', identity_projection=None, gc_tracker=None):
     """
     Evaluate graph classification task only.
     
@@ -1045,16 +1690,25 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
     model.eval()
     predictor.eval()
     
+    if gc_tracker:
+        gc_tracker.log_memory(f"eval_{split}_start")
+    
     results = {}
     
     with torch.no_grad():
         gc_data_list, gc_processed_data_list = gc_data
+        
+        if gc_tracker:
+            gc_tracker.log_memory(f"eval_{split}_data_loaded")
         
         if len(gc_data_list) > 0:
             all_dataset_results = []
             individual_results = []
             
             for dataset_idx, dataset_info in enumerate(gc_processed_data_list):
+                if gc_tracker:
+                    gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_start")
+                    
                 dataset_name = dataset_info['dataset'].name if hasattr(dataset_info['dataset'], 'name') else f'gc_dataset_{dataset_idx}'
                 
                 # Use precomputed task-filtered datasets
@@ -1095,18 +1749,70 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             use_index_tracking=use_index_tracking
                         )
                     
-                    # Evaluate this specific task
-                    task_eval_results = evaluate_graph_classification_single_task(
-                        model, predictor, dataset_info, task_eval_loaders, task_idx,
-                        pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
-                        normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
-                    )
+                    # Debug: Check profiling setting
+                    profiling_enabled = getattr(args, 'enable_profiling', False)
+                    print(f"      [DEBUG] Task {task_idx}: enable_profiling = {profiling_enabled}")
+                    
+                    if gc_tracker:
+                        gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_before_eval")
+                    
+                    # Per-task profiling if enabled
+                    if profiling_enabled:
+                        from torch.profiler import profile, record_function, ProfilerActivity
+                        prof = profile(
+                            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                            record_shapes=True,
+                            profile_memory=True,
+                            with_stack=True
+                        )
+                        prof.start()
+                        with record_function(f"gc_eval_{dataset_name}_task_{task_idx}"):
+                            # Evaluate this specific task
+                            task_eval_results = evaluate_graph_classification_single_task(
+                                model, predictor, dataset_info, task_eval_loaders, task_idx,
+                                pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
+                                normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
+                            )
+                        prof.stop()
+                        
+                        if gc_tracker:
+                            gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_profiled_eval")
+                        
+                        # Save per-task profiling results
+                        profile_filename = f"gc_eval_{dataset_name}_task_{task_idx}.json"
+                        prof.export_chrome_trace(profile_filename)
+                        print(f"      [PROFILING] Task {task_idx}: Saved profiling to {profile_filename}")
+                        
+                        # Print top CPU functions for this task
+                        print(f"      [PROFILING] Task {task_idx} Top CPU ops:")
+                        cpu_table = prof.key_averages().table(sort_by="cpu_time_total", row_limit=5)
+                        for line in cpu_table.split('\n')[:7]:  # Header + top 5 rows
+                            if line.strip():
+                                print(f"        {line}")
+                    else:
+                        # Evaluate this specific task
+                        task_eval_results = evaluate_graph_classification_single_task(
+                            model, predictor, dataset_info, task_eval_loaders, task_idx,
+                            pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
+                            normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
+                        )
+                        
+                        if gc_tracker:
+                            gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_eval")
+                    
+                    
+                    if gc_tracker:
+                        gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_complete")
                     
                     # Extract the appropriate split result
                     split_result = task_eval_results.get(split, 0.0)
                     task_results.append(split_result)
                 
                 # Aggregate results across tasks for this dataset
+                # Task accumulation completed for this dataset
+                if gc_tracker:
+                    gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_tasks_complete")
+                
                 if task_results:
                     dataset_avg = aggregate_task_metrics(task_results)
                     # For averaging across datasets, extract primary metric if multiple metrics
@@ -1120,6 +1826,9 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                 else:
                     all_dataset_results.append(0.0)
                     individual_results.append(0.0)
+                    
+                if gc_tracker:
+                    gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_complete")
             
             # Calculate overall average
             if all_dataset_results:
@@ -1137,12 +1846,15 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     'test': 0.0,
                     'individual_test_metrics': []
                 }
+                
+        if gc_tracker:
+            gc_tracker.log_memory(f"eval_{split}_complete")
     
     return results
 
 
 def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='valid',
-                    identity_projection=None):
+                    identity_projection=None, gc_tracker=None):
     """
     Evaluate enabled tasks and return metrics.
     
@@ -1164,7 +1876,7 @@ def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='v
     
     # Evaluate graph classification
     if hasattr(args, 'enable_gc') and args.enable_gc and gc_data is not None and len(gc_data[0]) > 0:
-            gc_results = evaluate_graph_classification_task(model, predictor, gc_data, args, split, identity_projection)
+            gc_results = evaluate_graph_classification_task(model, predictor, gc_data, args, split, identity_projection, gc_tracker)
             results['gc_metrics'] = gc_results
     
     return results
@@ -1174,8 +1886,8 @@ def run_joint_training(args, device='cuda:0'):
     """
     Main joint training function.
     """
-    # Declare global lp_tracker at the very beginning
-    global lp_tracker
+    # Declare global trackers at the very beginning
+    global lp_tracker, gc_tracker
     
     print(f"\n=== Starting Joint Training ===")
     print(f"Device: {device}")
@@ -1192,6 +1904,17 @@ def run_joint_training(args, device='cuda:0'):
         lp_tracker.record_memory()
         initial_stats = lp_tracker.get_memory_stats()
         print(f"Initial Memory - GPU: {initial_stats['gpu_allocated']:.2f}GB, CPU: {initial_stats['cpu_memory']:.2f}GB")
+    
+    # Initialize graph classification tracker early if graph classification is enabled
+    if getattr(args, 'enable_gc', True) and gc_tracker is None:
+        gc_tracker = GraphClassificationTracker(device=device)
+        print(f"✓ Graph Classification Tracker initialized on {device}")
+        # Record initial memory state
+        gc_tracker.record_memory()
+        initial_stats = gc_tracker.get_memory_stats()
+        print(f"[GC-MEMORY] Initial Memory - GPU: {initial_stats['gpu_allocated']:.2f}GB, "
+              f"CPU: {initial_stats['cpu_memory']:.2f}GB, System: {initial_stats['system_memory_percent']:.1f}% used")
+        gc_tracker.log_memory_spike_warning(threshold_gb=4.0)  # Lower threshold for initial warning
     
     # Initialize logging
     logger = TrainingLogger(
@@ -1224,11 +1947,19 @@ def run_joint_training(args, device='cuda:0'):
     
     # Load and preprocess data (skip training data if using pretrained model)
     with lp_tracker.time_operation('data_preparation') if lp_tracker else nullcontext():
-        data_dict = load_and_preprocess_data(args, device, skip_training_data=args.use_pretrained_model)
+        with gc_tracker.time_operation('dataset_processing') if gc_tracker else nullcontext():
+            data_dict = load_and_preprocess_data(args, device, skip_training_data=args.use_pretrained_model, gc_tracker=gc_tracker)
     
     if lp_tracker:
         lp_tracker.record_memory()
         after_data_stats = lp_tracker.get_memory_stats()
+    
+    if gc_tracker:
+        gc_tracker.record_memory()
+        after_data_stats = gc_tracker.get_memory_stats()
+        print(f"[GC-MEMORY] After Data Loading - CPU: {after_data_stats['cpu_memory']:.2f}GB, "
+              f"GPU: {after_data_stats['gpu_allocated']:.2f}GB")
+        gc_tracker.log_memory_spike_warning(threshold_gb=6.0)
         print(f"After Data Loading - GPU: {after_data_stats['gpu_allocated']:.2f}GB, CPU: {after_data_stats['cpu_memory']:.2f}GB")
     
     # Create unified model
@@ -1301,7 +2032,7 @@ def run_joint_training(args, device='cuda:0'):
             # Graph Classification Test on unseen datasets
             if getattr(args, 'enable_gc', True) and len(data_dict['gc_test'][0]) > 0:
                 gc_test_results = evaluate_graph_classification_task(
-                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection
+                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker
                 )
             
             # Print and log final results
@@ -1309,9 +2040,26 @@ def run_joint_training(args, device='cuda:0'):
             lp_test_metric = lp_test_results.get('test', 0.0)
             gc_test_metric = gc_test_results.get('test', 0.0)
             
-            final_results_msg = (f"Node Classification Test: {nc_test_metric:.4f}\n"
-                                f"Link Prediction Test: {lp_test_metric:.4f}\n"
-                                f"Graph Classification Test: {gc_test_metric:.4f}")
+            # Handle case where test metrics might be dictionaries (e.g., PCBA)
+            if isinstance(nc_test_metric, dict):
+                nc_test_metric = nc_test_metric.get('auc', nc_test_metric.get('ap', list(nc_test_metric.values())[0] if nc_test_metric else 0.0))
+            if isinstance(lp_test_metric, dict):
+                lp_test_metric = lp_test_metric.get('auc', lp_test_metric.get('ap', list(lp_test_metric.values())[0] if lp_test_metric else 0.0))
+            if isinstance(gc_test_metric, dict):
+                gc_test_metric = gc_test_metric.get('auc', gc_test_metric.get('ap', list(gc_test_metric.values())[0] if gc_test_metric else 0.0))
+            
+            final_results_msg = f"Node Classification Test: {nc_test_metric:.4f}\n"
+            
+            # Add LP results with individual dataset breakdown
+            final_results_msg += f"Link Prediction Test: {lp_test_metric:.4f}\n"
+            lp_individual = lp_test_results.get('individual_test_metrics', [])
+            if lp_individual and hasattr(args, 'lp_test_dataset'):
+                lp_test_datasets = args.lp_test_dataset.split(',')
+                for dataset_name, metric in zip(lp_test_datasets, lp_individual):
+                    final_results_msg += f"  {dataset_name.strip()}: {metric:.4f}\n"
+            
+            final_results_msg += f"Graph Classification Test: {gc_test_metric:.4f}"
+            
             print(final_results_msg)
             logger.info(final_results_msg, LogLevel.INFO)
             
@@ -1371,7 +2119,7 @@ def run_joint_training(args, device='cuda:0'):
         # Every epoch: Validation on seen datasets (training data) for early stopping
         seen_valid_results = joint_evaluation(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
-            args, 'valid', identity_projection
+            args, 'valid', identity_projection, gc_tracker
         )
         
         # Compute combined validation score on seen datasets
@@ -1410,7 +2158,7 @@ def run_joint_training(args, device='cuda:0'):
             
             if getattr(args, 'enable_gc', True) and len(data_dict['gc_test'][0]) > 0:
                 gc_unseen_results = evaluate_graph_classification_task(
-                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection
+                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker
                 )
             
             nc_test_unseen = nc_unseen_results.get('test', 0.0)
@@ -1486,6 +2234,15 @@ def run_joint_training(args, device='cuda:0'):
                 # Log to wandb
                 lp_tracker.log_to_wandb()
             
+            # Log graph classification tracking stats
+            if gc_tracker is not None and getattr(args, 'enable_gc', True):
+                # Print detailed tracking summary every 10 epochs or at the first epoch
+                if epoch % (args.log_interval * 10) == 0 or epoch == 0:
+                    gc_tracker.print_summary(epoch)
+                
+                # Log to wandb
+                gc_tracker.log_to_wandb()
+            
             # Log to wandb
             wandb_log = {
                 'epoch': epoch,
@@ -1538,13 +2295,21 @@ def run_joint_training(args, device='cuda:0'):
     # Graph Classification Test on unseen datasets
     if getattr(args, 'enable_gc', True) and len(data_dict['gc_test'][0]) > 0:
         gc_test_results = evaluate_graph_classification_task(
-            model, predictor, data_dict['gc_test'], args, 'test', identity_projection
+            model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker
         )
     
     # Print and log final results
     nc_test_metric = nc_test_results.get('test', 0.0)
     lp_test_metric = lp_test_results.get('test', 0.0)
     gc_test_metric = gc_test_results.get('test', 0.0)
+    
+    # Handle case where test metrics might be dictionaries (e.g., PCBA)
+    if isinstance(nc_test_metric, dict):
+        nc_test_metric = nc_test_metric.get('auc', nc_test_metric.get('ap', list(nc_test_metric.values())[0] if nc_test_metric else 0.0))
+    if isinstance(lp_test_metric, dict):
+        lp_test_metric = lp_test_metric.get('auc', lp_test_metric.get('ap', list(lp_test_metric.values())[0] if lp_test_metric else 0.0))
+    if isinstance(gc_test_metric, dict):
+        gc_test_metric = gc_test_metric.get('auc', gc_test_metric.get('ap', list(gc_test_metric.values())[0] if gc_test_metric else 0.0))
     
     final_results_msg = (f"Node Classification Test: {nc_test_metric:.4f}\n"
                         f"Link Prediction Test: {lp_test_metric:.4f}\n"
@@ -1566,6 +2331,11 @@ def run_joint_training(args, device='cuda:0'):
     if lp_tracker is not None and getattr(args, 'enable_lp', True):
         print("\n=== Final Link Prediction Performance Summary ===")
         lp_tracker.print_summary()
+    
+    # Add final graph classification tracking summary
+    if gc_tracker is not None and getattr(args, 'enable_gc', True):
+        print("\n=== Final Graph Classification Performance Summary ===")
+        gc_tracker.print_summary()
         lp_tracker.log_to_wandb(prefix="final_lp_tracker")
         
         # Add final summary stats to wandb

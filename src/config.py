@@ -356,6 +356,18 @@ def parse_joint_training_args():
     # === Dynamic Context Refresh ===
     parser.add_argument('--context_refresh_interval', type=int, default=0,
                        help='Refresh contexts every N epochs (0 = never refresh)')
+    parser.add_argument('--context_batch_refresh_interval', type=int, default=0,
+                       help='Refresh contexts every N batches within each task (0 = disabled)')
+    parser.add_argument('--context_sampling_plan', type=str, default='ori', choices=['ori', 'random', 'decay'],
+                       help='Context sampling strategy: ori=original fixed, random=random sampling, decay=gradual decay')
+    parser.add_argument('--context_bounds', type=str, default='(5,20)(8,128)(8,24)',
+                       help='Context bounds for NC/LP/GC: (lower,upper)(lower,upper)(lower,upper). Used for random sampling range and decay start/end.')
+    parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=False,
+                       help='Use K-Medoids clustering to guide context sampling for better representativeness')
+    
+    # === Profiling and Performance ===
+    parser.add_argument('--enable_profiling', type=str2bool, default=False,
+                       help='Enable PyTorch profiler during evaluation to track CPU/GPU usage')
     
     # === Joint Multi-Task Training (TSGFM-style) ===
 # Removed joint multitask arguments - only using task-specific and full batch training
