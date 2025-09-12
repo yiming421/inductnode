@@ -813,89 +813,79 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
             reservoirs[task_idx] = {0: [], 1: []}
             counts[task_idx] = {0: 0, 1: 0}
         
-        # Hybrid CPU-GPU approach - GPU for filtering, CPU for sampling
-        print(f"  Hybrid CPU-GPU sampling for {num_tasks} tasks across {len(split_idx['train'])} graphs...")
+        # Optimized vectorized reservoir sampling approach
+        print(f"  Vectorized sampling for {num_tasks} tasks across {len(split_idx['train'])} graphs...")
         
         train_indices = split_idx['train']
         
-        # For reservoir sampling, CPU-only is often faster due to random number generation
-        # But we can use smart batching and early termination
-        
-        # Track completion status for early termination
-        completed_tasks = set()
-        total_combinations = num_tasks * 2  # tasks × classes
-        
-        graphs_processed = 0
-        for idx in train_indices:
-            # Convert tensor index to integer for dataset access
-            idx_int = idx.item() if torch.is_tensor(idx) else idx
-            graphs_processed += 1
+        # --- STAGE 1: Pre-fetch all labels and masks ---
+        train_indices_tensor = torch.as_tensor(train_indices, dtype=torch.long)
+        num_train_samples = len(train_indices_tensor)
+
+        # Pre-allocate tensors to store all labels and masks
+        train_labels = torch.empty((num_train_samples, num_tasks), dtype=torch.long)
+        train_masks = torch.empty((num_train_samples, num_tasks), dtype=torch.bool)
+
+        for i, idx in enumerate(train_indices_tensor):
+            graph = dataset[idx.item()]
             
-            # Early termination: stop when all reservoirs are full
-            if len(completed_tasks) >= total_combinations:
-                print(f"  Early termination: all reservoirs full after {graphs_processed} graphs")
-                break
-                
-            graph = dataset[idx_int]
-            
-            # Handle OGB caching: create task_mask on-the-fly if missing
+            # Get/create the task mask
             if not hasattr(graph, 'task_mask'):
                 if graph.y.dtype.is_floating_point:
-                    graph.task_mask = (~torch.isnan(graph.y)).float()
+                    mask = ~torch.isnan(graph.y)
                 else:
-                    graph.task_mask = (graph.y != -1).float()
-            
-            # FIX: Get column indices (task indices), not row indices
-            valid_tasks = torch.where(graph.task_mask.squeeze() > 0)[0]
-            
-            # Process all valid tasks for this graph efficiently
-            for task_idx in valid_tasks:
-                task_idx_int = task_idx.item()
+                    mask = (graph.y != -1)
+            else:
+                mask = graph.task_mask
                 
-                # Handle different y tensor shapes for multi-task datasets
-                if graph.y.dim() == 2 and graph.y.size(0) == 1:
-                    # Shape [1, num_tasks] - need to access [0, task_idx]
-                    class_label = graph.y[0, task_idx_int].item()
-                elif graph.y.dim() == 1:
-                    # Shape [num_tasks] - can access [task_idx] directly
-                    class_label = graph.y[task_idx_int].item()
+            train_masks[i] = mask.view(-1).bool()
+            # Store labels, filling invalid ones with a placeholder like -1
+            train_labels[i] = torch.where(mask.view(-1).bool(), graph.y.view(-1), -1)
+
+        print("Pre-fetching complete.")
+
+        # --- STAGE 2: Populate reservoirs using vectorized lookups ---
+        # Initialize the data structures for the results
+        reservoirs = [[[] for _ in range(2)] for _ in range(num_tasks)] # For classes [0, 1]
+
+        # Loop through each task and class to populate its reservoir
+        for task_idx in range(num_tasks):
+            for class_label in [0, 1]:
+                # Vectorized check for valid samples for this specific (task, class) pair
+                # 1. Find samples that are valid for this task.
+                mask_is_valid = train_masks[:, task_idx]
+                # 2. Find samples that have the correct class label for this task.
+                label_is_correct = train_labels[:, task_idx] == class_label
+                
+                # Combine masks to get the final set of candidate indices (relative to train_indices)
+                final_mask = mask_is_valid & label_is_correct
+                relative_indices = torch.where(final_mask)[0]
+                
+                # Map back to the original dataset indices
+                candidate_indices = train_indices_tensor[relative_indices].numpy()
+                
+                # Perform reservoir sampling in one shot
+                if len(candidate_indices) == 0:
+                    continue # No samples found for this combination
+                
+                if len(candidate_indices) <= context_k:
+                    # If we have fewer candidates than the reservoir size, take all of them
+                    reservoirs[task_idx][class_label] = candidate_indices.tolist()
                 else:
-                    # Flatten and access by index
-                    class_label = graph.y.flatten()[task_idx_int].item()
-                
-                if class_label in [0, 1]:
-                    
-                    reservoir = reservoirs[task_idx_int][class_label]
-                    count = counts[task_idx_int][class_label]
-                    
-                    # Check if this (task, class) combination is already complete
-                    task_class_key = (task_idx_int, class_label)
-                    if task_class_key in completed_tasks:
-                        continue
-                    
-                    count += 1
-                    if len(reservoir) < context_k:
-                        reservoir.append(idx)
-                        # Mark as complete when reservoir is full
-                        if len(reservoir) == context_k:
-                            completed_tasks.add(task_class_key)
-                    else:
-                        # Reservoir sampling replacement
-                        j = np.random.randint(0, count)
-                        if j < context_k:
-                            reservoir[j] = idx
-                    
-                    counts[task_idx_int][class_label] = count
+                    # If we have more, take a random sample without replacement
+                    sampled_indices = np.random.choice(
+                        candidate_indices, 
+                        size=context_k, 
+                        replace=False
+                    )
+                    reservoirs[task_idx][class_label] = sampled_indices.tolist()
         
         sampling_time = time.time() - sampling_start
         
         # Step 2.5: Transfer reservoirs to task_contexts
         for task_idx in range(num_tasks):
             for class_label in [0, 1]:
-                if task_idx in reservoirs and class_label in reservoirs[task_idx]:
-                    task_contexts[task_idx][class_label] = list(reservoirs[task_idx][class_label])
-                else:
-                    task_contexts[task_idx][class_label] = []
+                task_contexts[task_idx][class_label] = reservoirs[task_idx][class_label]
         
         # Step 3: GPU memory deduplication (only at the end)
         dedup_start = time.time()
@@ -1188,36 +1178,53 @@ def create_task_filtered_datasets(dataset, split_idx, filter_split=None):
     else:
         print(f"Prefiltering dataset for {num_tasks} tasks...")
     
+    # --- STAGE 1: Pre-compute the task mask for the ENTIRE dataset ---
+    # This loop runs only ONCE over the dataset.
+    print("Pre-computing task masks for the entire dataset...")
+    all_task_masks = torch.empty((len(dataset), num_tasks), dtype=torch.bool)
+
+    for i, graph in enumerate(dataset):
+        # Create task_mask on-the-fly if missing
+        if not hasattr(graph, 'task_mask'):
+            if graph.y.dtype.is_floating_point:
+                # Check for NaN for floating point labels
+                mask = ~torch.isnan(graph.y)
+            else:
+                # Check for -1 for integer labels
+                mask = (graph.y != -1)
+        else:
+            mask = graph.task_mask
+
+        # Ensure mask has the correct shape and store it
+        all_task_masks[i] = mask.view(-1).bool()
+
+    print("Pre-computation complete.")
+
+    # --- STAGE 2: Perform efficient, vectorized filtering ---
+    task_filtered_splits = {}
+
     for task_idx in range(num_tasks):
         task_filtered_splits[task_idx] = {}
         
+        # Get the boolean validity mask for the current task
+        # This is a tensor of shape [len(dataset)]
+        task_validity_mask = all_task_masks[:, task_idx]
+
         for split_name, indices in split_idx.items():
             if filter_split is None or split_name == filter_split:
-                # Apply task filtering to this split
-                valid_indices = []
+                # Convert split indices to a tensor
+                split_indices_tensor = torch.as_tensor(indices, dtype=torch.long)
                 
-                for idx in indices:
-                    idx_int = idx.item() if torch.is_tensor(idx) else idx
-                    graph = dataset[idx_int]
-                    
-                    # Create task_mask on-the-fly if missing (same as context sampling)
-                    if not hasattr(graph, 'task_mask'):
-                        if graph.y.dtype.is_floating_point:
-                            graph.task_mask = (~torch.isnan(graph.y)).float()
-                        else:
-                            graph.task_mask = (graph.y != -1).float()
-                    
-                    if graph.task_mask[0][task_idx]:
-                        valid_indices.append(idx_int)
+                # Use the split indices to select the relevant masks
+                mask_for_this_split = task_validity_mask[split_indices_tensor]
                 
-                task_filtered_splits[task_idx][split_name] = valid_indices
+                # Apply the boolean mask to get the final valid indices
+                valid_indices = split_indices_tensor[mask_for_this_split]
+                
+                task_filtered_splits[task_idx][split_name] = valid_indices.tolist()
             else:
                 # Don't filter this split, use original indices
-                # Convert to list for consistency
-                if hasattr(indices, 'tolist'):
-                    task_filtered_splits[task_idx][split_name] = indices.tolist()
-                else:
-                    task_filtered_splits[task_idx][split_name] = indices
+                task_filtered_splits[task_idx][split_name] = indices.tolist() if hasattr(indices, 'tolist') else indices
             
         # Log filtering results
         if filter_split is None:

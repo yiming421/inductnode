@@ -264,7 +264,7 @@ def parse_joint_training_args():
     parser.add_argument('--lr', type=float, default=0.00001152103060806947, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.005, help='Weight decay')
     parser.add_argument('--schedule', type=str, default='warmup', choices=['cosine', 'step', 'warmup', 'none'])
-    parser.add_argument('--nc_batch_size', type=int, default=16384, help='Node classification batch size')
+    parser.add_argument('--nc_batch_size', type=int, default=8192, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=65536, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
@@ -360,7 +360,7 @@ def parse_joint_training_args():
                        help='Refresh contexts every N batches within each task (0 = disabled)')
     parser.add_argument('--context_sampling_plan', type=str, default='ori', choices=['ori', 'random', 'decay'],
                        help='Context sampling strategy: ori=original fixed, random=random sampling, decay=gradual decay')
-    parser.add_argument('--context_bounds', type=str, default='(5,20)(8,128)(8,24)',
+    parser.add_argument('--context_bounds', type=str, default='(1,20)(1,32)(1,32)',
                        help='Context bounds for NC/LP/GC: (lower,upper)(lower,upper)(lower,upper). Used for random sampling range and decay start/end.')
     parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=False,
                        help='Use K-Medoids clustering to guide context sampling for better representativeness')
@@ -490,7 +490,7 @@ def parse_graph_classification_args():
     # Data processing arguments
     parser.add_argument('--min_pca_dim', type=int, default=32,
                         help='Minimum PCA dimension')
-    parser.add_argument('--padding_strategy', type=str, default='zero',
+    parser.add_argument('--padding_strategy', type=str, default='random',
                         help='Padding strategy for graph classification')
     parser.add_argument('--use_batchnorm', type=str2bool, default=True,
                         help='Use batch normalization')

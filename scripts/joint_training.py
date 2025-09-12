@@ -157,11 +157,6 @@ class LinkPredictionTracker:
         
         return summary
     
-    def log_to_wandb(self, prefix="lp_tracker"):
-        """Log tracking statistics to wandb."""
-        summary = self.get_summary_stats()
-        wandb_log = {f"{prefix}/{key}": value for key, value in summary.items()}
-        wandb.log(wandb_log)
     
     def print_summary(self, epoch=None):
         """Print a human-readable summary of tracking statistics."""
@@ -380,11 +375,6 @@ class GraphClassificationTracker:
         
         return summary
     
-    def log_to_wandb(self, prefix="gc_tracker"):
-        """Log tracking statistics to wandb."""
-        summary = self.get_summary_stats()
-        wandb_log = {f"{prefix}/{key}": value for key, value in summary.items()}
-        wandb.log(wandb_log)
     
     def print_detailed_summary(self, epoch=None):
         """Print a comprehensive summary of tracking statistics."""
@@ -1687,6 +1677,11 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
     Returns:
         Dictionary with graph classification metrics
     """
+    import time
+    
+    eval_start_time = time.time()
+    print(f"Starting graph classification evaluation ({split} split)...")
+    
     model.eval()
     predictor.eval()
     
@@ -1705,7 +1700,11 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
             all_dataset_results = []
             individual_results = []
             
+            datasets_start_time = time.time()
+            print(f"  Processing {len(gc_processed_data_list)} datasets...")
+            
             for dataset_idx, dataset_info in enumerate(gc_processed_data_list):
+                dataset_start_time = time.time()
                 if gc_tracker:
                     gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_start")
                     
@@ -1720,13 +1719,20 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                 # Evaluate each task separately and aggregate results
                 task_results = []
                 
+                tasks_start_time = time.time()
+                print(f"    Dataset {dataset_idx} ({dataset_name}): Processing {len(task_filtered_splits)} tasks...")
+                
                 for task_idx, task_splits in task_filtered_splits.items():
+                    task_start_time = time.time()
+                    
                     # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
+                    setup_start_time = time.time()
                     use_index_tracking = ('fug_mapping' in dataset_info or 
                                         'tsgfm_mapping' in dataset_info or 
                                         'tag_mapping' in dataset_info)
                     
                     # Create task-specific data loaders for evaluation
+                    dataloader_start_time = time.time()
                     if split == 'test':
                         # Only use test split for unseen datasets
                         test_only_splits = {'test': task_splits['test']}
@@ -1749,14 +1755,17 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             use_index_tracking=use_index_tracking
                         )
                     
+                    dataloader_time = time.time() - dataloader_start_time
+                    
                     # Debug: Check profiling setting
                     profiling_enabled = getattr(args, 'enable_profiling', False)
-                    print(f"      [DEBUG] Task {task_idx}: enable_profiling = {profiling_enabled}")
+                    print(f"      [DEBUG] Task {task_idx}: enable_profiling = {profiling_enabled}, dataloader: {dataloader_time:.3f}s")
                     
                     if gc_tracker:
                         gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_before_eval")
                     
                     # Per-task profiling if enabled
+                    eval_start_time = time.time()
                     if profiling_enabled:
                         from torch.profiler import profile, record_function, ProfilerActivity
                         prof = profile(
@@ -1774,6 +1783,7 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                                 normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
                             )
                         prof.stop()
+                        eval_time = time.time() - eval_start_time
                         
                         if gc_tracker:
                             gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_profiled_eval")
@@ -1781,7 +1791,7 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                         # Save per-task profiling results
                         profile_filename = f"gc_eval_{dataset_name}_task_{task_idx}.json"
                         prof.export_chrome_trace(profile_filename)
-                        print(f"      [PROFILING] Task {task_idx}: Saved profiling to {profile_filename}")
+                        print(f"      [PROFILING] Task {task_idx}: evaluation: {eval_time:.3f}s, saved profiling to {profile_filename}")
                         
                         # Print top CPU functions for this task
                         print(f"      [PROFILING] Task {task_idx} Top CPU ops:")
@@ -1796,6 +1806,7 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
                             normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
                         )
+                        eval_time = time.time() - eval_start_time
                         
                         if gc_tracker:
                             gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_eval")
@@ -1807,6 +1818,17 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     # Extract the appropriate split result
                     split_result = task_eval_results.get(split, 0.0)
                     task_results.append(split_result)
+                    
+                    task_time = time.time() - task_start_time
+                    overhead_time = task_time - eval_time - dataloader_time
+                    
+                    # Handle both numeric and dict results for display
+                    if isinstance(split_result, dict):
+                        # Extract primary metric for display
+                        display_metric = split_result.get('ap', split_result.get('auc', 0.0))
+                        print(f"      Task {task_idx}: {display_metric:.4f} (eval: {eval_time:.2f}s)")
+                    else:
+                        print(f"      Task {task_idx}: {split_result:.4f} (eval: {eval_time:.2f}s)")
                 
                 # Aggregate results across tasks for this dataset
                 # Task accumulation completed for this dataset
@@ -1819,7 +1841,7 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     if isinstance(dataset_avg, dict):
                         primary_metric = dataset_avg.get('ap', dataset_avg.get('auc', 0.0))
                         all_dataset_results.append(primary_metric)
-                        individual_results.append(dataset_avg)  # Keep full dict for individual results
+                        individual_results.append(primary_metric)  # Store primary metric for averaging
                     else:
                         all_dataset_results.append(dataset_avg)
                         individual_results.append(dataset_avg)
@@ -1829,6 +1851,10 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     
                 if gc_tracker:
                     gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_complete")
+                
+                dataset_time = time.time() - dataset_start_time
+                tasks_time = time.time() - tasks_start_time
+                print(f"    Dataset {dataset_idx} ({dataset_name}): completed in {dataset_time:.2f}s (tasks: {tasks_time:.2f}s)")
             
             # Calculate overall average
             if all_dataset_results:
@@ -1846,9 +1872,15 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     'test': 0.0,
                     'individual_test_metrics': []
                 }
+            
+            datasets_total_time = time.time() - datasets_start_time
+            print(f"  All {len(gc_processed_data_list)} datasets completed in {datasets_total_time:.2f}s")
                 
         if gc_tracker:
             gc_tracker.log_memory(f"eval_{split}_complete")
+    
+    eval_total_time = time.time() - eval_start_time
+    print(f"Graph classification evaluation ({split} split) completed in {eval_total_time:.2f}s")
     
     return results
 
@@ -2232,7 +2264,7 @@ def run_joint_training(args, device='cuda:0'):
                     lp_tracker.print_summary(epoch)
                 
                 # Log to wandb
-                lp_tracker.log_to_wandb()
+# lp_tracker.log_to_wandb() - REMOVED to reduce wandb bloat
             
             # Log graph classification tracking stats
             if gc_tracker is not None and getattr(args, 'enable_gc', True):
@@ -2241,7 +2273,7 @@ def run_joint_training(args, device='cuda:0'):
                     gc_tracker.print_summary(epoch)
                 
                 # Log to wandb
-                gc_tracker.log_to_wandb()
+# gc_tracker.log_to_wandb() - REMOVED to reduce wandb bloat
             
             # Log to wandb
             wandb_log = {
@@ -2336,12 +2368,12 @@ def run_joint_training(args, device='cuda:0'):
     if gc_tracker is not None and getattr(args, 'enable_gc', True):
         print("\n=== Final Graph Classification Performance Summary ===")
         gc_tracker.print_summary()
-        lp_tracker.log_to_wandb(prefix="final_lp_tracker")
+# gc_tracker.log_to_wandb(prefix="final_gc_tracker") - REMOVED to reduce wandb bloat
         
-        # Add final summary stats to wandb
-        summary_stats = lp_tracker.get_summary_stats()
-        for key, value in summary_stats.items():
-            final_wandb_log[f'final_lp_summary/{key}'] = value
+# # Add final summary stats to wandb - REMOVED to reduce wandb bloat
+        # summary_stats = gc_tracker.get_summary_stats()
+        # for key, value in summary_stats.items():
+        #     final_wandb_log[f'final_gc_summary/{key}'] = value
     
     wandb.log(final_wandb_log)
     

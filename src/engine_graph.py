@@ -1075,6 +1075,7 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
     predictor.eval()
     
     results = {}
+    total_start = time.perf_counter()
     
     # Time context creation
     context_start = time.perf_counter()
@@ -1085,6 +1086,8 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
     )
     context_time = time.perf_counter() - context_start
     
+    # Time PFN data preparation
+    pfn_prep_start = time.perf_counter()
     # Prepare PFN data structure
     pfn_data = prepare_pfn_data_structure(context_embeddings, context_labels, 
                                         dataset_info['num_classes'], device)
@@ -1097,6 +1100,7 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         mlp_module=None,
         normalize=normalize_class_h
     )
+    pfn_prep_time = time.perf_counter() - pfn_prep_start
 
     # Determine the appropriate metric for this dataset
     # Check if this is a multi-task dataset
@@ -1105,21 +1109,24 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
     metric_type = get_dataset_metric(dataset_name, is_multitask) if dataset_name else 'accuracy'
 
     # Evaluate on each split
+    split_times = {}
     for split_name, data_loader in data_loaders.items():
+        split_start = time.perf_counter()
         if len(data_loader.dataset) == 0:
             results[split_name] = 0.0
+            split_times[split_name] = 0.0
             continue
             
         all_predictions = []
         all_labels = []
         all_probabilities = []
         
-        # Pre-extract all batches for evaluation to eliminate DataLoader iterator overhead  
-        eval_batches = list(data_loader)
+        # Time batch processing (direct iteration, no pre-extraction)
+        batch_processing_start = time.perf_counter()
+        total_samples = len(data_loader.dataset)
         
-        total_eval_batches = len(eval_batches)
-        for batch_idx, batch_graphs in enumerate(eval_batches):
-            print(f"\rEvaluating batch {batch_idx+1}/{total_eval_batches}", end="", flush=True)
+        for batch_idx, batch_graphs in enumerate(data_loader):
+            print(f"\rEvaluating batch {batch_idx+1}...", end="", flush=True)
             batch_data = batch_graphs.to(device)
             node_emb_table = _get_node_embedding_table(dataset_info['dataset'], task_idx, device, dataset_info)
             
@@ -1178,7 +1185,7 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             all_predictions.append(predictions.cpu())
             all_labels.append(batch_labels.cpu())
             all_probabilities.append(probabilities.cpu())
-            print(f"\rEvaluating batch {batch_idx+1}/{total_eval_batches} completed ({len(predictions)} samples)", end="", flush=True)
+            print(f"\rEvaluating batch {batch_idx+1} completed ({len(predictions)} samples)", end="", flush=True)
 
         # Concatenate all predictions and labels
         if all_predictions:
@@ -1201,8 +1208,19 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
                 results[split_name] = {metric_name: 0.0 for metric_name in metric_type}
             else:
                 results[split_name] = 0.0
+        
+        # Time split completion
+        batch_processing_time = time.perf_counter() - batch_processing_start
+        split_times[split_name] = time.perf_counter() - split_start
+        
+        print(f" | processing: {batch_processing_time:.3f}s")
 
-    print(f"\nEvaluation completed for task {task_idx}")
+    # Final timing summary
+    total_time = time.perf_counter() - total_start
+    print(f"Task {task_idx} timing: context: {context_time:.3f}s, pfn_prep: {pfn_prep_time:.3f}s, total: {total_time:.3f}s")
+    if split_times:
+        split_breakdown = ", ".join([f"{split}: {t:.3f}s" for split, t in split_times.items()])
+        print(f"  Split breakdown: {split_breakdown}")
     
     return results
 

@@ -231,9 +231,7 @@ def load_all_graph_datasets_cache_aware(dataset_names, device='cuda', pretrainin
         elif isinstance(result, tuple) and len(result) == 2:
             # FUG dataset with external mapping
             dataset, fug_mapping = result
-            cache_mode = fug_mapping.get('cache_mode', False)
-            memory_saved = " (🎉 48GB saved!)" if cache_mode else ""
-            print(f"  FUG dataset loaded with external mapping{memory_saved}")
+            print(f"  FUG dataset loaded with external mapping")
         else:
             # Regular dataset
             dataset = result
