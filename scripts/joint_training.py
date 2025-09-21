@@ -977,7 +977,7 @@ def create_unified_model(args, input_dim, device):
     elif args.model == 'UnifiedGNN':
         model = UnifiedGNN(
             model_type=getattr(args, 'unified_model_type', 'gcn'),
-            in_feats=input_dim,
+            in_feats=hidden,
             h_feats=hidden,
             prop_step=getattr(args, 'num_layers', 2),  # Reuse num_layers as prop_step
             conv=getattr(args, 'conv_type', 'GCN'),

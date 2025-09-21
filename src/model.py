@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GINConv, MessagePassing
+from torch_geometric.nn import GCNConv, GINConv, MessagePassing, SAGEConv, GATConv
 from torch_geometric.utils import degree
 from torch_sparse.matmul import spmm_add
 from torch_scatter import scatter_softmax
@@ -875,15 +875,13 @@ class UnifiedGNN(nn.Module):
         alpha: Alpha parameter for LightGCN
         exp: Use exponential alpha weights
         res: Residual connections
-        gin_aggr: Aggregation for GIN ('sum', 'mean')
         supports_edge_weight: Whether model supports edge weights
         no_parameters: Use parameter-free convolutions
     """
-    def __init__(self, model_type='gcn', in_feats=128, h_feats=128, prop_step=2, 
+    def __init__(self, model_type='gcn', in_feats=128, h_feats=128, prop_step=2,
                  conv='GCN', multilayer=False, norm=False, relu=False, dropout=0.2,
                  residual=1.0, linear=False, alpha=0.5, exp=False, res=False,
-                 gin_aggr='sum', supports_edge_weight=False,
-                 no_parameters=False, input_norm=False):
+                 supports_edge_weight=False, no_parameters=False, input_norm=False):
         super(UnifiedGNN, self).__init__()
         
         self.model_type = model_type.lower()
@@ -903,7 +901,7 @@ class UnifiedGNN(nn.Module):
         self.h_feats = h_feats
         
         # Convolution layers
-        self._build_conv_layers(in_feats, h_feats, dropout, gin_aggr)
+        self._build_conv_layers(in_feats, h_feats, dropout)
         
         # LightGCN alpha parameters
         if self.model_type == 'lightgcn':
@@ -924,35 +922,32 @@ class UnifiedGNN(nn.Module):
             # All models use the same MLP structure: h_feats -> h_feats
             self.mlps = nn.ModuleList([MLP(h_feats, h_feats, h_feats, 2, dropout) for _ in range(prop_step)])
 
-    def _build_conv_layers(self, in_feats, h_feats, dropout, gin_aggr):
+    def _build_conv_layers(self, in_feats, h_feats, dropout):
         """Build convolution layers based on configuration."""
         if self.multilayer:
             # Use separate conv layers for each propagation step
             self.convs = nn.ModuleList()
             for i in range(self.prop_step):
                 input_dim = in_feats if i == 0 else h_feats
-                self.convs.append(self._create_conv_layer(input_dim, h_feats, dropout, gin_aggr))
+                self.convs.append(self._create_conv_layer(input_dim, h_feats, dropout))
         else:
             # Use single conv layer shared across propagation steps
-            self.conv1 = self._create_conv_layer(in_feats, h_feats, dropout, gin_aggr)
-            self.conv2 = self._create_conv_layer(h_feats, h_feats, dropout, gin_aggr)
+            self.conv1 = self._create_conv_layer(in_feats, h_feats, dropout)
+            self.conv2 = self._create_conv_layer(h_feats, h_feats, dropout)
 
-    def _create_conv_layer(self, in_dim, out_dim, dropout, gin_aggr):
+    def _create_conv_layer(self, in_dim, out_dim, dropout):
         """Create a single convolution layer."""
         if self.conv_type == 'GCN':
             bias = not self.no_parameters
-            weight = not self.no_parameters
-            if in_dim != out_dim:
-                weight = True
-            return GraphConv(in_dim, out_dim, weight=weight, bias=bias)
+            return GCNConv(in_dim, out_dim, bias=bias)
         elif self.conv_type == 'SAGE':
             bias = not self.no_parameters
             return SAGEConv(in_dim, out_dim, 'mean', bias=bias)
         elif self.conv_type == 'GAT':
-            return GATConv(in_dim, out_dim // 4, 4)
+            return GATConv(in_dim, out_dim // 4, heads=4, concat=True)
         elif self.conv_type == 'GIN':
             mlp = MLP(in_dim, out_dim, out_dim, 2, dropout, self.norm)
-            return GINConv(mlp, gin_aggr)
+            return GINConv(mlp)
         else:
             raise ValueError(f"Unsupported convolution type: {self.conv_type}")
 
@@ -966,25 +961,25 @@ class UnifiedGNN(nn.Module):
             x = self.dp(x)
         return x
     
-    def _apply_conv(self, conv_layer, g, x, e_feat):
+    def _apply_conv(self, conv_layer, adj_t, x, e_feat):
         """Apply convolution layer with conditional edge weight support."""
-        if self.conv_type == 'GAT':
-            # GAT doesn't support edge_weight parameter
-            return conv_layer(g, x).flatten(1)
+        if self.conv_type == 'GCN' and e_feat is not None:
+            # Only GCN supports edge_weight parameter
+            return conv_layer(x, adj_t, edge_weight=e_feat).flatten(1)
         else:
-            # GCN, SAGE, GIN support edge_weight
-            return conv_layer(g, x, edge_weight=e_feat).flatten(1)
+            # SAGE, GAT, GIN don't support edge_weight, PyG handles SparseTensor automatically
+            return conv_layer(x, adj_t).flatten(1)
 
-    def forward(self, g, in_feat, e_feat=None):
+    def forward(self, in_feat, adj_t, e_feat=None):
         """Forward pass."""
         # Input projection - LightGCN handles input transformation with conv1, others use lin
         if self.model_type == 'lightgcn':
             # Pass raw input directly to LightGCN since conv1 handles input transformation
-            return self._forward_lightgcn(g, in_feat, e_feat)
+            return self._forward_lightgcn(adj_t, in_feat, e_feat)
         else:
-            return self._forward_gcn(g, in_feat, e_feat)
+            return self._forward_gcn(adj_t, in_feat, e_feat)
 
-    def _forward_lightgcn(self, g, in_feat, e_feat):
+    def _forward_lightgcn(self, adj_t, in_feat, e_feat):
         """LightGCN forward pass matching original implementation exactly."""
         alpha = F.softmax(self.alphas, dim=0)
         if self.input_norm:
@@ -992,34 +987,34 @@ class UnifiedGNN(nn.Module):
         
         if self.multilayer:
             # Use separate conv layers for each step
-            h = self._apply_conv(self.convs[0], g, in_feat, e_feat)
+            h = self._apply_conv(self.convs[0], adj_t, in_feat, e_feat)
             res = h * alpha[0]
             for i in range(1, self.prop_step):
                 if self.linear and self.conv_type != 'GIN':
                     h = self.mlps[i](h)
                 h = self._apply_norm_and_activation(h, i)
-                h = self._apply_conv(self.convs[i], g, h, e_feat)
+                h = self._apply_conv(self.convs[i], adj_t, h, e_feat)
                 res += h * alpha[i]
             return res
         else:
             # Match original LightGCN exactly: conv1 on raw input, then conv2 repeatedly
-            h = self._apply_conv(self.conv1, g, in_feat, e_feat)  # Apply conv1 to raw input
+            h = self._apply_conv(self.conv1, adj_t, in_feat, e_feat)  # Apply conv1 to raw input
             res = h * alpha[0]  # First layer gets alpha[0]
             for i in range(1, self.prop_step):
                 if self.linear and self.conv_type != 'GIN':
                     h = self.mlps[i](h)
                 h = self._apply_norm_and_activation(h, i)  # Apply norm/activation to previous h
-                h = self._apply_conv(self.conv2, g, h, e_feat)  # Apply conv2 to processed h
+                h = self._apply_conv(self.conv2, adj_t, h, e_feat)  # Apply conv2 to processed h
                 res += h * alpha[i]  # Add to result with alpha[i]
             return res
 
-    def _forward_gcn(self, g, in_feat, e_feat):
+    def _forward_gcn(self, adj_t, in_feat, e_feat):
         if self.input_norm:
             in_feat = self._apply_norm_and_activation(in_feat, 0)
         """Standard GCN forward pass."""
         ori = in_feat
         if self.multilayer:
-            h = self._apply_conv(self.convs[0], g, in_feat, e_feat)
+            h = self._apply_conv(self.convs[0], adj_t, in_feat, e_feat)
             if self.in_feats != self.h_feats:
                 ori = h
             # Use separate conv layers for each step
@@ -1029,11 +1024,11 @@ class UnifiedGNN(nn.Module):
                 if self.res:
                     h = h + self.residual * ori
                 h = self._apply_norm_and_activation(h, i)
-                
+
                 # Apply convolution
-                h = self._apply_conv(self.convs[i], g, h, e_feat)
+                h = self._apply_conv(self.convs[i], adj_t, h, e_feat)
         else:
-            h = self._apply_conv(self.conv1, g, in_feat, e_feat)
+            h = self._apply_conv(self.conv1, adj_t, in_feat, e_feat)
             if self.in_feats != self.h_feats:
                 ori = h
             # Use the same conv layers for each step
@@ -1043,8 +1038,8 @@ class UnifiedGNN(nn.Module):
                 if self.res:
                     h = h + self.residual * ori
                 h = self._apply_norm_and_activation(h, i)
-                
+
                 # Apply convolution
-                h = self._apply_conv(self.conv2, g, h, e_feat)
+                h = self._apply_conv(self.conv2, adj_t, h, e_feat)
         
         return h
