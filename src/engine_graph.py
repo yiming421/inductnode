@@ -343,8 +343,8 @@ def aggregate_task_metrics(metric_values):
         primary_values = []
         for val in metric_values:
             if isinstance(val, dict):
-                # Extract primary metric (AP if available, otherwise AUC, otherwise first value)
-                primary_val = val.get('ap', val.get('auc', next(iter(val.values()))))
+                # Extract primary metric (AUC if available, otherwise AP, otherwise first value)
+                primary_val = val.get('auc', val.get('ap', next(iter(val.values()))))
                 primary_values.append(primary_val)
             else:
                 primary_values.append(val)
@@ -1069,7 +1069,7 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         dataset_name (str): Name of the dataset (for metric selection)
         
     Returns:
-        dict: Dictionary with train/val/test metrics for this task (AUC for chemhiv, AP for chempcba, accuracy for others)
+        dict: Dictionary with train/val/test metrics for this task (AUC for chemhiv, AUC for chempcba, accuracy for others)
     """
     model.eval()
     predictor.eval()
@@ -1418,8 +1418,8 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                 all_val_results[dataset_name] = val_results
                 if 'val' in val_results:
                     if isinstance(val_results['val'], dict):
-                        # Multiple metrics: use AP for validation tracking (primary metric for PCBA)
-                        total_val_acc += val_results['val'].get('ap', val_results['val'].get('auc', 0.0))
+                        # Multiple metrics: use AUC for validation tracking (primary metric for PCBA)
+                        total_val_acc += val_results['val'].get('auc', val_results['val'].get('ap', 0.0))
                     else:
                         total_val_acc += val_results['val']
                 
@@ -1480,7 +1480,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                     all_val_results[dataset_name] = val_results
                     # Handle multiple metrics for total validation tracking
                     if isinstance(val_results['val'], dict):
-                        total_val_acc += val_results['val'].get('ap', val_results['val'].get('auc', 0.0))
+                        total_val_acc += val_results['val'].get('auc', val_results['val'].get('ap', 0.0))
                     else:
                         total_val_acc += val_results['val']
                 else:
@@ -1595,8 +1595,8 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                             test_str = format_metric_results(test_results['test'])
                             print(f"    {test_name} (Full Batch, No Pre-filtering): Test {test_str}", 
                                   f"Time: {time.perf_counter() - dataset_start_time:.2f}s")
-                            # Use AP for averaging if available, otherwise AUC
-                            test_value = test_results['test'].get('ap', test_results['test'].get('auc', 0.0))
+                            # Use AUC for averaging if available, otherwise AP
+                            test_value = test_results['test'].get('auc', test_results['test'].get('ap', 0.0))
                             avg_test_metric += test_value
                         else:
                             # Single metric
@@ -1698,8 +1698,8 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                             test_str = format_metric_results(test_results['test'])
                             print(f"    {test_name}: Test {test_str}", 
                                   f"Time: {time.perf_counter() - dataset_start_time:.2f}s")
-                            # Use AP for averaging if available, otherwise AUC
-                            test_value = test_results['test'].get('ap', test_results['test'].get('auc', 0.0))
+                            # Use AUC for averaging if available, otherwise AP
+                            test_value = test_results['test'].get('auc', test_results['test'].get('ap', 0.0))
                             avg_test_metric += test_value
                         else:
                             # Single metric

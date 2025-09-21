@@ -22,7 +22,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Core imports - reuse from existing scripts
-from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection
+from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN
 from src.data import load_all_data, load_all_data_train
 from src.data_link import load_all_data_link
 from src.data_graph import load_all_graph_datasets, process_graph_features, create_data_loaders, create_task_filtered_datasets
@@ -969,11 +969,32 @@ def create_unified_model(args, input_dim, device):
     
     # Create GNN backbone
     if args.model == 'PureGCN_v1':
-        model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm, 
+        model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm,
                           args.res, args.relu, args.gnn_norm_affine)
     elif args.model == 'GCN':
         model = GCN(hidden, hidden, args.norm, args.relu, args.num_layers, args.dp,
                    args.multilayer, args.use_gin, args.res, args.gnn_norm_affine)
+    elif args.model == 'UnifiedGNN':
+        model = UnifiedGNN(
+            model_type=getattr(args, 'unified_model_type', 'gcn'),
+            in_feats=input_dim,
+            h_feats=hidden,
+            prop_step=getattr(args, 'num_layers', 2),  # Reuse num_layers as prop_step
+            conv=getattr(args, 'conv_type', 'GCN'),
+            multilayer=getattr(args, 'multilayer', False),
+            norm=getattr(args, 'norm', False),
+            relu=getattr(args, 'relu', False),
+            dropout=getattr(args, 'dp', 0.2),
+            residual=getattr(args, 'residual', 1.0),
+            linear=getattr(args, 'linear', False),
+            alpha=getattr(args, 'alpha', 0.5),
+            exp=getattr(args, 'exp', False),
+            res=getattr(args, 'res', False),
+            gin_aggr=getattr(args, 'gin_aggr', 'sum'),
+            supports_edge_weight=getattr(args, 'supports_edge_weight', False),
+            no_parameters=getattr(args, 'no_parameters', False),
+            input_norm=getattr(args, 'input_norm', False)
+        )
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
     
@@ -1545,29 +1566,42 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None):
     """
     Evaluate node classification task only.
-    
+
     Returns:
         Dictionary with node classification metrics
     """
+    import time
+
+    eval_start_time = time.time()
+    print(f"Starting node classification evaluation ({split} split)...")
+
     model.eval()
     predictor.eval()
-    
+
     results = {}
-    
+
     with torch.no_grad():
         nc_data_list, nc_split_idx_list = nc_data
         if len(nc_data_list) > 0:
             if split == 'test':
+                print(f"  Processing {len(nc_data_list)} unseen test datasets...")
+                datasets_start_time = time.time()
+
                 # Use inductive evaluation for unseen datasets
                 train_metrics, valid_metrics, test_metrics = test_all_induct(
                     model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
                     False, None, None, True, None, 0, identity_projection
                 )
+
+                datasets_time = time.time() - datasets_start_time
+                print(f"  All {len(nc_data_list)} datasets completed in {datasets_time:.2f}s")
+
                 results = {
                     'train': sum(train_metrics) / len(train_metrics) if train_metrics else 0.0,
                     'valid': sum(valid_metrics) / len(valid_metrics) if valid_metrics else 0.0,
                     'test': sum(test_metrics) / len(test_metrics) if test_metrics else 0.0,
-                    'individual_test_metrics': test_metrics if test_metrics else []
+                    'individual_test_metrics': test_metrics if test_metrics else [],
+                    'evaluation_time': datasets_time
                 }
             else:
                 # Use transductive evaluation for seen datasets
@@ -1581,7 +1615,10 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     'test': test_metrics if isinstance(test_metrics, (int, float)) else sum(test_metrics) / len(test_metrics),
                     'individual_test_metrics': test_metrics if isinstance(test_metrics, list) else [test_metrics]
                 }
-    
+
+    eval_total_time = time.time() - eval_start_time
+    print(f"Node classification evaluation ({split} split) completed in {eval_total_time:.2f}s")
+
     return results
 
 
@@ -2507,7 +2544,16 @@ def main():
         num_gc_datasets = len(all_gc_individual_results[0])
         for dataset_idx in range(num_gc_datasets):
             dataset_metrics = [run_results[dataset_idx] for run_results in all_gc_individual_results if len(run_results) > dataset_idx]
-            avg_gc_individual.append(sum(dataset_metrics) / len(dataset_metrics))
+            # Extract primary metric (AUC if available, otherwise AP, otherwise raw value) for PCBA
+            primary_metrics = []
+            for metric in dataset_metrics:
+                if isinstance(metric, dict):
+                    # Multiple metrics (e.g., PCBA with AUC and AP) - prioritize AUC
+                    primary_metric = metric.get('auc', metric.get('ap', next(iter(metric.values()))))
+                    primary_metrics.append(primary_metric)
+                else:
+                    primary_metrics.append(metric)
+            avg_gc_individual.append(sum(primary_metrics) / len(primary_metrics))
     
     print(f"\n{'='*50}")
     print(f"Final Results (Average over {args.runs} runs)")

@@ -275,20 +275,27 @@ def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=Fal
     return tot_train_metric ** (1/(len(data_list))), tot_valid_metric ** (1/(len(data_list))), \
            tot_test_metric ** (1/(len(data_list)))
 
-def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, degree=False, 
+def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, degree=False,
                     att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None):
+    import time
+
     train_metric_list, valid_metric_list, test_metric_list = [], [], []
-    for data, split_idx in zip(data_list, split_idx_list):
+    for dataset_idx, (data, split_idx) in enumerate(zip(data_list, split_idx_list)):
+        dataset_start_time = time.time()
+
         train_idx = split_idx['train']
         valid_idx = split_idx['valid']
         test_idx = split_idx['test']
 
         train_metric, valid_metric, test_metric = \
-        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp, 
+        test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
              normalize_class_h, projector, rank, identity_projection)
+
+        dataset_time = time.time() - dataset_start_time
+
         if rank == 0:
-            print(f"Dataset {data.name}")
-            print(f"Train {train_metric}, Valid {valid_metric}, Test {test_metric}", flush=True)
+            print(f"    Dataset {dataset_idx} ({data.name}): completed in {dataset_time:.2f}s")
+            print(f"      Train {train_metric:.4f}, Valid {valid_metric:.4f}, Test {test_metric:.4f}", flush=True)
         train_metric_list.append(train_metric)
         valid_metric_list.append(valid_metric)
         test_metric_list.append(test_metric)

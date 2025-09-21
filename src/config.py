@@ -243,14 +243,14 @@ def parse_joint_training_args():
     parser.add_argument('--single_gpu', type=str2bool, default=True, help='Use single GPU mode instead of distributed training')
     
     # === Model Architecture ===
-    parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN'])
+    parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN', 'UnifiedGNN'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN'])
-    parser.add_argument('--hidden', type=int, default=512, help='Hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=6, help='Number of GNN layers')
+    parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension')
+    parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
-    parser.add_argument('--transformer_layers', type=int, default=2, help='Number of transformer layers')
+    parser.add_argument('--transformer_layers', type=int, default=3, help='Number of transformer layers')
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
-    parser.add_argument('--dp', type=float, default=0.4, help='Dropout rate')
+    parser.add_argument('--dp', type=float, default=0.08717780667044389, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
     parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections')
     parser.add_argument('--relu', type=str2bool, default=False, help='Use ReLU activation')
@@ -258,23 +258,37 @@ def parse_joint_training_args():
     parser.add_argument('--mlp_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in MLP norm')
     parser.add_argument('--multilayer', type=str2bool, default=True, help='Use multilayer structure for GCN')
     parser.add_argument('--use_gin', type=str2bool, default=False, help='Use GIN variant for GCN')
+
+    # === UnifiedGNN Specific Arguments ===
+    parser.add_argument('--unified_model_type', type=str, default='gcn', choices=['gcn', 'lightgcn', 'puregcn'],
+                       help='UnifiedGNN model type')
+    parser.add_argument('--conv_type', type=str, default='GCN', choices=['GCN', 'SAGE', 'GAT', 'GIN'],
+                       help='Convolution type for UnifiedGNN')
+    parser.add_argument('--residual', type=float, default=1.0, help='Residual connection strength')
+    parser.add_argument('--linear', type=str2bool, default=False, help='Apply linear transformation after conv')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Alpha parameter for LightGCN')
+    parser.add_argument('--exp', type=str2bool, default=False, help='Use exponential alpha weights')
+    parser.add_argument('--gin_aggr', type=str, default='sum', choices=['sum', 'mean'], help='Aggregation for GIN')
+    parser.add_argument('--supports_edge_weight', type=str2bool, default=False, help='Whether model supports edge weights')
+    parser.add_argument('--no_parameters', type=str2bool, default=False, help='Use parameter-free convolutions')
+    parser.add_argument('--input_norm', type=str2bool, default=False, help='Apply input normalization')
     
     # === Training Configuration ===
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
-    parser.add_argument('--lr', type=float, default=0.00001152103060806947, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.005, help='Weight decay')
-    parser.add_argument('--schedule', type=str, default='warmup', choices=['cosine', 'step', 'warmup', 'none'])
+    parser.add_argument('--lr', type=float, default=0.000001995432810684568, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.00041043056600071503, help='Weight decay')
+    parser.add_argument('--schedule', type=str, default='step', choices=['cosine', 'step', 'warmup', 'none'])
     parser.add_argument('--nc_batch_size', type=int, default=8192, help='Node classification batch size')
-    parser.add_argument('--lp_batch_size', type=int, default=65536, help='Link prediction batch size')
+    parser.add_argument('--lp_batch_size', type=int, default=32768, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
-    parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
+    parser.add_argument('--clip_grad', type=float, default=0.9893307302161596, help='Gradient clipping')
     
     # === Joint Training Specific ===
     parser.add_argument('--enable_nc', type=str2bool, default=True, help='Enable node classification task')
     parser.add_argument('--enable_lp', type=str2bool, default=True, help='Enable link prediction task')
     parser.add_argument('--enable_gc', type=str2bool, default=True, help='Enable graph classification task')
-    parser.add_argument('--lambda_nc', type=float, default=1.0, help='Weight for node classification loss')
-    parser.add_argument('--lambda_lp', type=float, default=1.3223791896807502, help='Weight for link prediction loss')
+    parser.add_argument('--lambda_nc', type=float, default=0.5339754552414909, help='Weight for node classification loss')
+    parser.add_argument('--lambda_lp', type=float, default=2.735303979230086, help='Weight for link prediction loss')
     
     # === Dataset Configuration ===
     parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
@@ -313,18 +327,18 @@ def parse_joint_training_args():
     # === Link Prediction Specific ===
     parser.add_argument('--context_neg_ratio', type=int, default=3, help='Negative sampling ratio for context')
     parser.add_argument('--train_neg_ratio', type=int, default=3, help='Negative sampling ratio for training')
-    parser.add_argument('--context_k', type=int, default=128, help='Number of context samples for link prediction')
+    parser.add_argument('--context_k', type=int, default=32, help='Number of context samples for link prediction')
     parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
     
     # === Graph Classification Specific ===
     parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')
     parser.add_argument('--gc_test_dataset', type=str, default='hiv,pcba', help='Graph classification test datasets')
-    parser.add_argument('--gc_batch_size', type=int, default=4096, help='Graph classification batch size')
+    parser.add_argument('--gc_batch_size', type=int, default=1024, help='Graph classification batch size')
     parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
-    parser.add_argument('--graph_pooling', type=str, default='mean', choices=['mean', 'max', 'sum'], help='Graph pooling method')
-    parser.add_argument('--lambda_gc', type=float, default=1.0, help='Weight for graph classification loss')
-    parser.add_argument('--context_graph_num', type=int, default=16, help='Number of context graphs for graph classification')
+    parser.add_argument('--graph_pooling', type=str, default='max', choices=['mean', 'max', 'sum'], help='Graph pooling method')
+    parser.add_argument('--lambda_gc', type=float, default=0.41834063194474214, help='Weight for graph classification loss')
+    parser.add_argument('--context_graph_num', type=int, default=8, help='Number of context graphs for graph classification')
     
     # === OGB FUG embeddings arguments (for graph classification) ===
     parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
@@ -354,15 +368,15 @@ def parse_joint_training_args():
                        help='Per-dataset context overrides for GC: "dataset1:shots1,dataset2:shots2"')
     
     # === Dynamic Context Refresh ===
-    parser.add_argument('--context_refresh_interval', type=int, default=0,
+    parser.add_argument('--context_refresh_interval', type=int, default=1,
                        help='Refresh contexts every N epochs (0 = never refresh)')
-    parser.add_argument('--context_batch_refresh_interval', type=int, default=0,
+    parser.add_argument('--context_batch_refresh_interval', type=int, default=1,
                        help='Refresh contexts every N batches within each task (0 = disabled)')
-    parser.add_argument('--context_sampling_plan', type=str, default='ori', choices=['ori', 'random', 'decay'],
+    parser.add_argument('--context_sampling_plan', type=str, default='decay', choices=['ori', 'random', 'decay'],
                        help='Context sampling strategy: ori=original fixed, random=random sampling, decay=gradual decay')
-    parser.add_argument('--context_bounds', type=str, default='(1,20)(1,32)(1,32)',
+    parser.add_argument('--context_bounds', type=str, default='(5,20)(8,32)(8,32)',
                        help='Context bounds for NC/LP/GC: (lower,upper)(lower,upper)(lower,upper). Used for random sampling range and decay start/end.')
-    parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=False,
+    parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=True,
                        help='Use K-Medoids clustering to guide context sampling for better representativeness')
     
     # === Profiling and Performance ===
