@@ -944,7 +944,7 @@ class UnifiedGNN(nn.Module):
             bias = not self.no_parameters
             return SAGEConv(in_dim, out_dim, 'mean', bias=bias)
         elif self.conv_type == 'GAT':
-            return GATConv(in_dim, out_dim // 4, heads=4, concat=True)
+            return GATConv(in_dim, out_dim, heads=1, concat=False)
         elif self.conv_type == 'GIN':
             mlp = MLP(in_dim, out_dim, out_dim, 2, dropout, self.norm)
             return GINConv(mlp)

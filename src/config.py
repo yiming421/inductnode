@@ -323,7 +323,26 @@ def parse_joint_training_args():
     parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
     parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
     parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
-    
+
+    # === Edge Dropout Augmentation ===
+    parser.add_argument('--edge_dropout_rate', type=float, default=0.0,
+                       help='Edge dropout rate for data augmentation (0.0-0.5). Set to 0.0 to disable.')
+    parser.add_argument('--edge_dropout_enabled', type=str2bool, default=False,
+                       help='Enable edge dropout augmentation during training')
+    parser.add_argument('--verbose_edge_dropout', type=str2bool, default=False,
+                       help='Print edge dropout timing and statistics')
+
+    # === Feature Dropout Augmentation ===
+    parser.add_argument('--feature_dropout_rate', type=float, default=0.0,
+                       help='Feature dropout rate for data augmentation (0.0-0.8). Set to 0.0 to disable.')
+    parser.add_argument('--feature_dropout_enabled', type=str2bool, default=False,
+                       help='Enable feature dropout augmentation during training (applied after projection)')
+    parser.add_argument('--feature_dropout_type', type=str, default='element_wise',
+                       choices=['element_wise', 'channel_wise', 'gaussian_noise'],
+                       help='Type of feature dropout: element_wise, channel_wise, or gaussian_noise')
+    parser.add_argument('--verbose_feature_dropout', type=str2bool, default=False,
+                       help='Print feature dropout timing and statistics')
+
     # === Link Prediction Specific ===
     parser.add_argument('--context_neg_ratio', type=int, default=3, help='Negative sampling ratio for context')
     parser.add_argument('--train_neg_ratio', type=int, default=3, help='Negative sampling ratio for training')

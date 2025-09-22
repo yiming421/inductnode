@@ -12,8 +12,33 @@ import gc
 from sklearn.metrics import roc_auc_score, average_precision_score
 from .data_graph import create_graph_batch, create_task_filtered_datasets
 from .utils import process_node_features
+from .data_utils import batch_edge_dropout, feature_dropout
 import numpy as np
 from torch.profiler import profile, record_function, ProfilerActivity
+
+
+def apply_feature_dropout_if_enabled(x, args, rank=0):
+    """
+    Apply feature dropout if enabled in args (after projection only).
+
+    Args:
+        x (torch.Tensor): Input features
+        args: Arguments containing feature dropout configuration
+        rank (int): Process rank for logging
+
+    Returns:
+        torch.Tensor: Features with dropout applied
+    """
+    if (args is not None and
+        hasattr(args, 'feature_dropout_enabled') and args.feature_dropout_enabled and
+        hasattr(args, 'feature_dropout_rate') and args.feature_dropout_rate > 0):
+
+        dropout_type = getattr(args, 'feature_dropout_type', 'element_wise')
+        verbose = getattr(args, 'verbose_feature_dropout', False) and rank == 0
+
+        return feature_dropout(x, args.feature_dropout_rate, training=True,
+                             dropout_type=dropout_type, verbose=verbose)
+    return x
 
 def refresh_gc_context_if_needed(dataset_info, batch_idx, epoch, args, device='cuda', task_idx=None):
     """
@@ -614,7 +639,7 @@ def train_graph_classification_full_batch(model, predictor, train_dataset_info, 
         for task_idx in range(num_tasks):
             task_loss = train_graph_classification_single_task_no_update(
                 model, predictor, train_dataset_info, batch, task_idx,
-                pooling_method, device, orthogonal_push, normalize_class_h, identity_projection, context_k
+                pooling_method, device, orthogonal_push, normalize_class_h, identity_projection, context_k, args
             )
             
             if task_loss > 0:
@@ -695,6 +720,9 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
                     x_input = identity_projection(batch_data.x)
                 else:
                     x_input = batch_data.x
+
+                # Apply feature dropout AFTER projection (evaluation doesn't need dropout but kept for consistency)
+                # x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0)  # Commented out for evaluation
 
                 batch_data.adj_t = SparseTensor.from_edge_index(
                     batch_data.edge_index,
@@ -801,7 +829,7 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
 
 
 def train_graph_classification_single_task_no_update(model, predictor, dataset_info, batch, task_idx,
-                                                     pooling_method, device, orthogonal_push, normalize_class_h, identity_projection, context_k=None):
+                                                     pooling_method, device, orthogonal_push, normalize_class_h, identity_projection, context_k=None, args=None):
     """
     Process single task without parameter update - for accumulating losses.
     Returns loss tensor that can be accumulated.
@@ -822,11 +850,18 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
     else:
         x_input = batch_data_x
 
+    # Apply feature dropout AFTER projection
+    x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0)
+
+    # Apply edge dropout if enabled (before creating adj_t)
+    if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):
+        batch_data = batch_edge_dropout(batch_data, args.edge_dropout_rate, training=model.training)
+
     batch_data.adj_t = SparseTensor.from_edge_index(
         batch_data.edge_index,
         sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
     ).to_symmetric().coalesce()
-    
+
     # Get node embeddings from GNN
     node_embeddings = model(x_input, batch_data.adj_t)
     
@@ -945,12 +980,19 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         # Apply identity projection if needed
         needs_proj = dataset_info.get('needs_identity_projection', False)
         has_proj = identity_projection is not None
-        
+
         if needs_proj and has_proj:
             x_input = identity_projection(batch_data.x)
         else:
             x_input = batch_data.x
+
+        # Apply feature dropout AFTER projection
+        x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0)
         
+        # Apply edge dropout if enabled (before creating adj_t)
+        if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):
+            batch_data = batch_edge_dropout(batch_data, args.edge_dropout_rate, training=model.training)
+
         batch_data.adj_t = SparseTensor.from_edge_index(
             batch_data.edge_index,
             sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
@@ -1137,10 +1179,13 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
                 raise ValueError("Expected node embedding table under unified setting")
             
             # Apply identity projection if needed
-            if dataset_info.get('needs_identity_projection', False) and identity_projection is not None:    
+            if dataset_info.get('needs_identity_projection', False) and identity_projection is not None:
                 x_input = identity_projection(batch_data.x)
             else:
                 x_input = batch_data.x
+
+            # Apply feature dropout AFTER projection (evaluation doesn't need dropout but kept for consistency)
+            # x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0)  # Commented out for evaluation
 
             batch_data.adj_t = SparseTensor.from_edge_index(
                 batch_data.edge_index,

@@ -990,7 +990,6 @@ def create_unified_model(args, input_dim, device):
             alpha=getattr(args, 'alpha', 0.5),
             exp=getattr(args, 'exp', False),
             res=getattr(args, 'res', False),
-            gin_aggr=getattr(args, 'gin_aggr', 'sum'),
             supports_edge_weight=getattr(args, 'supports_edge_weight', False),
             no_parameters=getattr(args, 'no_parameters', False),
             input_norm=getattr(args, 'input_norm', False)

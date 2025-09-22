@@ -9,6 +9,7 @@ import copy
 import time
 import psutil
 import os
+from .data_utils import edge_dropout_sparse_tensor, feature_dropout
 
 
 def refresh_lp_context_if_needed(data, batch_idx, epoch, args, context_edges, train_mask, train_edges):
@@ -53,35 +54,74 @@ def refresh_lp_context_if_needed(data, batch_idx, epoch, args, context_edges, tr
     
     return context_edges, train_mask
 
-def get_node_embeddings(model, data, projector=None, identity_projection=None, use_full_adj=False):
+def apply_feature_dropout_if_enabled(x, args, rank=0):
+    """
+    Apply feature dropout if enabled in args (after projection only).
+
+    Args:
+        x (torch.Tensor): Input features
+        args: Arguments containing feature dropout configuration
+        rank (int): Process rank for logging
+
+    Returns:
+        torch.Tensor: Features with dropout applied
+    """
+    if (args is not None and
+        hasattr(args, 'feature_dropout_enabled') and args.feature_dropout_enabled and
+        hasattr(args, 'feature_dropout_rate') and args.feature_dropout_rate > 0):
+
+        dropout_type = getattr(args, 'feature_dropout_type', 'element_wise')
+        verbose = getattr(args, 'verbose_feature_dropout', False) and rank == 0
+
+        return feature_dropout(x, args.feature_dropout_rate, training=True,
+                             dropout_type=dropout_type, verbose=verbose)
+    return x
+
+
+def get_node_embeddings(model, data, projector=None, identity_projection=None, use_full_adj=False, args=None, rank=0):
     """
     Get node embeddings using the same model and preprocessing as node classification.
-    
+
     Args:
         model: Trained GNN model
         data: Graph data
         projector: Optional projector module
         identity_projection: Optional identity projection module
         use_full_adj: Whether to use full_adj_t if available (for test evaluation)
-    
+        args: Training arguments (for edge dropout configuration)
+        rank: Process rank for logging
+
     Returns:
         Node embeddings [num_nodes, hidden_dim]
     """
-    # Apply same projection strategies as node classification
+    # Apply different projection strategies
     if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
         x_input = identity_projection(data.x)
     elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
         projected_features = projector(data.x)
-        x_input = projected_features
+        # Apply final PCA to get features in proper PCA form
+        if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
+            from .utils import apply_final_pca
+            x_input = apply_final_pca(projected_features, projected_features.size(1))
+        else:
+            x_input = projected_features
     else:
         x_input = data.x
-    
+
+    # Apply feature dropout AFTER projection
+    x_input = apply_feature_dropout_if_enabled(x_input, args, rank)
+
     # Choose adjacency matrix: use full_adj_t for test evaluation if available
     if use_full_adj and hasattr(data, 'full_adj_t') and data.full_adj_t is not None:
         adj_matrix = data.full_adj_t
     else:
         adj_matrix = data.adj_t
-    
+
+    # Apply edge dropout if enabled (only during training)
+    if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):
+        verbose_dropout = getattr(args, 'verbose_edge_dropout', False) and rank == 0
+        adj_matrix = edge_dropout_sparse_tensor(adj_matrix, args.edge_dropout_rate, training=model.training, verbose=verbose_dropout)
+
     # Get node embeddings
     node_embeddings = model(x_input, adj_matrix)
     return node_embeddings
@@ -245,7 +285,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 # Recompute embeddings and prototypes for each batch to maintain the computation graph
                 data_for_gnn = copy.copy(data)
                 data_for_gnn.adj_t = adj_for_gnn
-                node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection, use_full_adj=False)
+                node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection, use_full_adj=False, args=args, rank=rank)
 
                 # -----------------------------------------
 
@@ -412,7 +452,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         device = data.x.device
         
         # Get node embeddings - use full_adj_t for test evaluation if available
-        node_embeddings = get_node_embeddings(model, data, projector, identity_projection, use_full_adj_for_test)
+        node_embeddings = get_node_embeddings(model, data, projector, identity_projection, use_full_adj_for_test, args=None, rank=rank)
         
         # Get context edge embeddings for PFN predictor
         context_edge_pairs = context_edges['edge_pairs'].to(device)

@@ -8,7 +8,31 @@ import torch.distributed as dist
 import psutil
 import os
 from .utils import process_node_features, acc, apply_final_pca
-from .data_utils import select_k_shot_context
+from .data_utils import select_k_shot_context, edge_dropout_sparse_tensor, feature_dropout
+
+
+def apply_feature_dropout_if_enabled(x, args, rank=0):
+    """
+    Apply feature dropout if enabled in args (after projection only).
+
+    Args:
+        x (torch.Tensor): Input features
+        args: Arguments containing feature dropout configuration
+        rank (int): Process rank for logging
+
+    Returns:
+        torch.Tensor: Features with dropout applied
+    """
+    if (args is not None and
+        hasattr(args, 'feature_dropout_enabled') and args.feature_dropout_enabled and
+        hasattr(args, 'feature_dropout_rate') and args.feature_dropout_rate > 0):
+
+        dropout_type = getattr(args, 'feature_dropout_type', 'element_wise')
+        verbose = getattr(args, 'verbose_feature_dropout', False) and rank == 0
+
+        return feature_dropout(x, args.feature_dropout_rate, training=True,
+                             dropout_type=dropout_type, verbose=verbose)
+    return x
 
 
 def refresh_dataset_context_if_needed(data, split_idx, batch_idx, epoch, args):
@@ -90,14 +114,23 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                 x_input = projected_features
         else:
             x_input = data.x
-        
+
+        # Apply feature dropout AFTER projection
+        x_input = apply_feature_dropout_if_enabled(x_input, args, rank)
+
+        # Apply edge dropout if enabled
+        adj_t_input = data.adj_t
+        if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):
+            verbose_dropout = getattr(args, 'verbose_edge_dropout', False) and rank == 0
+            adj_t_input = edge_dropout_sparse_tensor(data.adj_t, args.edge_dropout_rate, training=model.training, verbose=verbose_dropout)
+
         # Memory-optimized forward pass with gradient checkpointing and chunking
         if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
             # Use gradient checkpointing to reduce memory
-            h = torch.utils.checkpoint.checkpoint(model, x_input, data.adj_t)
+            h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
         else:
             # Standard forward pass
-            h = model(x_input, data.adj_t)
+            h = model(x_input, adj_t_input)
 
         # Memory optimization: Extract needed embeddings immediately and delete large tensor
         context_h = h[data.context_sample]

@@ -4,6 +4,7 @@ import time
 import numpy as np
 from sklearn.decomposition import PCA, IncrementalPCA
 from torch_geometric.utils import negative_sampling
+from torch_sparse import SparseTensor
 
 def apply_incremental_pca_cpu(data_tensor, target_dim, batch_size=10000, sign_normalize=False, rank=0):
     """
@@ -551,4 +552,387 @@ def process_link_data(data, args, rank=0):
             data.x = F.normalize(data.x, p=2, dim=1)
             
     if rank == 0:
-        print(f"Feature processing time: {time.time()-st:.2f}s", flush=True) 
+        print(f"Feature processing time: {time.time()-st:.2f}s", flush=True)
+
+
+# =============================================================================
+# Edge Dropout Augmentation Functions
+# =============================================================================
+
+def edge_dropout_sparse_tensor(adj_t, dropout_rate, training=True, verbose=False):
+    """
+    Apply edge dropout to SparseTensor (for single large graphs).
+
+    Args:
+        adj_t (SparseTensor): Input adjacency tensor
+        dropout_rate (float): Probability of dropping each edge (0.0-1.0)
+        training (bool): Only apply dropout during training
+        verbose (bool): Print timing information
+
+    Returns:
+        SparseTensor: Adjacency tensor with dropped edges
+    """
+    if not training or dropout_rate <= 0.0:
+        return adj_t
+
+    if verbose:
+        start_time = time.time()
+
+    # Get COO format - already on correct device
+    row, col, edge_attr = adj_t.coo()
+
+    # Fast GPU random generation + masking
+    num_edges = row.size(0)
+    keep_mask = torch.rand(num_edges, device=row.device) > dropout_rate
+
+    # Apply mask to all components
+    row_kept = row[keep_mask]
+    col_kept = col[keep_mask]
+    edge_attr_kept = edge_attr[keep_mask] if edge_attr is not None else None
+
+    # Reconstruct SparseTensor
+    result = SparseTensor(
+        row=row_kept,
+        col=col_kept,
+        value=edge_attr_kept,
+        sparse_sizes=adj_t.sparse_sizes()
+    )
+
+    if verbose:
+        elapsed = (time.time() - start_time) * 1000  # Convert to ms
+        edges_removed = num_edges - row_kept.size(0)
+        print(f"[Edge Dropout] {edges_removed}/{num_edges} edges removed ({dropout_rate:.1%}) in {elapsed:.2f}ms")
+
+    return result
+
+
+def edge_dropout_edge_index(edge_index, edge_attr=None, dropout_rate=0.1, training=True):
+    """
+    Apply edge dropout to edge_index format (for graph datasets).
+
+    Args:
+        edge_index (torch.Tensor): Edge indices [2, num_edges]
+        edge_attr (torch.Tensor, optional): Edge attributes [num_edges, num_features]
+        dropout_rate (float): Probability of dropping each edge (0.0-1.0)
+        training (bool): Only apply dropout during training
+
+    Returns:
+        tuple: (edge_index_dropped, edge_attr_dropped)
+    """
+    if not training or dropout_rate <= 0.0:
+        return edge_index, edge_attr
+
+    num_edges = edge_index.size(1)
+    keep_mask = torch.rand(num_edges, device=edge_index.device) > dropout_rate
+
+    # Apply mask to edge_index
+    edge_index_dropped = edge_index[:, keep_mask]
+
+    # Apply mask to edge_attr if present
+    edge_attr_dropped = None
+    if edge_attr is not None:
+        edge_attr_dropped = edge_attr[keep_mask]
+
+    return edge_index_dropped, edge_attr_dropped
+
+
+def batch_edge_dropout(batch, dropout_rate, training=True):
+    """
+    Apply edge dropout to a PyTorch Geometric batch (for graph classification).
+
+    Args:
+        batch: PyTorch Geometric batch object
+        dropout_rate (float): Probability of dropping each edge (0.0-1.0)
+        training (bool): Only apply dropout during training
+
+    Returns:
+        batch: Modified batch with dropped edges
+    """
+    if not training or dropout_rate <= 0.0:
+        return batch
+
+    # Clone batch to avoid modifying original
+    batch_dropped = batch.clone()
+
+    # Apply edge dropout to the entire batch
+    edge_index_dropped, edge_attr_dropped = edge_dropout_edge_index(
+        batch.edge_index,
+        getattr(batch, 'edge_attr', None),
+        dropout_rate,
+        training
+    )
+
+    # Update batch with dropped edges
+    batch_dropped.edge_index = edge_index_dropped
+    if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+        batch_dropped.edge_attr = edge_attr_dropped
+
+    return batch_dropped
+
+
+def apply_edge_dropout(data, dropout_rate, training=True, data_type='auto'):
+    """
+    Universal edge dropout function that handles different data formats.
+
+    Args:
+        data: Input data (SparseTensor, PyG Data, or PyG Batch)
+        dropout_rate (float): Probability of dropping each edge (0.0-1.0)
+        training (bool): Only apply dropout during training
+        data_type (str): Data type hint ('sparse_tensor', 'edge_index', 'batch', 'auto')
+
+    Returns:
+        Modified data with edge dropout applied
+    """
+    if not training or dropout_rate <= 0.0:
+        return data
+
+    # Auto-detect data type
+    if data_type == 'auto':
+        if isinstance(data, SparseTensor):
+            data_type = 'sparse_tensor'
+        elif hasattr(data, 'batch'):  # PyG Batch
+            data_type = 'batch'
+        elif hasattr(data, 'edge_index'):  # PyG Data
+            data_type = 'edge_index'
+        else:
+            raise ValueError(f"Cannot auto-detect data type for: {type(data)}")
+
+    # Apply appropriate dropout function
+    if data_type == 'sparse_tensor':
+        return edge_dropout_sparse_tensor(data, dropout_rate, training)
+    elif data_type == 'batch':
+        return batch_edge_dropout(data, dropout_rate, training)
+    elif data_type == 'edge_index':
+        # For PyG Data objects
+        edge_index_dropped, edge_attr_dropped = edge_dropout_edge_index(
+            data.edge_index,
+            getattr(data, 'edge_attr', None),
+            dropout_rate,
+            training
+        )
+        data_dropped = data.clone()
+        data_dropped.edge_index = edge_index_dropped
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            data_dropped.edge_attr = edge_attr_dropped
+        return data_dropped
+    else:
+        raise ValueError(f"Unsupported data_type: {data_type}")
+
+
+def get_edge_dropout_stats(original_data, dropped_data, data_type='auto'):
+    """
+    Get statistics about edge dropout operation.
+
+    Args:
+        original_data: Original data before dropout
+        dropped_data: Data after dropout
+        data_type (str): Data type hint
+
+    Returns:
+        dict: Statistics about the dropout operation
+    """
+    # Count edges in original data
+    if isinstance(original_data, SparseTensor):
+        original_edges = original_data.nnz()
+    elif hasattr(original_data, 'edge_index'):
+        original_edges = original_data.edge_index.size(1)
+    else:
+        original_edges = 0
+
+    # Count edges in dropped data
+    if isinstance(dropped_data, SparseTensor):
+        dropped_edges = dropped_data.nnz()
+    elif hasattr(dropped_data, 'edge_index'):
+        dropped_edges = dropped_data.edge_index.size(1)
+    else:
+        dropped_edges = 0
+
+    # Calculate statistics
+    edges_removed = original_edges - dropped_edges
+    actual_dropout_rate = edges_removed / original_edges if original_edges > 0 else 0.0
+
+    return {
+        'original_edges': original_edges,
+        'remaining_edges': dropped_edges,
+        'edges_removed': edges_removed,
+        'actual_dropout_rate': actual_dropout_rate
+    }
+
+
+# =============================================================================
+# Feature Dropout Augmentation Functions
+# =============================================================================
+
+def feature_dropout(x, dropout_rate, training=True, dropout_type='element_wise', verbose=False):
+    """
+    Apply feature dropout to node features with different strategies.
+
+    Args:
+        x (torch.Tensor): Input features [num_nodes, num_features]
+        dropout_rate (float): Probability of dropping features (0.0-1.0)
+        training (bool): Only apply dropout during training
+        dropout_type (str): Type of dropout ('element_wise', 'channel_wise', 'gaussian_noise')
+        verbose (bool): Print timing information
+
+    Returns:
+        torch.Tensor: Features with dropout applied
+    """
+    if not training or dropout_rate <= 0.0:
+        return x
+
+    if verbose:
+        start_time = time.time()
+
+    if dropout_type == 'element_wise':
+        # Standard element-wise dropout - randomly zero out individual features
+        result = torch.nn.functional.dropout(x, p=dropout_rate, training=True)
+
+    elif dropout_type == 'channel_wise':
+        # Channel-wise dropout - drop entire feature dimensions across all nodes
+        num_features = x.size(1)
+        keep_mask = torch.rand(num_features, device=x.device) > dropout_rate
+        result = x * keep_mask.unsqueeze(0)  # Broadcast to all nodes
+
+    elif dropout_type == 'gaussian_noise':
+        # Add Gaussian noise instead of zeroing (softer augmentation)
+        if x.numel() > 0:
+            noise_std = dropout_rate * x.std()
+            noise = torch.randn_like(x) * noise_std
+            result = x + noise
+        else:
+            result = x
+    else:
+        raise ValueError(f"Unknown dropout_type: {dropout_type}. Choose 'element_wise', 'channel_wise', or 'gaussian_noise'")
+
+    if verbose:
+        elapsed = (time.time() - start_time) * 1000  # Convert to ms
+        if dropout_type == 'gaussian_noise':
+            noise_std = dropout_rate * x.std() if x.numel() > 0 else 0.0
+            print(f"[Feature Dropout] {dropout_type}: noise_std={noise_std:.4f} in {elapsed:.2f}ms")
+        elif dropout_type == 'channel_wise':
+            num_features = x.size(1)
+            keep_mask = torch.rand(num_features, device=x.device) > dropout_rate
+            features_kept = keep_mask.float().mean().item()
+            print(f"[Feature Dropout] {dropout_type}: {features_kept:.1%} feature dims kept ({dropout_rate:.1%} dropout) in {elapsed:.2f}ms")
+        else:  # element_wise
+            non_zero_ratio = (result != 0).float().mean().item()
+            print(f"[Feature Dropout] {dropout_type}: {non_zero_ratio:.1%} elements kept in {elapsed:.2f}ms")
+
+    return result
+
+
+def batch_feature_dropout(batch, dropout_rate, training=True, dropout_type='element_wise', verbose=False):
+    """
+    Apply feature dropout to a PyTorch Geometric batch.
+
+    Args:
+        batch: PyTorch Geometric batch object
+        dropout_rate (float): Probability of dropping features (0.0-1.0)
+        training (bool): Only apply dropout during training
+        dropout_type (str): Type of dropout ('element_wise', 'channel_wise', 'gaussian_noise')
+        verbose (bool): Print timing information
+
+    Returns:
+        batch: Modified batch with feature dropout applied
+    """
+    if not training or dropout_rate <= 0.0:
+        return batch
+
+    # Clone batch to avoid modifying original
+    batch_dropped = batch.clone()
+
+    # Apply feature dropout to node features
+    batch_dropped.x = feature_dropout(batch.x, dropout_rate, training, dropout_type, verbose)
+
+    return batch_dropped
+
+
+def apply_feature_dropout(data, dropout_rate, training=True, dropout_type='element_wise',
+                         data_type='auto', verbose=False):
+    """
+    Universal feature dropout function that handles different data formats.
+
+    Args:
+        data: Input data (PyG Data, PyG Batch, or raw tensor)
+        dropout_rate (float): Probability of dropping features (0.0-1.0)
+        training (bool): Only apply dropout during training
+        dropout_type (str): Type of dropout ('element_wise', 'channel_wise', 'gaussian_noise')
+        data_type (str): Data type hint ('tensor', 'data', 'batch', 'auto')
+        verbose (bool): Print timing information
+
+    Returns:
+        Modified data with feature dropout applied
+    """
+    if not training or dropout_rate <= 0.0:
+        return data
+
+    # Auto-detect data type
+    if data_type == 'auto':
+        if hasattr(data, 'batch'):  # PyG Batch
+            data_type = 'batch'
+        elif hasattr(data, 'x'):  # PyG Data
+            data_type = 'data'
+        elif isinstance(data, torch.Tensor):  # Raw tensor
+            data_type = 'tensor'
+        else:
+            raise ValueError(f"Cannot auto-detect data type for: {type(data)}")
+
+    # Apply appropriate dropout function
+    if data_type == 'batch':
+        return batch_feature_dropout(data, dropout_rate, training, dropout_type, verbose)
+    elif data_type == 'data':
+        # For PyG Data objects
+        data_dropped = data.clone()
+        data_dropped.x = feature_dropout(data.x, dropout_rate, training, dropout_type, verbose)
+        return data_dropped
+    elif data_type == 'tensor':
+        # For raw tensors
+        return feature_dropout(data, dropout_rate, training, dropout_type, verbose)
+    else:
+        raise ValueError(f"Unsupported data_type: {data_type}")
+
+
+def get_feature_dropout_stats(original_features, dropped_features, dropout_type='element_wise'):
+    """
+    Get statistics about feature dropout operation.
+
+    Args:
+        original_features (torch.Tensor): Original features before dropout
+        dropped_features (torch.Tensor): Features after dropout
+        dropout_type (str): Type of dropout used
+
+    Returns:
+        dict: Statistics about the dropout operation
+    """
+    if dropout_type == 'gaussian_noise':
+        # For Gaussian noise, compute noise magnitude
+        if original_features.numel() > 0:
+            noise_magnitude = (dropped_features - original_features).abs().mean().item()
+            feature_magnitude = original_features.abs().mean().item()
+            relative_noise = noise_magnitude / feature_magnitude if feature_magnitude > 0 else 0.0
+        else:
+            noise_magnitude = 0.0
+            feature_magnitude = 0.0
+            relative_noise = 0.0
+
+        return {
+            'original_feature_magnitude': feature_magnitude,
+            'noise_magnitude': noise_magnitude,
+            'relative_noise_ratio': relative_noise,
+            'features_changed': 1.0  # All features have noise added
+        }
+    else:
+        # For masking-based dropout, compute fraction of features kept
+        if original_features.numel() > 0:
+            features_kept = (dropped_features != 0).float().mean().item()
+            features_dropped = 1.0 - features_kept
+        else:
+            features_kept = 1.0
+            features_dropped = 0.0
+
+        return {
+            'original_features': original_features.numel(),
+            'features_kept': features_kept,
+            'features_dropped': features_dropped,
+            'actual_dropout_rate': features_dropped
+        } 
