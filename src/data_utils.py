@@ -232,22 +232,24 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     # Original PCA-based approach
     # Determine PCA target dimension
     original_dim = input_features.size(1)
-    
+    num_nodes = input_features.size(0)
+    max_pca_dim = min(num_nodes, original_dim)  # Maximum valid PCA dimension
+
     if original_dim >= hidden:
         # Case 1: Enough features, just PCA to hidden (no padding/projection needed)
-        pca_target_dim = hidden
+        pca_target_dim = min(hidden, max_pca_dim)  # Ensure we don't exceed matrix limits
         data.needs_projection = False
         if rank == 0:
-            print(f"Dataset {data.name}: Sufficient features ({original_dim} >= {hidden}), PCA to {hidden}")
+            print(f"Dataset {data.name}: Sufficient features ({original_dim} >= {hidden}), PCA to {pca_target_dim}")
     elif use_projector:
         # Case 2a: Not enough features, use projector pathway
-        pca_target_dim = min(original_dim, min_pca_dim)
+        pca_target_dim = min(original_dim, min_pca_dim, max_pca_dim)
         data.needs_projection = True
         if rank == 0:
             print(f"Dataset {data.name}: Using projector pathway ({original_dim} -> {pca_target_dim} -> {hidden})")
     else:
         # Case 2b: Not enough features, use zero padding
-        pca_target_dim = original_dim  # Use all available features
+        pca_target_dim = min(original_dim, max_pca_dim)  # Use all available features but respect limits
         data.needs_projection = False
         if rank == 0:
             print(f"Dataset {data.name}: Using zero padding ({original_dim} -> zero-pad to {hidden})")
