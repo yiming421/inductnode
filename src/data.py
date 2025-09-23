@@ -193,7 +193,7 @@ def load_ogbn_data_train(dataset):
 
 def load_text_enhanced_dataset(dataset_name: str):
     """Load text-enhanced datasets with Qwen-generated node features"""
-    dataset_path = os.path.join(get_project_root(), 'dataset', dataset_name)
+    dataset_path = os.path.join(os.path.join(get_project_root(), 'dataset'), dataset_name)
     
     if not os.path.exists(dataset_path):
         raise ValueError(f"Text-enhanced dataset {dataset_name} not found at {dataset_path}")

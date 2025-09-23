@@ -712,7 +712,7 @@ def refresh_nc_contexts(nc_data, args=None, epoch=None):
     if nc_data[0] is None:
         return
     
-    nc_data_list, nc_split_idx_list = nc_data
+    nc_data_list, nc_split_idx_list, nc_external_embeddings = nc_data
     print("  🔄 Refreshing NC contexts...")
     
     for data, split_idx in zip(nc_data_list, nc_split_idx_list):
@@ -1028,63 +1028,118 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
     # === Node Classification Data ===
     nc_train_data_list, nc_train_split_idx_list = None, None
     nc_test_data_list, nc_test_split_idx_list = None, None
+    # Ensure local initialization before any reference to avoid UnboundLocalError
+    nc_train_external_embeddings = None
+    nc_test_external_embeddings = None
     
     if args.enable_nc:
         print("Loading node classification datasets...")
         nc_train_datasets = args.nc_train_dataset.split(',')
         nc_test_datasets = args.nc_test_dataset.split(',')
         
-        # Load training data for node classification (skip if using pretrained model)
+        # 1) Load training/test data lists first
         if not skip_training_data:
             nc_train_data_list, nc_train_split_idx_list = load_all_data_train(nc_train_datasets)
-            
-            # Process node classification training data
-            for data, split_idx in zip(nc_train_data_list, nc_train_split_idx_list):
-                data.x = data.x.to(device)
-                data.adj_t = data.adj_t.to(device)
-                data.y = data.y.to(device)
-                # Apply node classification specific preprocessing
-
-                process_data(data, split_idx, args.hidden, args.context_num, False, args.use_full_pca, 
-                            args.normalize_data, False, 32, 0, args.padding_strategy, 
-                            args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
-                            args.incremental_pca_batch_size)
-                
-                # Apply K-Medoids sampling if enabled
-                if getattr(args, 'use_kmedoids_sampling', False):
-                    new_context_sample = sample_context_with_kmedoids(
-                        data, args.context_num, split_idx['train'], 
-                        use_kmedoids=True, random_state=args.seed
-                    )
-                    data.context_sample = new_context_sample.to(data.context_sample.device)
         else:
             print("  Skipping NC training data loading (using pretrained model)")
 
-        # Load test data for node classification
         nc_test_data_list, nc_test_split_idx_list = load_all_data(nc_test_datasets)
-        
-        # Process node classification test data
-        for data, split_idx in zip(nc_test_data_list, nc_test_split_idx_list):
+
+        # 2) Load external embeddings (if enabled) before processing datasets so they can be used
+        if getattr(args, 'use_external_embeddings_nc', False):
+            print("Loading external embeddings for node classification...")
+
+            if not os.path.exists(args.fug_root):
+                print(f"  WARNING: fug_root directory does not exist: {args.fug_root}")
+                print(f"  Continuing without external embeddings...")
+            else:
+                # Training embeddings
+                if not skip_training_data and nc_train_data_list is not None:
+                    nc_train_external_embeddings = []
+                    for data in nc_train_data_list:
+                        dataset_name = getattr(data, 'name', 'unknown')
+                        emb_file = os.path.join(args.fug_root, dataset_name, f"{dataset_name}.pt")
+                        if os.path.exists(emb_file):
+                            try:
+                                external_embeddings = torch.load(emb_file, map_location='cpu')
+                                print(f"  Loaded external embeddings for {dataset_name}: {external_embeddings.shape}")
+                                if external_embeddings.size(0) != data.num_nodes:
+                                    print(f"  WARNING: {dataset_name} embedding count {external_embeddings.size(0)} != dataset nodes {data.num_nodes}")
+                                nc_train_external_embeddings.append(external_embeddings)
+                            except Exception as e:
+                                print(f"  Failed to load external embeddings for {dataset_name}: {e}")
+                                nc_train_external_embeddings.append(None)
+                        else:
+                            print(f"  No external embeddings found for {dataset_name} (expected: {emb_file})")
+                            nc_train_external_embeddings.append(None)
+                # Test embeddings
+                if nc_test_data_list is not None:
+                    nc_test_external_embeddings = []
+                    for data in nc_test_data_list:
+                        dataset_name = getattr(data, 'name', 'unknown')
+                        emb_file = os.path.join(args.fug_root, dataset_name, f"{dataset_name}.pt")
+                        if os.path.exists(emb_file):
+                            try:
+                                external_embeddings = torch.load(emb_file, map_location='cpu')
+                                print(f"  Loaded external embeddings for {dataset_name}: {external_embeddings.shape}")
+                                if external_embeddings.size(0) != data.num_nodes:
+                                    print(f"  WARNING: {dataset_name} embedding count {external_embeddings.size(0)} != dataset nodes {data.num_nodes}")
+                                nc_test_external_embeddings.append(external_embeddings)
+                            except Exception as e:
+                                print(f"  Failed to load external embeddings for {dataset_name}: {e}")
+                                nc_test_external_embeddings.append(None)
+                        else:
+                            print(f"  No external embeddings found for {dataset_name} (expected: {emb_file})")
+                            nc_test_external_embeddings.append(None)
+
+        # 3) Process training data (now embeddings are ready if enabled)
+        if not skip_training_data:
+            for i, (data, split_idx) in enumerate(zip(nc_train_data_list, nc_train_split_idx_list)):
+                data.x = data.x.to(device)
+                data.adj_t = data.adj_t.to(device)
+                data.y = data.y.to(device)
+
+                external_emb = nc_train_external_embeddings[i] if nc_train_external_embeddings else None
+
+                process_data(
+                    data, split_idx, args.hidden, args.context_num, False, args.use_full_pca,
+                    args.normalize_data, False, 32, 0, args.padding_strategy,
+                    args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                    args.incremental_pca_batch_size, external_emb
+                )
+
+                if getattr(args, 'use_kmedoids_sampling', False):
+                    new_context_sample = sample_context_with_kmedoids(
+                        data, args.context_num, split_idx['train'], use_kmedoids=True, random_state=args.seed
+                    )
+                    data.context_sample = new_context_sample.to(data.context_sample.device)
+
+        # 4) Process test data
+        for i, (data, split_idx) in enumerate(zip(nc_test_data_list, nc_test_split_idx_list)):
             data.x = data.x.to(device)
             data.adj_t = data.adj_t.to(device)
             data.y = data.y.to(device)
-            # Resolve context shots for this specific dataset
+
+            external_emb = nc_test_external_embeddings[i] if nc_test_external_embeddings else None
+
             context_shots = resolve_context_shots(data.name, 'nc', args, epoch=None)
-            process_data(data, split_idx, args.hidden, context_shots, False, args.use_full_pca, 
-                        args.normalize_data, False, 32, 0, args.padding_strategy, 
-                        args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
-                        args.incremental_pca_batch_size)
-            
-            # Apply K-Medoids sampling if enabled
+            process_data(
+                data, split_idx, args.hidden, context_shots, False, args.use_full_pca,
+                args.normalize_data, False, 32, 0, args.padding_strategy,
+                args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                args.incremental_pca_batch_size, external_emb
+            )
+
             if getattr(args, 'use_kmedoids_sampling', False):
                 new_context_sample = sample_context_with_kmedoids(
-                    data, context_shots, split_idx['train'], 
-                    use_kmedoids=True, random_state=args.seed
+                    data, context_shots, split_idx['train'], use_kmedoids=True, random_state=args.seed
                 )
                 data.context_sample = new_context_sample.to(data.context_sample.device)
     else:
         print("Node classification task disabled, skipping dataset loading...")
-    
+
+    # (External embedding section moved earlier within NC block.)
+
     # === Link Prediction Data ===
     lp_train_data_list, lp_train_split_idx_list = None, None
     lp_train_context_data, lp_train_masks, lp_train_link_data_all = [], [], []
@@ -1367,10 +1422,10 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 dataset_info['task_filtered_splits_test_only'] = task_filtered_splits_test
     else:
         print("Graph classification task disabled, skipping dataset loading...")
-    
+
     data_dict = {
-        'nc_train': (nc_train_data_list, nc_train_split_idx_list),
-        'nc_test': (nc_test_data_list, nc_test_split_idx_list),
+        'nc_train': (nc_train_data_list, nc_train_split_idx_list, nc_train_external_embeddings),
+        'nc_test': (nc_test_data_list, nc_test_split_idx_list, nc_test_external_embeddings),
         'lp_train': (lp_train_data_list, lp_train_split_idx_list, lp_train_context_data, lp_train_masks, lp_train_link_data_all),
         'lp_test': (lp_test_data_list, lp_test_split_idx_list, lp_test_context_data, lp_test_link_data_all),
         'gc_train': (gc_train_data_list, gc_train_processed_data_list),
@@ -1405,7 +1460,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     gc_count = 0
     
     # Unpack data
-    nc_data_list, nc_split_idx_list = nc_data
+    nc_data_list, nc_split_idx_list, nc_external_embeddings = nc_data
     (lp_data_list, lp_split_idx_list, lp_context_data, lp_masks, lp_link_data_all) = lp_data
     gc_data_list, gc_processed_data_list = gc_data
     
@@ -1413,10 +1468,10 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     
     # Node Classification Loss
     if hasattr(args, 'enable_nc') and args.enable_nc and nc_data_list is not None and len(nc_data_list) > 0 and args.lambda_nc > 0:
-        nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=optimizer, pred=predictor, 
-                          batch_size=args.nc_batch_size, degree=False, 
-                          orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h, 
-                          clip_grad=args.clip_grad, rank=0, epoch=epoch, 
+        nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=optimizer, pred=predictor,
+                          batch_size=args.nc_batch_size, degree=False,
+                          orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
+                          clip_grad=args.clip_grad, rank=0, epoch=epoch,
                           identity_projection=identity_projection, lambda_=args.lambda_nc, args=args)
         if nc_loss is not None:
             total_nc_loss = nc_loss
@@ -1580,7 +1635,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
     results = {}
 
     with torch.no_grad():
-        nc_data_list, nc_split_idx_list = nc_data
+        nc_data_list, nc_split_idx_list, nc_external_embeddings = nc_data
         if len(nc_data_list) > 0:
             if split == 'test':
                 print(f"  Processing {len(nc_data_list)} unseen test datasets...")
@@ -2054,7 +2109,8 @@ def run_joint_training(args, device='cuda:0'):
     if args.schedule == 'cosine':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     elif args.schedule == 'step':
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epochs // 5, gamma=0.5)
+        step = max(1, args.epochs // 5)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step, gamma=0.5)
     elif args.schedule == 'warmup':
         scheduler = get_cosine_schedule_with_warmup(optimizer, 
                                                   num_warmup_steps=args.epochs // 10, 
@@ -2486,7 +2542,51 @@ def main():
         setup_cuda_visible_devices(gpu_ids)
         
         device = torch.device(f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu')
-        
+
+        # Claim all available GPU memory if requested
+        if args.claim_all_gpu_memory and torch.cuda.is_available():
+            try:
+                print(f"🔒 Claiming all available GPU memory on {device}...")
+                # Get current memory usage
+                allocated_before = torch.cuda.memory_allocated(device) / 1024**3
+                reserved_before = torch.cuda.memory_reserved(device) / 1024**3
+
+                # Get total GPU memory
+                total_memory = torch.cuda.get_device_properties(device).total_memory / 1024**3
+
+                print(f"   Before claiming - Allocated: {allocated_before:.2f}GB, Reserved: {reserved_before:.2f}GB, Total: {total_memory:.2f}GB")
+
+                # Reserve most available memory by creating large tensors
+                free_memory = torch.cuda.mem_get_info(device)[0] / 1024**3  # Free memory in GB
+                memory_to_claim = free_memory - 1.0  # Leave 1GB buffer for operations
+
+                if memory_to_claim > 1.0:  # Only claim if more than 1GB available
+                    print(f"   Free memory: {free_memory:.2f}GB, claiming: {memory_to_claim:.2f}GB")
+
+                    # Create tensor to claim memory (using float32 which is 4 bytes per element)
+                    elements_to_allocate = int(memory_to_claim * 1024**3 / 4)  # 4 bytes per float32
+                    memory_tensor = torch.empty(elements_to_allocate, dtype=torch.float32, device=device)
+
+                    # Check final memory usage
+                    allocated_after = torch.cuda.memory_allocated(device) / 1024**3
+                    reserved_after = torch.cuda.memory_reserved(device) / 1024**3
+
+                    print(f"   ✅ Memory claimed - Allocated: {allocated_after:.2f}GB, Reserved: {reserved_after:.2f}GB")
+                    print(f"   Successfully claimed {allocated_after - allocated_before:.2f}GB of GPU memory")
+
+                    # Delete the tensor but keep the memory reserved
+                    del memory_tensor
+                    torch.cuda.empty_cache()
+
+                    final_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                    print(f"   Final reserved memory: {final_reserved:.2f}GB")
+                else:
+                    print(f"   ⚠️  Only {memory_to_claim:.2f}GB available to claim, skipping memory claiming")
+
+            except Exception as e:
+                print(f"   ⚠️  Failed to claim GPU memory: {e}")
+                print(f"   Continuing without memory claiming...")
+
     except (ValueError, RuntimeError) as e:
         print(f"GPU setup error: {e}")
         return
@@ -2524,21 +2624,26 @@ def main():
     
     # Aggregate individual dataset metrics across runs
     avg_nc_individual = []
+    std_nc_individual = []
     avg_lp_individual = []
+    std_lp_individual = []
     avg_gc_individual = []
-    
+    std_gc_individual = []
+
     if all_nc_individual_results and all_nc_individual_results[0]:
         num_nc_datasets = len(all_nc_individual_results[0])
         for dataset_idx in range(num_nc_datasets):
             dataset_metrics = [run_results[dataset_idx] for run_results in all_nc_individual_results if len(run_results) > dataset_idx]
             avg_nc_individual.append(sum(dataset_metrics) / len(dataset_metrics))
-    
+            std_nc_individual.append(torch.std(torch.tensor(dataset_metrics)).item() if len(dataset_metrics) > 1 else 0.0)
+
     if all_lp_individual_results and all_lp_individual_results[0]:
         num_lp_datasets = len(all_lp_individual_results[0])
         for dataset_idx in range(num_lp_datasets):
             dataset_metrics = [run_results[dataset_idx] for run_results in all_lp_individual_results if len(run_results) > dataset_idx]
             avg_lp_individual.append(sum(dataset_metrics) / len(dataset_metrics))
-    
+            std_lp_individual.append(torch.std(torch.tensor(dataset_metrics)).item() if len(dataset_metrics) > 1 else 0.0)
+
     if all_gc_individual_results and all_gc_individual_results[0]:
         num_gc_datasets = len(all_gc_individual_results[0])
         for dataset_idx in range(num_gc_datasets):
@@ -2553,6 +2658,7 @@ def main():
                 else:
                     primary_metrics.append(metric)
             avg_gc_individual.append(sum(primary_metrics) / len(primary_metrics))
+            std_gc_individual.append(torch.std(torch.tensor(primary_metrics)).item() if len(primary_metrics) > 1 else 0.0)
     
     print(f"\n{'='*50}")
     print(f"Final Results (Average over {args.runs} runs)")
@@ -2575,21 +2681,21 @@ def main():
     if avg_nc_individual:
         print(f"\nNode Classification Individual Results:")
         nc_test_datasets = args.nc_test_dataset.split(',')
-        for dataset_name, metric in zip(nc_test_datasets, avg_nc_individual):
-            print(f"  {dataset_name.strip()}: {metric:.4f}")
-    
+        for dataset_name, metric, std in zip(nc_test_datasets, avg_nc_individual, std_nc_individual):
+            print(f"  {dataset_name.strip()}: {metric:.4f} ± {std:.4f}")
+
     if avg_lp_individual:
         print(f"\nLink Prediction Individual Results:")
         lp_test_datasets = args.lp_test_dataset.split(',')
-        for dataset_name, metric in zip(lp_test_datasets, avg_lp_individual):
-            print(f"  {dataset_name.strip()}: {metric:.4f}")
-    
+        for dataset_name, metric, std in zip(lp_test_datasets, avg_lp_individual, std_lp_individual):
+            print(f"  {dataset_name.strip()}: {metric:.4f} ± {std:.4f}")
+
     if avg_gc_individual:
         print(f"\nGraph Classification Individual Results:")
         gc_test_datasets = args.gc_test_dataset.split(',')
-        for dataset_name, metric in zip(gc_test_datasets, avg_gc_individual):
+        for dataset_name, metric, std in zip(gc_test_datasets, avg_gc_individual, std_gc_individual):
             metric_str = format_metric_results(metric) if isinstance(metric, dict) else f"{metric:.4f}"
-            print(f"  {dataset_name.strip()}: {metric_str}")
+            print(f"  {dataset_name.strip()}: {metric_str} ± {std:.4f}")
     
     # Get dataset names
     nc_test_datasets = args.nc_test_dataset.split(',') if getattr(args, 'enable_nc', True) and hasattr(args, 'nc_test_dataset') else []

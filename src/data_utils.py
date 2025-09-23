@@ -149,11 +149,11 @@ def select_k_shot_context(data, k, index):
     context_samples = torch.cat(context_samples)
     return context_samples
 
-def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use_full_pca=False, 
-                 normalize_data=False, use_projector=False, min_pca_dim=32, rank=0, 
-                 padding_strategy='zero', use_batchnorm=False, use_identity_projection=False, 
+def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use_full_pca=False,
+                 normalize_data=False, use_projector=False, min_pca_dim=32, rank=0,
+                 padding_strategy='zero', use_batchnorm=False, use_identity_projection=False,
                  projection_small_dim=128, projection_large_dim=256, pca_device='gpu',
-                 incremental_pca_batch_size=10000):
+                 incremental_pca_batch_size=10000, external_embeddings=None):
     device = data.x.device
     split_idx['train'] = split_idx['train'].to(device)
     split_idx['valid'] = split_idx['valid'].to(device)
@@ -162,10 +162,19 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     data.context_sample = data.context_sample.to(device)
 
     st = time.time()
-    
+
+    # Use external embeddings if provided, otherwise use original data.x
+    if external_embeddings is not None:
+        # Move external embeddings to the correct device and replace data.x
+        input_features = external_embeddings.to(device)
+        if rank == 0:
+            print(f"Dataset {data.name}: Using external embeddings ({input_features.shape}) instead of data.x ({data.x.shape})")
+    else:
+        input_features = data.x
+
     # Identity projection approach - PCA to small_dim, then project to large_dim
     if use_identity_projection:
-        original_dim = data.x.size(1)
+        original_dim = input_features.size(1)
         if rank == 0:
             print(f"Dataset {data.name}: Identity projection ({original_dim}D -> PCA to {projection_small_dim}D -> Project to {projection_large_dim}D)")
         
@@ -173,12 +182,12 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         if original_dim >= projection_small_dim:
             # Standard PCA to small_dim
             if use_full_pca:
-                U, S, V = torch.svd(data.x)
+                U, S, V = torch.svd(input_features)
                 U = U[:, :projection_small_dim]
                 S = S[:projection_small_dim]
             else:
-                U, S, V = torch.pca_lowrank(data.x, q=projection_small_dim)
-            
+                U, S, V = torch.pca_lowrank(input_features, q=projection_small_dim)
+
             # Sign normalization if requested
             if sign_normalize:
                 for i in range(projection_small_dim):
@@ -186,18 +195,18 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
                     max_idx = torch.argmax(torch.abs(feature_vector))
                     if feature_vector[max_idx] < 0:
                         U[:, i] = -U[:, i]
-            
+
             data.x_pca = torch.mm(U, torch.diag(S))
         else:
             # For very small datasets, use all dimensions + minimal padding if needed
-            data.x_pca = data.x
+            data.x_pca = input_features
             if data.x_pca.size(1) < projection_small_dim:
                 pad_size = projection_small_dim - data.x_pca.size(1)
                 padding = torch.zeros(data.x_pca.size(0), pad_size, device=device)
                 data.x_pca = torch.cat([data.x_pca, padding], dim=1)
                 if rank == 0:
-                    print(f"Dataset {data.name}: Minimal padding {data.x.size(1)} -> {projection_small_dim}")
-        
+                    print(f"Dataset {data.name}: Minimal padding {input_features.size(1)} -> {projection_small_dim}")
+
         # Step 2: Set up for identity projection during forward pass
         data.x = data.x_pca  # Input to identity projection layer
         data.needs_identity_projection = True
@@ -222,7 +231,7 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     
     # Original PCA-based approach
     # Determine PCA target dimension
-    original_dim = data.x.size(1)
+    original_dim = input_features.size(1)
     
     if original_dim >= hidden:
         # Case 1: Enough features, just PCA to hidden (no padding/projection needed)
@@ -248,8 +257,8 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         # Use CPU-based Incremental PCA (stays on CPU)
         pca_start = time.time()
         data.x_pca = apply_incremental_pca_cpu(
-            data.x, 
-            target_dim=pca_target_dim, 
+            input_features,
+            target_dim=pca_target_dim,
             batch_size=incremental_pca_batch_size,
             sign_normalize=sign_normalize,
             rank=rank
@@ -260,11 +269,11 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     else:
         # Use original GPU-based PCA methods
         if use_full_pca:
-            U, S, V = torch.svd(data.x)
+            U, S, V = torch.svd(input_features)
             U = U[:, :pca_target_dim]
             S = S[:pca_target_dim]
         else:
-            U, S, V = torch.pca_lowrank(data.x, q=pca_target_dim)
+            U, S, V = torch.pca_lowrank(input_features, q=pca_target_dim)
 
         # normalize the eigenvectors direction
         if sign_normalize:

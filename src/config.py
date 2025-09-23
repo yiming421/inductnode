@@ -241,7 +241,8 @@ def parse_joint_training_args():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--port', type=int, default=12355, help='Port for DDP')
     parser.add_argument('--single_gpu', type=str2bool, default=True, help='Use single GPU mode instead of distributed training')
-    
+    parser.add_argument('--claim_all_gpu_memory', type=str2bool, default=False, help='Claim all available GPU memory at startup to prevent competition')
+
     # === Model Architecture ===
     parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN', 'UnifiedGNN'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN'])
@@ -304,7 +305,7 @@ def parse_joint_training_args():
     parser.add_argument('--use_identity_projection', type=str2bool, default=True, help='Use identity projection')
     
     # === PFN Predictor Configuration ===
-    parser.add_argument('--context_num', type=int, default=20, help='Number of context nodes')
+    parser.add_argument('--context_num', type=int, default=5, help='Number of context nodes')
     parser.add_argument('--seperate', type=str2bool, default=True, help='Separate processing in PFN predictor')
     parser.add_argument('--padding', type=str, default='zero', choices=['zero', 'mlp'], help='Padding method for PFN predictor')
     parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'mlp'], help='Similarity function')
@@ -327,7 +328,7 @@ def parse_joint_training_args():
     # === Edge Dropout Augmentation ===
     parser.add_argument('--edge_dropout_rate', type=float, default=0.0,
                        help='Edge dropout rate for data augmentation (0.0-0.5). Set to 0.0 to disable.')
-    parser.add_argument('--edge_dropout_enabled', type=str2bool, default=False,
+    parser.add_argument('--edge_dropout_enabled', type=str2bool, default=True,
                        help='Enable edge dropout augmentation during training')
     parser.add_argument('--verbose_edge_dropout', type=str2bool, default=False,
                        help='Print edge dropout timing and statistics')
@@ -335,13 +336,17 @@ def parse_joint_training_args():
     # === Feature Dropout Augmentation ===
     parser.add_argument('--feature_dropout_rate', type=float, default=0.0,
                        help='Feature dropout rate for data augmentation (0.0-0.8). Set to 0.0 to disable.')
-    parser.add_argument('--feature_dropout_enabled', type=str2bool, default=False,
+    parser.add_argument('--feature_dropout_enabled', type=str2bool, default=True,
                        help='Enable feature dropout augmentation during training (applied after projection)')
-    parser.add_argument('--feature_dropout_type', type=str, default='element_wise',
+    parser.add_argument('--feature_dropout_type', type=str, default='channel_wise',
                        choices=['element_wise', 'channel_wise', 'gaussian_noise'],
                        help='Type of feature dropout: element_wise, channel_wise, or gaussian_noise')
     parser.add_argument('--verbose_feature_dropout', type=str2bool, default=False,
                        help='Print feature dropout timing and statistics')
+
+    # === External Embeddings (FUG) ===
+    parser.add_argument('--use_external_embeddings_nc', type=str2bool, default=False,
+                       help='Use external embeddings for node classification (load from fug_root)')
 
     # === Link Prediction Specific ===
     parser.add_argument('--context_neg_ratio', type=int, default=3, help='Negative sampling ratio for context')

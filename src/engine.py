@@ -66,9 +66,9 @@ def refresh_dataset_context_if_needed(data, split_idx, batch_idx, epoch, args):
             
             print(f"🔄 Dataset {data.name} context refreshed at batch {batch_idx} ({len(new_context_sample)} samples)")
 
-def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None, 
-          orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, rank=0, epoch=0, 
-          identity_projection=None, lambda_=1.0, args=None):
+def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att=None, mlp=None,
+          orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, rank=0, epoch=0,
+          identity_projection=None, lambda_=1.0, args=None, external_embeddings=None):
     st = time.time()
     print(f"[RANK {rank}] Starting training epoch {epoch} on device cuda:{rank}", flush=True)
     
@@ -102,18 +102,20 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             perm = perm.tolist()
         train_perm_idx = train_idx[perm]
         
+        base_features = data.x
+
         # Apply different projection strategies
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
-            x_input = identity_projection(data.x)
+            x_input = identity_projection(base_features)
         elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
-            projected_features = projector(data.x)
+            projected_features = projector(base_features)
             # Apply final PCA to get features in proper PCA form
             if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
                 x_input = apply_final_pca(projected_features, projected_features.size(1))
             else:
                 x_input = projected_features
         else:
-            x_input = data.x
+            x_input = base_features
 
         # Apply feature dropout AFTER projection
         x_input = apply_feature_dropout_if_enabled(x_input, args, rank)
@@ -200,22 +202,23 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     return total_loss / len(dataloader)  # Return scalar for normal training
 
 def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, degree=False, att=None,
-              mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None, 
-              rank=0, epoch=0, identity_projection=None, lambda_=1.0, args=None):
+              mlp=None, orthogonal_push=0.0, normalize_class_h=False, clip_grad=1.0, projector=None,
+              rank=0, epoch=0, identity_projection=None, lambda_=1.0, args=None, external_embeddings_list=None):
     tot_loss = 0
-    for data, split_idx in zip(data_list, split_idx_list):
+    for i, (data, split_idx) in enumerate(zip(data_list, split_idx_list)):
         train_idx = split_idx['train']
+        external_embeddings = external_embeddings_list[i] if external_embeddings_list else None
         loss = train(model, data, train_idx, optimizer, pred, batch_size, degree, att, mlp,
-                     orthogonal_push, normalize_class_h, clip_grad, projector, rank, epoch, 
-                     identity_projection, lambda_, args)
+                     orthogonal_push, normalize_class_h, clip_grad, projector, rank, epoch,
+                     identity_projection, lambda_, args, external_embeddings)
         if rank == 0:
             print(f"Dataset {data.name} Loss: {loss}", flush=True)
         tot_loss += loss
     return tot_loss / (len(data_list))
 
 @torch.no_grad()
-def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False, 
-         att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None):
+def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False,
+         att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings=None):
     st = time.time()
     model.eval()
     predictor.eval()
@@ -224,19 +227,21 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     if identity_projection is not None:
         identity_projection.eval()
 
+    base_features = data.x
+
     # Apply different projection strategies
     if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
         # Apply identity projection
-        x_input = identity_projection(data.x)
+        x_input = identity_projection(base_features)
     elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
-        projected_features = projector(data.x)
+        projected_features = projector(base_features)
         # Apply final PCA to get features in proper PCA form
         if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
             x_input = apply_final_pca(projected_features, projected_features.size(1))
         else:
             x_input = projected_features
     else:
-        x_input = data.x
+        x_input = base_features
 
     h = model(x_input, data.adj_t)
 
@@ -288,17 +293,18 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
         print(f"Test time: {time.time()-st}", flush=True)
     return train_results, valid_results, test_results
 
-def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=False, att=None, 
-             mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None):
+def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=False, att=None,
+             mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings_list=None):
     tot_train_metric, tot_valid_metric, tot_test_metric = 1, 1, 1
-    for data, split_idx in zip(data_list, split_idx_list):
+    for i, (data, split_idx) in enumerate(zip(data_list, split_idx_list)):
         train_idx = split_idx['train']
         valid_idx = split_idx['valid']
         test_idx = split_idx['test']
+        external_embeddings = external_embeddings_list[i] if external_embeddings_list else None
 
         train_metric, valid_metric, test_metric = \
         test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
-             normalize_class_h, projector, rank, identity_projection)
+             normalize_class_h, projector, rank, identity_projection, external_embeddings)
         if rank == 0:
             print(f"Dataset {data.name}")
             print(f"Train {train_metric}, Valid {valid_metric}, Test {test_metric}", flush=True)
@@ -309,7 +315,7 @@ def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=Fal
            tot_test_metric ** (1/(len(data_list)))
 
 def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, degree=False,
-                    att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None):
+                    att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings_list=None):
     import time
 
     train_metric_list, valid_metric_list, test_metric_list = [], [], []
@@ -320,9 +326,10 @@ def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, deg
         valid_idx = split_idx['valid']
         test_idx = split_idx['test']
 
+        external_embeddings = external_embeddings_list[dataset_idx] if external_embeddings_list else None
         train_metric, valid_metric, test_metric = \
         test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
-             normalize_class_h, projector, rank, identity_projection)
+             normalize_class_h, projector, rank, identity_projection, external_embeddings)
 
         dataset_time = time.time() - dataset_start_time
 
