@@ -675,10 +675,14 @@ def resolve_context_shots(dataset_name, task_type, args, epoch=None):
     elif sampling_plan == 'decay':
         # Gradual decay from upper to lower bound over training
         if epoch is None:
-            # If no epoch provided, use upper bound
-            bounds = parse_context_bounds(getattr(args, 'context_bounds', None))
-            context_shots = bounds[task_type][1]  # upper bound
-            print(f"[Context Decay] {task_type.upper()} dataset '{dataset_name}': using {context_shots} context shots (no epoch provided, using upper bound)")
+            # During evaluation, fall back to original fixed behavior instead of upper bound
+            defaults = {
+                'nc': args.context_num,
+                'lp': args.context_k,
+                'gc': args.context_graph_num
+            }
+            context_shots = defaults[task_type]
+            print(f"[Context Evaluation] {task_type.upper()} dataset '{dataset_name}': using {context_shots} context shots (evaluation mode, ignoring decay)")
             return context_shots
             
         bounds = parse_context_bounds(getattr(args, 'context_bounds', None))

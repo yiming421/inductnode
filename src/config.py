@@ -351,7 +351,7 @@ def parse_joint_training_args():
     # === Link Prediction Specific ===
     parser.add_argument('--context_neg_ratio', type=int, default=3, help='Negative sampling ratio for context')
     parser.add_argument('--train_neg_ratio', type=int, default=3, help='Negative sampling ratio for training')
-    parser.add_argument('--context_k', type=int, default=32, help='Number of context samples for link prediction')
+    parser.add_argument('--context_k', type=int, default=5, help='Number of context samples for link prediction')
     parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
     
@@ -362,7 +362,7 @@ def parse_joint_training_args():
     parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
     parser.add_argument('--graph_pooling', type=str, default='max', choices=['mean', 'max', 'sum'], help='Graph pooling method')
     parser.add_argument('--lambda_gc', type=float, default=0.41834063194474214, help='Weight for graph classification loss')
-    parser.add_argument('--context_graph_num', type=int, default=8, help='Number of context graphs for graph classification')
+    parser.add_argument('--context_graph_num', type=int, default=5, help='Number of context graphs for graph classification')
     
     # === OGB FUG embeddings arguments (for graph classification) ===
     parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
