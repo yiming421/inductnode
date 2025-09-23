@@ -554,7 +554,7 @@ def parse_graph_classification_args():
                         help='Root directory for OGB datasets')
     
     # Checkpointing arguments
-    parser.add_argument('--save_checkpoint', type=str2bool, default=False,
+    parser.add_argument('--save_checkpoint', type=str2bool, default=True,
                         help='Save checkpoint after training')
     parser.add_argument('--checkpoint_dir', type=str, default='../checkpoints',
                         help='Directory to save checkpoints')

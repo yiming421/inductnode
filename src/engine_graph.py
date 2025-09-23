@@ -305,8 +305,8 @@ def get_dataset_metric(dataset_name, is_multitask=None):
     if 'chemhiv' in dataset_name or 'hiv' in dataset_name:
         return 'auc'
     elif 'chempcba' in dataset_name or 'pcba' in dataset_name:
-        # PCBA gets both AUC and AP metrics
-        return ['auc', 'ap']
+        # PCBA uses AUC metric
+        return 'auc'
     
     # Intelligent defaults based on task type
     if is_multitask is not None:
