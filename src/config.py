@@ -222,7 +222,7 @@ def parse_link_prediction_args():
                         help='Directory to save checkpoints')
     parser.add_argument('--checkpoint_name', type=str, default=None,
                         help='Custom checkpoint name (default: auto-generated)')
-    
+
     return parser.parse_args()
 
 def parse_joint_training_args():
@@ -411,7 +411,7 @@ def parse_joint_training_args():
 # Removed joint multitask arguments - only using task-specific and full batch training
     
     # === Checkpointing ===
-    parser.add_argument('--save_checkpoint', type=str2bool, default=False, help='Save model checkpoints')
+    parser.add_argument('--save_checkpoint', type=str2bool, default=True, help='Save model checkpoints')
     parser.add_argument('--checkpoint_dir', type=str, default='../checkpoints', help='Checkpoint directory')
     parser.add_argument('--checkpoint_name', type=str, default=None, help='Custom checkpoint name')
     parser.add_argument('--load_checkpoint', type=str, default=None, help='Path to checkpoint to load')
@@ -424,7 +424,17 @@ def parse_joint_training_args():
     parser.add_argument('--eval_interval', type=int, default=5, help='Evaluation interval (epochs)')
     # === Experiment Tracking ===
     parser.add_argument('--sweep', type=str2bool, default=False, help='Running hyperparameter sweep')
-    
+
+    # === Ablation Study ===
+    parser.add_argument('--disable_transformer', type=str2bool, default=False,
+                        help='Disable transformer layers for ablation study (use identity mapping)')
+    parser.add_argument('--disable_gnn', type=str2bool, default=False,
+                        help='Disable GNN layers for ablation study (use input features directly)')
+    parser.add_argument('--use_first_half_embedding', type=str2bool, default=False,
+                        help='Use first half of embedding after transformer instead of second half for prototype calculation')
+    parser.add_argument('--use_full_embedding', type=str2bool, default=False,
+                        help='Use full embedding (both halves) after transformer for prototype calculation instead of just one half')
+
     args = parser.parse_args()
     return args
 

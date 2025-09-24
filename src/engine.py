@@ -127,12 +127,19 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             adj_t_input = edge_dropout_sparse_tensor(data.adj_t, args.edge_dropout_rate, training=model.training, verbose=verbose_dropout)
 
         # Memory-optimized forward pass with gradient checkpointing and chunking
-        if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
-            # Use gradient checkpointing to reduce memory
-            h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
+        # GNN forward pass or bypass for ablation
+        disable_gnn = args.disable_gnn if args is not None and hasattr(args, 'disable_gnn') else False
+        if disable_gnn:
+            # Skip GNN layers, use input features directly
+            # Apply a simple identity operation to maintain gradients
+            h = x_input + 0.0
         else:
-            # Standard forward pass
-            h = model(x_input, adj_t_input)
+            if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
+                # Use gradient checkpointing to reduce memory
+                h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
+            else:
+                # Standard forward pass
+                h = model(x_input, adj_t_input)
 
         # Memory optimization: Extract needed embeddings immediately and delete large tensor
         context_h = h[data.context_sample]
@@ -218,7 +225,7 @@ def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, deg
 
 @torch.no_grad()
 def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False,
-         att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings=None):
+         att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings=None, args=None):
     st = time.time()
     model.eval()
     predictor.eval()
@@ -243,7 +250,14 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     else:
         x_input = base_features
 
-    h = model(x_input, data.adj_t)
+    # GNN forward pass or bypass for ablation
+    disable_gnn = args.disable_gnn if args is not None and hasattr(args, 'disable_gnn') else False
+    if disable_gnn:
+        # Skip GNN layers, use input features directly
+        # Apply a simple identity operation to maintain gradients
+        h = x_input + 0.0
+    else:
+        h = model(x_input, data.adj_t)
 
     context_h = h[data.context_sample]
     context_y = data.y[data.context_sample]

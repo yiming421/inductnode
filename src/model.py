@@ -552,9 +552,10 @@ class PFNTransformerLayer(nn.Module):
         return x_context, x_target
 
 class PFNPredictorNodeCls(nn.Module):
-    def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2, 
-                 norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot', 
-                 padding='zero', norm_affine=True, normalize=False):
+    def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2,
+                 norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
+                 padding='zero', norm_affine=True, normalize=False, disable_transformer=False,
+                 use_first_half_embedding=False, use_full_embedding=False):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
@@ -599,6 +600,13 @@ class PFNPredictorNodeCls(nn.Module):
         self.att = att
         self.mlp_pool = mlp
         self.normalize = normalize
+        self.disable_transformer = disable_transformer
+        self.use_first_half_embedding = use_first_half_embedding
+        self.use_full_embedding = use_full_embedding
+
+        # Validate embedding options (only one should be True)
+        if sum([use_first_half_embedding, use_full_embedding]) > 1:
+            raise ValueError("Only one of use_first_half_embedding or use_full_embedding can be True")
     
     def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification'):
         """
@@ -636,15 +644,28 @@ class PFNPredictorNodeCls(nn.Module):
         context_tokens = context_tokens.unsqueeze(1)  # [num_context, 1, 2*hidden_dim]
         target_tokens = target_tokens.unsqueeze(1)    # [num_target, 1, 2*hidden_dim]
         
-        # Step 4: Process through transformer layers
-        for layer in self.transformer_row:
-           context_tokens, target_tokens = layer(context_tokens, target_tokens)
+        # Step 4: Process through transformer layers (or skip for ablation)
+        if not self.disable_transformer:
+            for layer in self.transformer_row:
+                context_tokens, target_tokens = layer(context_tokens, target_tokens)
         
         # Step 5: Extract refined label embeddings
         context_tokens = context_tokens.squeeze(1)  # [num_context, 2*hidden_dim]
         target_tokens = target_tokens.squeeze(1)    # [num_target, 2*hidden_dim]
-        context_label_emb = context_tokens[:, self.hidden_dim:]  # [num_context, hidden_dim]
-        target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
+
+        # Choose which part of the embedding to use for prototype calculation
+        if self.use_full_embedding:
+            # Use full embedding (both halves) - will be [num_context/target, 2*hidden_dim]
+            context_label_emb = context_tokens  # [num_context, 2*hidden_dim]
+            target_label_emb = target_tokens    # [num_target, 2*hidden_dim]
+        elif self.use_first_half_embedding:
+            # Use first half (node features part)
+            context_label_emb = context_tokens[:, :self.hidden_dim]  # [num_context, hidden_dim]
+            target_label_emb = target_tokens[:, :self.hidden_dim]    # [num_target, hidden_dim]
+        else:
+            # Use second half (label embedding part) - default behavior
+            context_label_emb = context_tokens[:, self.hidden_dim:]  # [num_context, hidden_dim]
+            target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
         
         # Step 6: Compute refined class embeddings (different approaches for different tasks)
         if task_type == 'node_classification':
