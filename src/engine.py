@@ -11,7 +11,7 @@ from .utils import process_node_features, acc, apply_final_pca
 from .data_utils import select_k_shot_context, edge_dropout_sparse_tensor, feature_dropout
 
 
-def apply_feature_dropout_if_enabled(x, args, rank=0):
+def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
     """
     Apply feature dropout if enabled in args (after projection only).
 
@@ -19,6 +19,7 @@ def apply_feature_dropout_if_enabled(x, args, rank=0):
         x (torch.Tensor): Input features
         args: Arguments containing feature dropout configuration
         rank (int): Process rank for logging
+        training (bool): Whether the model is in training mode
 
     Returns:
         torch.Tensor: Features with dropout applied
@@ -30,7 +31,7 @@ def apply_feature_dropout_if_enabled(x, args, rank=0):
         dropout_type = getattr(args, 'feature_dropout_type', 'element_wise')
         verbose = getattr(args, 'verbose_feature_dropout', False) and rank == 0
 
-        return feature_dropout(x, args.feature_dropout_rate, training=True,
+        return feature_dropout(x, args.feature_dropout_rate, training=training,
                              dropout_type=dropout_type, verbose=verbose)
     return x
 
@@ -118,7 +119,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             x_input = base_features
 
         # Apply feature dropout AFTER projection
-        x_input = apply_feature_dropout_if_enabled(x_input, args, rank)
+        x_input = apply_feature_dropout_if_enabled(x_input, args, rank, training=model.training)
 
         # Apply edge dropout if enabled
         adj_t_input = data.adj_t
@@ -127,19 +128,13 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             adj_t_input = edge_dropout_sparse_tensor(data.adj_t, args.edge_dropout_rate, training=model.training, verbose=verbose_dropout)
 
         # Memory-optimized forward pass with gradient checkpointing and chunking
-        # GNN forward pass or bypass for ablation
-        disable_gnn = args.disable_gnn if args is not None and hasattr(args, 'disable_gnn') else False
-        if disable_gnn:
-            # Skip GNN layers, use input features directly
-            # Apply a simple identity operation to maintain gradients
-            h = x_input + 0.0
+        # GNN forward pass
+        if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
+            # Use gradient checkpointing to reduce memory
+            h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
         else:
-            if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
-                # Use gradient checkpointing to reduce memory
-                h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
-            else:
-                # Standard forward pass
-                h = model(x_input, adj_t_input)
+            # Standard forward pass
+            h = model(x_input, adj_t_input)
 
         # Memory optimization: Extract needed embeddings immediately and delete large tensor
         context_h = h[data.context_sample]
@@ -250,14 +245,8 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     else:
         x_input = base_features
 
-    # GNN forward pass or bypass for ablation
-    disable_gnn = args.disable_gnn if args is not None and hasattr(args, 'disable_gnn') else False
-    if disable_gnn:
-        # Skip GNN layers, use input features directly
-        # Apply a simple identity operation to maintain gradients
-        h = x_input + 0.0
-    else:
-        h = model(x_input, data.adj_t)
+    # GNN forward pass
+    h = model(x_input, data.adj_t)
 
     context_h = h[data.context_sample]
     context_y = data.y[data.context_sample]

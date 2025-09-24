@@ -17,7 +17,7 @@ import numpy as np
 from torch.profiler import profile, record_function, ProfilerActivity
 
 
-def apply_feature_dropout_if_enabled(x, args, rank=0):
+def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
     """
     Apply feature dropout if enabled in args (after projection only).
 
@@ -25,6 +25,7 @@ def apply_feature_dropout_if_enabled(x, args, rank=0):
         x (torch.Tensor): Input features
         args: Arguments containing feature dropout configuration
         rank (int): Process rank for logging
+        training (bool): Whether the model is in training mode
 
     Returns:
         torch.Tensor: Features with dropout applied
@@ -36,7 +37,7 @@ def apply_feature_dropout_if_enabled(x, args, rank=0):
         dropout_type = getattr(args, 'feature_dropout_type', 'element_wise')
         verbose = getattr(args, 'verbose_feature_dropout', False) and rank == 0
 
-        return feature_dropout(x, args.feature_dropout_rate, training=True,
+        return feature_dropout(x, args.feature_dropout_rate, training=training,
                              dropout_type=dropout_type, verbose=verbose)
     return x
 
@@ -851,7 +852,7 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
         x_input = batch_data_x
 
     # Apply feature dropout AFTER projection
-    x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0)
+    x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0, training=model.training)
 
     # Apply edge dropout if enabled (before creating adj_t)
     if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):
@@ -987,7 +988,7 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
             x_input = batch_data.x
 
         # Apply feature dropout AFTER projection
-        x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0)
+        x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0, training=model.training)
         
         # Apply edge dropout if enabled (before creating adj_t)
         if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):

@@ -554,7 +554,7 @@ class PFNTransformerLayer(nn.Module):
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2,
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
-                 padding='zero', norm_affine=True, normalize=False, disable_transformer=False,
+                 padding='zero', norm_affine=True, normalize=False,
                  use_first_half_embedding=False, use_full_embedding=False):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
@@ -600,7 +600,6 @@ class PFNPredictorNodeCls(nn.Module):
         self.att = att
         self.mlp_pool = mlp
         self.normalize = normalize
-        self.disable_transformer = disable_transformer
         self.use_first_half_embedding = use_first_half_embedding
         self.use_full_embedding = use_full_embedding
 
@@ -644,10 +643,9 @@ class PFNPredictorNodeCls(nn.Module):
         context_tokens = context_tokens.unsqueeze(1)  # [num_context, 1, 2*hidden_dim]
         target_tokens = target_tokens.unsqueeze(1)    # [num_target, 1, 2*hidden_dim]
         
-        # Step 4: Process through transformer layers (or skip for ablation)
-        if not self.disable_transformer:
-            for layer in self.transformer_row:
-                context_tokens, target_tokens = layer(context_tokens, target_tokens)
+        # Step 4: Process through transformer layers
+        for layer in self.transformer_row:
+            context_tokens, target_tokens = layer(context_tokens, target_tokens)
         
         # Step 5: Extract refined label embeddings
         context_tokens = context_tokens.squeeze(1)  # [num_context, 2*hidden_dim]

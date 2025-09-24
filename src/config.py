@@ -426,10 +426,6 @@ def parse_joint_training_args():
     parser.add_argument('--sweep', type=str2bool, default=False, help='Running hyperparameter sweep')
 
     # === Ablation Study ===
-    parser.add_argument('--disable_transformer', type=str2bool, default=False,
-                        help='Disable transformer layers for ablation study (use identity mapping)')
-    parser.add_argument('--disable_gnn', type=str2bool, default=False,
-                        help='Disable GNN layers for ablation study (use input features directly)')
     parser.add_argument('--use_first_half_embedding', type=str2bool, default=False,
                         help='Use first half of embedding after transformer instead of second half for prototype calculation')
     parser.add_argument('--use_full_embedding', type=str2bool, default=False,

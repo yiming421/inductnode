@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import copy
+import random
 import torch
 import wandb
 import signal
@@ -2012,10 +2013,13 @@ def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='v
 def run_joint_training(args, device='cuda:0'):
     """
     Main joint training function.
+
+    Note: Random seeds are already set by the calling function (main()) before this function is called.
+    This ensures deterministic behavior for both training and inference.
     """
     # Declare global trackers at the very beginning
     global lp_tracker, gc_tracker
-    
+
     print(f"\n=== Starting Joint Training ===")
     print(f"Device: {device}")
     print(f"Enabled Tasks:")
@@ -2136,7 +2140,13 @@ def run_joint_training(args, device='cuda:0'):
         # If loading from checkpoint, skip training and go directly to final evaluation
         if args.use_pretrained_model:
             print("\n=== Skipping Training - Using Pretrained Model ===")
-            
+
+            # Ensure models are in evaluation mode for inference
+            model.eval()
+            predictor.eval()
+            if identity_projection is not None:
+                identity_projection.eval()
+
             # Final evaluation on test sets
             print("\n=== Final Test Evaluation (From Checkpoint) ===")
             
@@ -2512,18 +2522,47 @@ def run_joint_training(args, device='cuda:0'):
     return nc_test_metric, lp_test_metric, gc_test_metric, nc_individual, lp_individual, gc_individual
 
 
+def set_all_random_seeds(seed):
+    """Set all random seeds for reproducible results."""
+    print(f"Setting all random seeds to: {seed}")
+
+    # Python random module
+    random.seed(seed)
+
+    # NumPy random module
+    np.random.seed(seed)
+
+    # PyTorch random seeds
+    torch.manual_seed(seed)
+
+    # CUDA random seeds (if CUDA is available)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        # Set CUDA deterministic behavior
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        print("✓ CUDA deterministic settings enabled")
+
+    print("✓ All random seeds initialized for reproducible inference")
+
 def main():
     """Main function."""
     # Set up signal handlers for graceful shutdown
     def signal_handler(signum, frame):
         print(f"\nReceived signal {signum}, shutting down gracefully...")
         sys.exit(0)
-    
+
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-    
+
     # Parse arguments
     args = parse_joint_training_args()
+
+    # Set all random seeds for reproducible results
+    set_all_random_seeds(args.seed)
     
     # Validate checkpoint arguments
     if args.use_pretrained_model and args.load_checkpoint is None:
@@ -2610,8 +2649,9 @@ def main():
         print(f"Run {run + 1}/{args.runs}")
         print(f"{'='*50}")
         
-        # Set different seed for each run
-        torch.manual_seed(args.seed + run)
+        # Set different seed for each run with all generators
+        run_seed = args.seed + run
+        set_all_random_seeds(run_seed)
         
         nc_result, lp_result, gc_result, nc_individual, lp_individual, gc_individual = run_joint_training(args, device)
         all_nc_results.append(nc_result)

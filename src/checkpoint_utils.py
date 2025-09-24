@@ -296,7 +296,6 @@ def create_model_from_args(args, input_dim, device):
             args.hidden, args.nhead, args.transformer_layers, args.mlp_layers, args.dp, args.norm,
             separate_att=args.seperate, degree=args.degree, att=att, mlp=mlp, sim=args.sim,
             padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
-            disable_transformer=getattr(args, 'disable_transformer', False),
             use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
             use_full_embedding=getattr(args, 'use_full_embedding', False)
         ).to(device) if args.predictor == 'PFN' else None
@@ -341,7 +340,6 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
         args.hidden, args.nhead, args.transformer_layers, args.mlp_layers, args.dp, args.norm,
         separate_att=args.seperate, degree=args.degree, att=att, mlp=mlp, sim=args.sim,
         padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
-        disable_transformer=getattr(args, 'disable_transformer', False),
         use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
         use_full_embedding=getattr(args, 'use_full_embedding', False)
     ).to(device) if args.predictor == 'PFN' else None

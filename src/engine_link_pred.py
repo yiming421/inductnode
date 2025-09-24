@@ -54,7 +54,7 @@ def refresh_lp_context_if_needed(data, batch_idx, epoch, args, context_edges, tr
     
     return context_edges, train_mask
 
-def apply_feature_dropout_if_enabled(x, args, rank=0):
+def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
     """
     Apply feature dropout if enabled in args (after projection only).
 
@@ -62,6 +62,7 @@ def apply_feature_dropout_if_enabled(x, args, rank=0):
         x (torch.Tensor): Input features
         args: Arguments containing feature dropout configuration
         rank (int): Process rank for logging
+        training (bool): Whether the model is in training mode
 
     Returns:
         torch.Tensor: Features with dropout applied
@@ -73,7 +74,7 @@ def apply_feature_dropout_if_enabled(x, args, rank=0):
         dropout_type = getattr(args, 'feature_dropout_type', 'element_wise')
         verbose = getattr(args, 'verbose_feature_dropout', False) and rank == 0
 
-        return feature_dropout(x, args.feature_dropout_rate, training=True,
+        return feature_dropout(x, args.feature_dropout_rate, training=training,
                              dropout_type=dropout_type, verbose=verbose)
     return x
 
@@ -109,7 +110,7 @@ def get_node_embeddings(model, data, projector=None, identity_projection=None, u
         x_input = data.x
 
     # Apply feature dropout AFTER projection
-    x_input = apply_feature_dropout_if_enabled(x_input, args, rank)
+    x_input = apply_feature_dropout_if_enabled(x_input, args, rank, training=model.training)
 
     # Choose adjacency matrix: use full_adj_t for test evaluation if available
     if use_full_adj and hasattr(data, 'full_adj_t') and data.full_adj_t is not None:
