@@ -8,12 +8,20 @@ if project_root not in sys.path:
 from src.model import PFNPredictorNodeCls
 
 
-def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch, 
-                   att=None, mlp=None, projector=None, identity_projection=None, 
+def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch,
+                   att=None, mlp=None, projector=None, identity_projection=None,
                    scheduler=None, rank=0):
     """Save checkpoint with all training state"""
     if rank != 0:
         return  # Only rank 0 saves checkpoints
+
+    # Check if checkpoint threshold is met (only if threshold is set)
+    if hasattr(args, 'checkpoint_threshold') and args.checkpoint_threshold > 0:
+        # Calculate combined score from best_metrics
+        combined_score = best_metrics.get('final_test', 0)  # final_test contains the combined score
+        if combined_score < args.checkpoint_threshold:
+            print(f"❌ Checkpoint not saved: combined score {combined_score:.4f} below threshold {args.checkpoint_threshold:.4f}")
+            return None
     
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -63,7 +71,12 @@ def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch,
     
     # Save checkpoint
     torch.save(checkpoint, checkpoint_path)
-    
+
+    # Show threshold information if applicable
+    if hasattr(args, 'checkpoint_threshold') and args.checkpoint_threshold > 0:
+        combined_score = best_metrics.get('final_test', 0)
+        print(f"✅ Checkpoint saved: combined score {combined_score:.4f} meets threshold {args.checkpoint_threshold:.4f}")
+
     print(f"💾 Checkpoint saved to: {checkpoint_path}")
     print(f"📊 Best metrics: {best_metrics}")
     

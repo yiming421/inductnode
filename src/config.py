@@ -86,6 +86,8 @@ def get_main_parser():
                         help='Custom checkpoint name (default: auto-generated)')
     parser.add_argument('--load_checkpoint', type=str, default=None,
                         help='Path to checkpoint to load (for resuming training)')
+    parser.add_argument('--checkpoint_threshold', type=float, default=0.0,
+                        help='Minimum combined score threshold for saving checkpoint (default: 0.0)')
 
     # Safe learning rate arguments
     parser.add_argument('--safe_transformer_layers', type=int, default=5,
@@ -415,6 +417,8 @@ def parse_joint_training_args():
     parser.add_argument('--checkpoint_dir', type=str, default='../checkpoints', help='Checkpoint directory')
     parser.add_argument('--checkpoint_name', type=str, default=None, help='Custom checkpoint name')
     parser.add_argument('--load_checkpoint', type=str, default=None, help='Path to checkpoint to load')
+    parser.add_argument('--checkpoint_threshold', type=float, default=2.0,
+                        help='Minimum combined score threshold for saving checkpoint (default: 0.0)')
     parser.add_argument('--use_pretrained_model', type=str2bool, default=False, help='Use pretrained model')
     
     # === Logging and Monitoring ===

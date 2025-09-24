@@ -2505,10 +2505,13 @@ def run_joint_training(args, device='cuda:0'):
             args, best_metrics, best_epoch,
             identity_projection=identity_projection, rank=0
         )
-        
-        # Update wandb log with checkpoint path
-        wandb.log({'checkpoint_path': checkpoint_path})
-        print(f"✅ Final checkpoint saved to: {checkpoint_path}")
+
+        # Update wandb log with checkpoint path (only if checkpoint was saved)
+        if checkpoint_path is not None:
+            wandb.log({'checkpoint_path': checkpoint_path})
+            print(f"✅ Final checkpoint saved to: {checkpoint_path}")
+        else:
+            print(f"ℹ️  Final checkpoint not saved due to threshold requirement")
         
     elif args.save_checkpoint and checkpoint is not None:
         print("ℹ️  Skipping checkpoint save since model was loaded from checkpoint")
