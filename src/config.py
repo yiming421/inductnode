@@ -33,7 +33,9 @@ def get_main_parser():
     parser.add_argument('--mlp_layers', type=int, default=2)
     parser.add_argument('--gnn_norm_affine', type=str2bool, default=False)
     parser.add_argument('--mlp_norm_affine', type=str2bool, default=True)
-    parser.add_argument('--relu', type=str2bool, default=False)
+    parser.add_argument('--activation', type=str, default='relu', choices=['relu', 'gelu', 'silu'],
+                        help='Activation function: relu, gelu (Gaussian Error Linear Unit), or silu (Sigmoid Linear Unit)')
+    parser.add_argument('--relu', type=str2bool, default=False)  # Keep for backward compatibility
     parser.add_argument('--res', type=str2bool, default=False)
     parser.add_argument('--optimizer', type=str, default='adam')
     parser.add_argument('--clip_grad', type=float, default=1.0)
@@ -43,6 +45,8 @@ def get_main_parser():
 
     parser.add_argument('--transformer_layers', type=int, default=3)
     parser.add_argument('--nhead', type=int, default=4)
+    parser.add_argument('--transformer_norm_type', type=str, default='post', choices=['pre', 'post'],
+                        help='Transformer normalization type: pre-norm or post-norm')
     parser.add_argument('--context_num', type=int, default=20)
     parser.add_argument('--seperate', type=str2bool, default=True)
     parser.add_argument('--degree', type=str2bool, default=False)
@@ -252,11 +256,23 @@ def parse_joint_training_args():
     parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--transformer_layers', type=int, default=3, help='Number of transformer layers')
+    parser.add_argument('--transformer_norm_type', type=str, default='post', choices=['pre', 'post'],
+                        help='Transformer normalization type: pre-norm or post-norm')
+    parser.add_argument('--use_moe', type=str2bool, default=False,
+                        help='Use Mixture of Experts (MoE) in transformer FFN layers')
+    parser.add_argument('--moe_num_experts', type=int, default=4,
+                        help='Number of experts in MoE layer')
+    parser.add_argument('--moe_top_k', type=int, default=2,
+                        help='Number of experts to route to in MoE (top-k)')
+    parser.add_argument('--moe_auxiliary_loss_weight', type=float, default=0.01,
+                        help='Weight for MoE auxiliary load balancing loss')
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
     parser.add_argument('--dp', type=float, default=0.08717780667044389, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
     parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections')
-    parser.add_argument('--relu', type=str2bool, default=False, help='Use ReLU activation')
+    parser.add_argument('--activation', type=str, default='relu', choices=['relu', 'gelu', 'silu'],
+                        help='Activation function: relu, gelu (Gaussian Error Linear Unit), or silu (Sigmoid Linear Unit)')
+    parser.add_argument('--relu', type=str2bool, default=False, help='Use ReLU activation (deprecated, use --activation)')
     parser.add_argument('--gnn_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in GNN norm')
     parser.add_argument('--mlp_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in MLP norm')
     parser.add_argument('--multilayer', type=str2bool, default=True, help='Use multilayer structure for GCN')
@@ -356,6 +372,8 @@ def parse_joint_training_args():
     parser.add_argument('--context_k', type=int, default=5, help='Number of context samples for link prediction')
     parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
+    parser.add_argument('--lp_metric', type=str, default='auto', choices=['auto', 'auc', 'acc', 'hits@20', 'hits@50', 'hits@100', 'mrr'],
+                       help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
     
     # === Graph Classification Specific ===
     parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')

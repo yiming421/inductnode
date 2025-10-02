@@ -7,6 +7,149 @@ from torch_sparse.matmul import spmm_add
 from torch_scatter import scatter_softmax
 from .utils import process_node_features
 
+def get_activation_fn(activation_name):
+    """Get activation function by name."""
+    if activation_name == 'relu':
+        return F.relu
+    elif activation_name == 'gelu':
+        return F.gelu
+    elif activation_name == 'silu':
+        return F.silu
+    else:
+        raise ValueError(f"Unsupported activation function: {activation_name}")
+
+class MoELayer(nn.Module):
+    """
+    Mixture of Experts Layer for Transformer FFN.
+
+    Args:
+        hidden_dim: Input/output dimension
+        expert_dim: Hidden dimension of each expert (typically 4 * hidden_dim)
+        num_experts: Number of expert networks
+        top_k: Number of experts to route to (typically 1 or 2)
+        mlp_layers: Number of layers in each expert MLP
+        dropout: Dropout rate
+        norm: Whether to use normalization in experts
+        norm_affine: Whether to use learnable affine parameters in norm
+        expert_capacity_factor: Controls expert capacity for load balancing
+        use_auxiliary_loss: Whether to add auxiliary loss for load balancing
+    """
+    def __init__(self, hidden_dim, expert_dim=None, num_experts=4, top_k=2, mlp_layers=2,
+                 dropout=0.2, norm=False, norm_affine=True, expert_capacity_factor=1.25,
+                 use_auxiliary_loss=True, gating_bias=True):
+        super(MoELayer, self).__init__()
+
+        self.hidden_dim = hidden_dim
+        self.expert_dim = expert_dim or (4 * hidden_dim)
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.expert_capacity_factor = expert_capacity_factor
+        self.use_auxiliary_loss = use_auxiliary_loss
+
+        # Gating network - learns which experts to route to
+        self.gating = nn.Linear(hidden_dim, num_experts, bias=gating_bias)
+
+        # Expert networks - multiple specialized FFNs
+        self.experts = nn.ModuleList([
+            MLP(
+                in_channels=hidden_dim,
+                hidden_channels=self.expert_dim,
+                out_channels=hidden_dim,
+                num_layers=mlp_layers,
+                dropout=dropout,
+                norm=norm,
+                tailact=False,
+                norm_affine=norm_affine
+            ) for _ in range(num_experts)
+        ])
+
+        # Load balancing
+        self.expert_counts = None
+        self.expert_gates = None
+
+    def forward(self, x):
+        """
+        Forward pass with expert routing.
+
+        Args:
+            x: Input tensor [seq_len, batch_size, hidden_dim] or [batch_size, hidden_dim]
+
+        Returns:
+            output: MoE output [same shape as x]
+            auxiliary_loss: Load balancing loss (if enabled)
+        """
+        original_shape = x.shape
+        # Flatten to [batch_size * seq_len, hidden_dim] for easier processing
+        x_flat = x.view(-1, self.hidden_dim)
+        batch_size = x_flat.size(0)
+
+        # Gating network: decide which experts to route to
+        gate_logits = self.gating(x_flat)  # [batch_size, num_experts]
+        gate_probs = F.softmax(gate_logits, dim=-1)
+
+        # Top-k gating: select top_k experts for each token
+        top_k_gates, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        top_k_gates = top_k_gates / top_k_gates.sum(dim=-1, keepdim=True)  # Renormalize
+
+        # Initialize output
+        output = torch.zeros_like(x_flat)
+
+        # Route to experts
+        for i in range(self.num_experts):
+            # Find tokens that should be routed to expert i
+            expert_mask = (top_k_indices == i).any(dim=-1)
+
+            if expert_mask.any():
+                # Get tokens for this expert
+                expert_tokens = x_flat[expert_mask]
+
+                # Get corresponding gates (weights) for this expert
+                expert_gate_indices = (top_k_indices[expert_mask] == i).nonzero(as_tuple=True)[1]
+                expert_gates = top_k_gates[expert_mask, expert_gate_indices]
+
+                # Process through expert
+                expert_output = self.experts[i](expert_tokens)
+
+                # Apply gating weights and accumulate
+                weighted_output = expert_output * expert_gates.unsqueeze(-1)
+                output[expert_mask] += weighted_output
+
+        # Reshape back to original shape
+        output = output.view(original_shape)
+
+        # Auxiliary loss for load balancing (optional)
+        auxiliary_loss = self._compute_auxiliary_loss(gate_probs) if self.use_auxiliary_loss else 0.0
+
+        return output, auxiliary_loss
+
+    def _compute_auxiliary_loss(self, gate_probs):
+        """
+        Compute auxiliary loss to encourage load balancing across experts.
+        Based on the original Switch Transformer paper.
+        """
+        # Fraction of tokens routed to each expert
+        expert_counts = gate_probs.sum(dim=0)  # [num_experts]
+        expert_fractions = expert_counts / expert_counts.sum()
+
+        # Gate probabilities mean across all tokens
+        gate_means = gate_probs.mean(dim=0)  # [num_experts]
+
+        # Auxiliary loss: encourage uniform distribution
+        auxiliary_loss = self.num_experts * torch.sum(expert_fractions * gate_means)
+
+        return auxiliary_loss
+
+    def get_expert_usage_stats(self):
+        """Get statistics about expert usage for monitoring."""
+        if self.expert_counts is not None:
+            return {
+                'expert_counts': self.expert_counts.cpu().numpy(),
+                'expert_utilization': (self.expert_counts / self.expert_counts.sum()).cpu().numpy(),
+                'max_expert_usage': self.expert_counts.max().item(),
+                'min_expert_usage': self.expert_counts.min().item(),
+            }
+        return None
+
 class PureGCNConv(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -30,20 +173,26 @@ class PureGCN(nn.Module):
         return x
 
 class PureGCN_v1(nn.Module):
-    def __init__(self, input_dim, num_layers=2, hidden=256, dp=0, norm=False, res=False, 
-                 relu=False, norm_affine=True):
+    def __init__(self, input_dim, num_layers=2, hidden=256, dp=0, norm=False, res=False,
+                 relu=False, norm_affine=True, activation='relu'):
         super().__init__()
-        
+
         # Input projection
         self.lin = nn.Linear(input_dim, hidden) if input_dim != hidden else nn.Identity()
-        
+
         # GCN Convolution Layer
         self.conv = PureGCNConv()
         self.num_layers = num_layers
         self.dp = dp
         self.norm = norm
         self.res = res
-        self.relu = relu
+        self.relu = relu  # Keep for backward compatibility
+
+        # Handle activation function
+        if relu:  # If relu is True, use activation function
+            self.activation_fn = get_activation_fn(activation)
+        else:  # If relu is False, no activation (linear GNN)
+            self.activation_fn = None
 
         # Use separate LayerNorm instances per layer if normalization is enabled
         if self.norm:
@@ -58,8 +207,8 @@ class PureGCN_v1(nn.Module):
                     x = x + ori  # Memory-efficient: reuses x's memory when possible
                 if self.norm:
                     x = self.norms[i](x)  # Apply per-layer normalization
-                if self.relu:
-                    x = F.relu(x)  # Memory-efficient: PyTorch optimizes this
+                if self.activation_fn is not None:
+                    x = self.activation_fn(x)
                 if self.dp > 0:
                     x = F.dropout(x, p=self.dp, training=self.training)  # Safe dropout
             x = self.conv(x, adj_t)  # Apply GCN convolution
@@ -94,8 +243,8 @@ class MLP(nn.Module):
         return x.squeeze()
     
 class GCN(nn.Module):
-    def __init__(self, in_feats, h_feats, norm=False, relu=False, prop_step=2, dropout=0.2, 
-                 multilayer=False, use_gin=False, res=False, norm_affine=True):
+    def __init__(self, in_feats, h_feats, norm=False, relu=False, prop_step=2, dropout=0.2,
+                 multilayer=False, use_gin=False, res=False, norm_affine=True, activation='relu'):
         super(GCN, self).__init__()
         self.lin = nn.Linear(in_feats, h_feats) if in_feats != h_feats else nn.Identity()
         self.multilayer = multilayer
@@ -115,6 +264,13 @@ class GCN(nn.Module):
         self.norm = norm
         self.relu = relu
         self.prop_step = prop_step
+
+        # Handle activation function
+        if relu:  # If relu is True, use activation function
+            self.activation_fn = get_activation_fn(activation)
+        else:  # If relu is False, no activation (linear GNN)
+            self.activation_fn = None
+
         if norm:
             self.norms = nn.ModuleList([nn.LayerNorm(h_feats, elementwise_affine=norm_affine) \
                                         for _ in range(prop_step)])
@@ -124,8 +280,8 @@ class GCN(nn.Module):
     def _apply_norm_and_activation(self, x, i):
         if self.norm:
             x = self.norms[i](x)
-        if self.relu:
-            x = F.relu(x)  # Safe ReLU - PyTorch optimizes memory automatically
+        if self.activation_fn is not None:
+            x = self.activation_fn(x)
         if self.norm:
             x = self.dp(x)
         return x
@@ -482,8 +638,9 @@ class Prodigy_Predictor_mlp(nn.Module):
         return x
 
 class PFNTransformerLayer(nn.Module):
-    def __init__(self, hidden_dim, n_head=1, mlp_layers=2, dropout=0.2, norm=False, 
-                 separate_att=False, unsqueeze=False, norm_affine=True):
+    def __init__(self, hidden_dim, n_head=1, mlp_layers=2, dropout=0.2, norm=False,
+                 separate_att=False, unsqueeze=False, norm_affine=True, norm_type='post',
+                 use_moe=False, num_experts=4, moe_top_k=2, moe_auxiliary_loss_weight=0.01):
         super(PFNTransformerLayer, self).__init__()
         self.hidden_dim = hidden_dim
         if separate_att:
@@ -503,59 +660,163 @@ class PFNTransformerLayer(nn.Module):
                 num_heads=n_head,
                 dropout=dropout,
             )
-        self.ffn = MLP(
-            in_channels=hidden_dim,
-            hidden_channels=4 * hidden_dim,
-            out_channels=hidden_dim,
-            num_layers=mlp_layers,
-            dropout=dropout,
-            norm=norm,
-            tailact=False,
-            norm_affine=norm_affine
-        )
+        # FFN or MoE layer
+        self.use_moe = use_moe
+        self.moe_auxiliary_loss_weight = moe_auxiliary_loss_weight
+
+        if use_moe:
+            self.ffn = MoELayer(
+                hidden_dim=hidden_dim,
+                expert_dim=4 * hidden_dim,
+                num_experts=num_experts,
+                top_k=moe_top_k,
+                mlp_layers=mlp_layers,
+                dropout=dropout,
+                norm=norm,
+                norm_affine=norm_affine,
+                use_auxiliary_loss=True
+            )
+        else:
+            self.ffn = MLP(
+                in_channels=hidden_dim,
+                hidden_channels=4 * hidden_dim,
+                out_channels=hidden_dim,
+                num_layers=mlp_layers,
+                dropout=dropout,
+                norm=norm,
+                tailact=False,
+                norm_affine=norm_affine
+            )
+
         self.context_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
         self.context_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
         self.tar_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
         self.tar_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
         self.separate_att = separate_att
         self.unsqueeze = unsqueeze
+        self.norm_type = norm_type
 
     def forward(self, x_context, x_target):
-        # x_context = self.context_norm1(x_context)
-        x_context_att, _ = self.self_att(x_context, x_context, x_context)
-        x_context = x_context_att + x_context
-        x_context = self.context_norm1(x_context)
+        auxiliary_losses = []
 
-        # x_context = self.context_norm2(x_context)
-        x_context_fnn = self.ffn(x_context)
-        if self.unsqueeze:
-            x_context_fnn = x_context_fnn.unsqueeze(1)
-        x_context = x_context_fnn + x_context
-        x_context = self.context_norm2(x_context)
-        
-        # x_target = self.tar_norm1(x_target)
-        # print(x_target.shape, x_context.shape, flush=True)
-        if self.separate_att:
-            x_target_att, _ = self.cross_att(x_target, x_context, x_context)
+        if self.norm_type == 'pre':
+            # Pre-norm: LayerNorm before sublayers
+            # Context self-attention
+            x_context_norm = self.context_norm1(x_context)
+            x_context_att, _ = self.self_att(x_context_norm, x_context_norm, x_context_norm)
+            x_context = x_context_att + x_context
+
+            # Context FFN
+            x_context_norm = self.context_norm2(x_context)
+            if self.use_moe:
+                x_context_fnn, aux_loss = self.ffn(x_context_norm)
+                auxiliary_losses.append(aux_loss)
+            else:
+                x_context_fnn = self.ffn(x_context_norm)
+
+            if self.unsqueeze:
+                x_context_fnn = x_context_fnn.unsqueeze(1)
+                # For residual connection, need to match dimensions temporarily
+                x_context_expanded = x_context.unsqueeze(1)
+                x_context_residual = x_context_fnn + x_context_expanded
+                # Squeeze back to 3D for attention operations
+                x_context = x_context_residual.squeeze(1)
+            else:
+                x_context = x_context_fnn + x_context
+
+            # Target cross/self-attention (context should now be 3D)
+            x_target_norm = self.tar_norm1(x_target)
+            context_for_att = x_context
+            if self.separate_att:
+                x_target_att, _ = self.cross_att(x_target_norm, context_for_att, context_for_att)
+            else:
+                x_target_att, _ = self.self_att(x_target_norm, context_for_att, context_for_att)
+            x_target = x_target_att + x_target
+
+            # Target FFN
+            x_target_norm = self.tar_norm2(x_target)
+            if self.use_moe:
+                x_target_fnn, aux_loss = self.ffn(x_target_norm)
+                auxiliary_losses.append(aux_loss)
+            else:
+                x_target_fnn = self.ffn(x_target_norm)
+
+            if self.unsqueeze:
+                x_target_fnn = x_target_fnn.unsqueeze(1)
+                # For residual connection, need to match dimensions temporarily
+                x_target_expanded = x_target.unsqueeze(1)
+                x_target_residual = x_target_fnn + x_target_expanded
+                # Squeeze back to 3D for consistency
+                x_target = x_target_residual.squeeze(1)
+            else:
+                x_target = x_target_fnn + x_target
+
+        else:  # post-norm (original behavior)
+            # Post-norm: LayerNorm after sublayers
+            # Context self-attention
+            x_context_att, _ = self.self_att(x_context, x_context, x_context)
+            x_context = x_context_att + x_context
+            x_context = self.context_norm1(x_context)
+
+            # Context FFN
+            if self.use_moe:
+                x_context_fnn, aux_loss = self.ffn(x_context)
+                auxiliary_losses.append(aux_loss)
+            else:
+                x_context_fnn = self.ffn(x_context)
+
+            if self.unsqueeze:
+                x_context_fnn = x_context_fnn.unsqueeze(1)
+                # For residual connection, need to match dimensions temporarily
+                x_context_expanded = x_context.unsqueeze(1)
+                x_context_residual = x_context_fnn + x_context_expanded
+                # Squeeze back to 3D for attention operations
+                x_context = x_context_residual.squeeze(1)
+            else:
+                x_context = x_context_fnn + x_context
+            x_context = self.context_norm2(x_context)
+
+            # Target cross/self-attention (context should now be 3D)
+            context_for_att = x_context
+            if self.separate_att:
+                x_target_att, _ = self.cross_att(x_target, context_for_att, context_for_att)
+            else:
+                x_target_att, _ = self.self_att(x_target, context_for_att, context_for_att)
+            x_target = x_target_att + x_target
+            x_target = self.tar_norm1(x_target)
+
+            # Target FFN
+            if self.use_moe:
+                x_target_fnn, aux_loss = self.ffn(x_target)
+                auxiliary_losses.append(aux_loss)
+            else:
+                x_target_fnn = self.ffn(x_target)
+
+            if self.unsqueeze:
+                x_target_fnn = x_target_fnn.unsqueeze(1)
+                # For residual connection, need to match dimensions temporarily
+                x_target_expanded = x_target.unsqueeze(1)
+                x_target_residual = x_target_fnn + x_target_expanded
+                # Squeeze back to 3D for consistency
+                x_target = x_target_residual.squeeze(1)
+            else:
+                x_target = x_target_fnn + x_target
+            x_target = self.tar_norm2(x_target)
+
+        # Return auxiliary loss for MoE training
+        total_auxiliary_loss = sum(auxiliary_losses) * self.moe_auxiliary_loss_weight if auxiliary_losses else 0.0
+
+        if self.use_moe:
+            return x_context, x_target, total_auxiliary_loss
         else:
-            x_target_att, _ = self.self_att(x_target, x_context, x_context)
-        x_target = x_target_att + x_target
-        x_target = self.tar_norm1(x_target)
-
-        # x_target = self.tar_norm2(x_target)
-        x_target_fnn = self.ffn(x_target)
-        if self.unsqueeze:
-            x_target_fnn = x_target_fnn.unsqueeze(1)
-        x_target = x_target_fnn + x_target
-        x_target = self.tar_norm2(x_target)
-
-        return x_context, x_target
+            return x_context, x_target
 
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2,
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
                  padding='zero', norm_affine=True, normalize=False,
-                 use_first_half_embedding=False, use_full_embedding=False):
+                 use_first_half_embedding=False, use_full_embedding=False, norm_type='post',
+                 use_moe=False, moe_num_experts=4, moe_top_k=2, moe_auxiliary_loss_weight=0.01):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
@@ -592,8 +853,13 @@ class PFNPredictorNodeCls(nn.Module):
                 mlp_layers=mlp_layers,
                 dropout=dropout,
                 norm=norm,
-                separate_att=separate_att, 
-                unsqueeze=True
+                separate_att=separate_att,
+                unsqueeze=True,
+                norm_type=norm_type,
+                use_moe=use_moe,
+                num_experts=moe_num_experts,
+                moe_top_k=moe_top_k,
+                moe_auxiliary_loss_weight=moe_auxiliary_loss_weight
             ) for _ in range(num_layers)
         ])
         self.degree = degree
@@ -602,6 +868,7 @@ class PFNPredictorNodeCls(nn.Module):
         self.normalize = normalize
         self.use_first_half_embedding = use_first_half_embedding
         self.use_full_embedding = use_full_embedding
+        self.use_moe = use_moe
 
         # Validate embedding options (only one should be True)
         if sum([use_first_half_embedding, use_full_embedding]) > 1:
@@ -644,8 +911,13 @@ class PFNPredictorNodeCls(nn.Module):
         target_tokens = target_tokens.unsqueeze(1)    # [num_target, 1, 2*hidden_dim]
         
         # Step 4: Process through transformer layers
+        total_auxiliary_loss = 0.0
         for layer in self.transformer_row:
-            context_tokens, target_tokens = layer(context_tokens, target_tokens)
+            if layer.use_moe:
+                context_tokens, target_tokens, aux_loss = layer(context_tokens, target_tokens)
+                total_auxiliary_loss += aux_loss
+            else:
+                context_tokens, target_tokens = layer(context_tokens, target_tokens)
         
         # Step 5: Extract refined label embeddings
         context_tokens = context_tokens.squeeze(1)  # [num_context, 2*hidden_dim]
@@ -720,11 +992,14 @@ class PFNPredictorNodeCls(nn.Module):
             logits = torch.matmul(target_label_emb, class_emb.t())
         else:
             raise ValueError("Invalid similarity type. Choose 'dot', 'cos', or 'mlp'.")
-        return logits, class_emb
+        if self.use_moe and total_auxiliary_loss > 0:
+            return logits, class_emb, total_auxiliary_loss
+        else:
+            return logits, class_emb
     
 class PFNPredictorBinaryCls(nn.Module):
-    def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2, norm=False, scale=False, 
-                padding='zeros', output_target=False, norm_affine=True):
+    def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2, norm=False, scale=False,
+                padding='zeros', output_target=False, norm_affine=True, norm_type='post'):
         super(PFNPredictorBinaryCls, self).__init__()
         # Store original hidden_dim for feature splitting
         self.hidden_dim = hidden_dim
@@ -740,8 +1015,8 @@ class PFNPredictorBinaryCls(nn.Module):
         # Shared transformer components (dimension = hidden_dim + 1 for label concatenation)
 
         self.transformer_row = nn.ModuleList([
-            PFNTransformerLayer(hidden_dim + 1, n_head=nhead, mlp_layers=2, dropout=dropout, 
-                                norm=norm, norm_affine=norm_affine)
+            PFNTransformerLayer(hidden_dim + 1, n_head=nhead, mlp_layers=2, dropout=dropout,
+                                norm=norm, norm_affine=norm_affine, norm_type=norm_type)
             for _ in range(num_layers)
         ])
 
@@ -900,7 +1175,7 @@ class UnifiedGNN(nn.Module):
     def __init__(self, model_type='gcn', in_feats=128, h_feats=128, prop_step=2,
                  conv='GCN', multilayer=False, norm=False, relu=False, dropout=0.2,
                  residual=1.0, linear=False, alpha=0.5, exp=False, res=False,
-                 supports_edge_weight=False, no_parameters=False, input_norm=False):
+                 supports_edge_weight=False, no_parameters=False, input_norm=False, activation='relu'):
         super(UnifiedGNN, self).__init__()
         
         self.model_type = model_type.lower()
@@ -909,6 +1184,13 @@ class UnifiedGNN(nn.Module):
         self.norm = norm
         self.relu = relu
         self.prop_step = prop_step
+
+        # Handle activation function
+        if relu:  # If relu is True, use activation function
+            self.activation_fn = get_activation_fn(activation)
+        else:  # If relu is False, no activation (linear GNN)
+            self.activation_fn = None
+
         self.residual = residual
         self.linear = linear
         self.res = res
@@ -974,8 +1256,8 @@ class UnifiedGNN(nn.Module):
         """Apply normalization and activation."""
         if self.norm:
             x = self.norms[i](x)
-        if self.relu:
-            x = F.relu(x)
+        if self.activation_fn is not None:
+            x = self.activation_fn(x)
         if self.dp:
             x = self.dp(x)
         return x

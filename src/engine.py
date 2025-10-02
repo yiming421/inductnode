@@ -153,7 +153,12 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         )
 
         target_y = data.y[train_perm_idx]
-        score, class_h = pred(data, context_h, target_h, context_y, class_h)
+        pred_output = pred(data, context_h, target_h, context_y, class_h)
+        if len(pred_output) == 3:  # MoE case with auxiliary loss
+            score, class_h, auxiliary_loss = pred_output
+        else:  # Standard case
+            score, class_h = pred_output
+            auxiliary_loss = 0.0
         score = F.log_softmax(score, dim=1)
         label = data.y[train_perm_idx].squeeze()
 
@@ -168,7 +173,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             orthogonal_loss = torch.tensor(0.0, device=label.device)
         
         nll_loss = F.nll_loss(score, label)
-        loss = nll_loss + orthogonal_push * orthogonal_loss
+        loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
         loss = loss * lambda_  # Apply lambda scaling
 
         # Only perform optimization if optimizer is provided (for joint training compatibility)
@@ -263,7 +268,11 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     valid_score = []
     for idx in valid_loader:
         target_h = h[valid_idx[idx]]
-        out, _ = predictor(data, context_h, target_h, context_y, class_h)
+        pred_output = predictor(data, context_h, target_h, context_y, class_h)
+        if len(pred_output) == 3:  # MoE case with auxiliary loss
+            out, _, _ = pred_output  # Discard auxiliary loss during evaluation
+        else:  # Standard case
+            out, _ = pred_output
         out = out.argmax(dim=1).flatten()
         valid_score.append(out)
     valid_score = torch.cat(valid_score, dim=0)
@@ -271,7 +280,11 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     train_score = []
     for idx in train_loader:
         target_h = h[train_idx[idx]]
-        out, _ = predictor(data, context_h, target_h, context_y, class_h)
+        pred_output = predictor(data, context_h, target_h, context_y, class_h)
+        if len(pred_output) == 3:  # MoE case with auxiliary loss
+            out, _, _ = pred_output  # Discard auxiliary loss during evaluation
+        else:  # Standard case
+            out, _ = pred_output
         out = out.argmax(dim=1).flatten()
         train_score.append(out)
     train_score = torch.cat(train_score, dim=0)
@@ -279,7 +292,11 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     test_score = []
     for idx in test_loader:
         target_h = h[test_idx[idx]]
-        out, _ = predictor(data, context_h, target_h, context_y, class_h)
+        pred_output = predictor(data, context_h, target_h, context_y, class_h)
+        if len(pred_output) == 3:  # MoE case with auxiliary loss
+            out, _, _ = pred_output  # Discard auxiliary loss during evaluation
+        else:  # Standard case
+            out, _ = pred_output
         out = out.argmax(dim=1).flatten()
         test_score.append(out)
     test_score = torch.cat(test_score, dim=0)

@@ -975,10 +975,12 @@ def create_unified_model(args, input_dim, device):
     # Create GNN backbone
     if args.model == 'PureGCN_v1':
         model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm,
-                          args.res, args.relu, args.gnn_norm_affine)
+                          args.res, args.relu, args.gnn_norm_affine,
+                          activation=getattr(args, 'activation', 'relu'))
     elif args.model == 'GCN':
         model = GCN(hidden, hidden, args.norm, args.relu, args.num_layers, args.dp,
-                   args.multilayer, args.use_gin, args.res, args.gnn_norm_affine)
+                   args.multilayer, args.use_gin, args.res, args.gnn_norm_affine,
+                   activation=getattr(args, 'activation', 'relu'))
     elif args.model == 'UnifiedGNN':
         model = UnifiedGNN(
             model_type=getattr(args, 'unified_model_type', 'gcn'),
@@ -997,7 +999,8 @@ def create_unified_model(args, input_dim, device):
             res=getattr(args, 'res', False),
             supports_edge_weight=getattr(args, 'supports_edge_weight', False),
             no_parameters=getattr(args, 'no_parameters', False),
-            input_norm=getattr(args, 'input_norm', False)
+            input_norm=getattr(args, 'input_norm', False),
+            activation=getattr(args, 'activation', 'relu')
         )
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
@@ -1005,9 +1008,14 @@ def create_unified_model(args, input_dim, device):
     # Create unified predictor (same for both tasks)
     if args.predictor == 'PFN':
         predictor = PFNPredictorNodeCls(
-            hidden, args.nhead, args.transformer_layers, args.mlp_layers, 
-            args.dp, args.norm, args.seperate, False, None, None, args.sim, 
-            args.padding, args.mlp_norm_affine, args.normalize_class_h
+            hidden, args.nhead, args.transformer_layers, args.mlp_layers,
+            args.dp, args.norm, args.seperate, False, None, None, args.sim,
+            args.padding, args.mlp_norm_affine, args.normalize_class_h,
+            norm_type=getattr(args, 'transformer_norm_type', 'post'),
+            use_moe=getattr(args, 'use_moe', False),
+            moe_num_experts=getattr(args, 'moe_num_experts', 4),
+            moe_top_k=getattr(args, 'moe_top_k', 2),
+            moe_auxiliary_loss_weight=getattr(args, 'moe_auxiliary_loss_weight', 0.01)
         )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
@@ -1729,8 +1737,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                         lp_results = evaluate_link_prediction(
                             model, predictor, data, link_data_all[split_key], context_data,
                             args.test_batch_size, None, None, None, identity_projection,
-                            0, True, degree=False, k_values=[20, 50, 100], 
-                            use_full_adj_for_test=True
+                            0, True, degree=False, k_values=[20, 50, 100],
+                            use_full_adj_for_test=True, lp_metric=args.lp_metric
                         )
                         
                         # Move all data back to CPU to free GPU memory

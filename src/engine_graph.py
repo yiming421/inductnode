@@ -783,7 +783,11 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
                 )
                 
                 # Use PFN predictor
-                scores, _ = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
+                pred_output = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
+                if len(pred_output) == 3:  # MoE case with auxiliary loss
+                    scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
+                else:  # Standard case
+                    scores, _ = pred_output
                 
                 # Get predictions and probabilities (same as single task version)
                 probabilities = F.softmax(scores, dim=1)
@@ -920,13 +924,19 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
     )
     
     # Use PFN predictor
-    scores, _ = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
+    pred_output = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
+    if len(pred_output) == 3:  # MoE case with auxiliary loss
+        scores, _, auxiliary_loss = pred_output
+    else:  # Standard case
+        scores, _ = pred_output
+        auxiliary_loss = 0.0
     scores = F.log_softmax(scores, dim=1)
-    
+
     # Compute loss
     nll_loss = F.nll_loss(scores, valid_labels)
-    
-    return nll_loss
+    total_loss = nll_loss + auxiliary_loss
+
+    return total_loss
 
 
 def train_graph_classification_single_task(model, predictor, dataset_info, data_loaders, optimizer, task_idx,
@@ -1056,12 +1066,17 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         )
         
         # Use PFN predictor (all samples are valid, no masking needed)
-        scores, refined_class_h = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
+        pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
+        if len(pred_output) == 3:  # MoE case with auxiliary loss
+            scores, refined_class_h, auxiliary_loss = pred_output
+        else:  # Standard case
+            scores, refined_class_h = pred_output
+            auxiliary_loss = 0.0
         scores = F.log_softmax(scores, dim=1)
-        
+
         # Compute loss - no masking needed since all samples are valid
         nll_loss = F.nll_loss(scores, batch_labels)
-        
+
         # Orthogonal loss for refined class prototypes
         if orthogonal_push > 0:
             refined_class_h_norm = F.normalize(refined_class_h, p=2, dim=1)
@@ -1070,8 +1085,8 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
             orthogonal_loss = torch.sum(class_matrix[mask]**2)
         else:
             orthogonal_loss = torch.tensor(0.0, device=device)
-        
-        loss = nll_loss + orthogonal_push * orthogonal_loss
+
+        loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
 
         # Backward pass
         optimizer.zero_grad()
@@ -1224,7 +1239,11 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             if batch_labels.dtype != torch.long:
                 batch_labels = batch_labels.to(torch.long)
             
-            scores, _ = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
+            pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
+            if len(pred_output) == 3:  # MoE case with auxiliary loss
+                scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
+            else:  # Standard case
+                scores, _ = pred_output
             probabilities = F.softmax(scores, dim=1)
             predictions = scores.argmax(dim=1)
             

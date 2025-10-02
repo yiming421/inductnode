@@ -313,8 +313,13 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     continue
 
                 # Use unified PFNPredictorNodeCls for link prediction
-                scores, link_prototypes = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(), 
+                pred_output = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(),
                                       link_prototypes, "link_prediction")
+                if len(pred_output) == 3:  # MoE case with auxiliary loss
+                    scores, link_prototypes, auxiliary_loss = pred_output
+                else:  # Standard case
+                    scores, link_prototypes = pred_output
+                    auxiliary_loss = 0.0
                 
                 # Use the train_mask to ensure loss is only calculated on non-context edges
                 # Make sure the mask is properly aligned with batch indices
@@ -339,7 +344,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 else:
                     orthogonal_loss = torch.tensor(0.0, device=device)
                     
-                loss = nll_loss + orthogonal_push * orthogonal_loss
+                loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
                 loss = loss * lambda_  # Apply lambda scaling
                 
                 try:
@@ -407,6 +412,13 @@ def get_dataset_default_metric(dataset_name):
     else:
         return 'hits@100'  # Default metric
 
+def get_evaluation_metric(dataset_name, lp_metric='auto'):
+    """Get the metric to use for evaluation based on user preference."""
+    if lp_metric == 'auto':
+        return get_dataset_default_metric(dataset_name)
+    else:
+        return lp_metric
+
 def compute_mrr_citation2(pos_scores, neg_scores):
     """
     Compute MRR for ogbl-citation2 dataset with special format requirement.
@@ -432,9 +444,10 @@ def compute_mrr_citation2(pos_scores, neg_scores):
 
 @torch.no_grad()
 def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, batch_size,
-                             att, mlp, projector=None, identity_projection=None, rank=0, 
-                             normalize_class_h=False, degree=False, evaluator=None, 
-                             neg_edges=None, k_values=[20, 50, 100], use_full_adj_for_test=True):
+                             att, mlp, projector=None, identity_projection=None, rank=0,
+                             normalize_class_h=False, degree=False, evaluator=None,
+                             neg_edges=None, k_values=[20, 50, 100], use_full_adj_for_test=True,
+                             lp_metric='auto'):
     """
     Evaluate link prediction using the PFN methodology with Hits@K metric.
     
@@ -507,8 +520,12 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             target_edge_embeds = src_embeds * dst_embeds
             
             # Use the unified predictor for link prediction
-            batch_scores, _ = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
-                                        link_prototypes, "link_prediction")
+            pred_output = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(),
+                                   link_prototypes, "link_prediction")
+            if len(pred_output) == 3:  # MoE case with auxiliary loss
+                batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
+            else:  # Standard case
+                batch_scores, _ = pred_output
             # Use the positive class score (class 1) and move to CPU immediately
             pos_scores.append(batch_scores[:, 1].cpu())
         
@@ -524,9 +541,13 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             dst_embeds = node_embeddings[batch_edges[:, 1]]
             target_edge_embeds = src_embeds * dst_embeds
             
-            # Use the unified predictor for link prediction  
-            batch_scores, _ = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(), 
-                                        link_prototypes, "link_prediction")
+            # Use the unified predictor for link prediction
+            pred_output = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(),
+                                   link_prototypes, "link_prediction")
+            if len(pred_output) == 3:  # MoE case with auxiliary loss
+                batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
+            else:  # Standard case
+                batch_scores, _ = pred_output
             # Use the positive class score (class 1) and move to CPU immediately  
             neg_scores.append(batch_scores[:, 1].cpu())
         
@@ -534,6 +555,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         
         # Compute Hits@K using OGB evaluator
         dataset_name = getattr(data, 'name', 'unknown')
+        # Use user-specified metric or dataset default
+        evaluation_metric = get_evaluation_metric(dataset_name, lp_metric)
         default_metric = get_dataset_default_metric(dataset_name)
         
         if evaluator is None:
@@ -554,6 +577,36 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             })[f'hits@{k}']
             results[f'hits@{k}'] = hits_k
         
+        # Compute AUC and accuracy metrics
+        try:
+            from sklearn.metrics import roc_auc_score, accuracy_score
+            import numpy as np
+
+            # Prepare labels and scores for AUC/accuracy computation
+            pos_labels = torch.ones(pos_scores.size(0))
+            neg_labels = torch.zeros(neg_scores.size(0))
+            all_labels = torch.cat([pos_labels, neg_labels]).cpu().numpy()
+            all_scores = torch.cat([pos_scores, neg_scores]).cpu().numpy()
+
+            # Compute AUC
+            auc_score = roc_auc_score(all_labels, all_scores)
+            results['auc'] = auc_score
+
+            # Compute accuracy (using 0.5 as threshold)
+            predictions = (all_scores > 0.5).astype(int)
+            acc_score = accuracy_score(all_labels, predictions)
+            results['acc'] = acc_score
+
+            if rank == 0 and evaluation_metric in ['auc', 'acc']:
+                print(f"AUC: {auc_score:.4f}, ACC: {acc_score:.4f}")
+
+        except ImportError:
+            if rank == 0 and evaluation_metric in ['auc', 'acc']:
+                print("Warning: sklearn not available, cannot compute AUC/accuracy metrics")
+        except Exception as e:
+            if rank == 0:
+                print(f"Error computing AUC/accuracy: {e}")
+
         # Compute special metrics for specific datasets
         if dataset_name == 'ogbl-citation2':
             # Special MRR calculation for citation2
@@ -564,10 +617,29 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             if rank == 0:
                 print(f"Citation2 MRR: {mrr_value:.4f}")
         
-        # Add the default metric as a convenience key
-        if default_metric in results:
+        # Add the evaluation metric as a convenience key
+        if evaluation_metric in results:
+            results['default_metric'] = results[evaluation_metric]
+            results['default_metric_name'] = evaluation_metric
+        elif default_metric in results:
+            # Fallback to default metric if evaluation metric not available
             results['default_metric'] = results[default_metric]
             results['default_metric_name'] = default_metric
+            if rank == 0 and evaluation_metric != 'auto':
+                print(f"Warning: Requested metric '{evaluation_metric}' not available, using '{default_metric}' instead")
+        else:
+            # Emergency fallback - use hits@100 if available
+            fallback_metric = 'hits@100'
+            if fallback_metric in results:
+                results['default_metric'] = results[fallback_metric]
+                results['default_metric_name'] = fallback_metric
+                if rank == 0:
+                    print(f"Warning: Neither '{evaluation_metric}' nor '{default_metric}' available, using '{fallback_metric}'")
+            else:
+                results['default_metric'] = 0.0
+                results['default_metric_name'] = 'unavailable'
+                if rank == 0:
+                    print(f"Warning: No suitable metric available, setting to 0.0")
         
         # Move persistent tensors back to CPU to free GPU memory
         test_edges['edge_pairs'] = test_edges['edge_pairs'].cpu()
