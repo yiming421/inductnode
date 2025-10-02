@@ -712,21 +712,20 @@ class PFNTransformerLayer(nn.Module):
                 x_context_fnn, aux_loss = self.ffn(x_context_norm)
                 auxiliary_losses.append(aux_loss)
             else:
+                # Store original shape to preserve it
+                orig_shape = x_context_norm.shape
                 x_context_fnn = self.ffn(x_context_norm)
 
-            if self.unsqueeze:
-                x_context_fnn = x_context_fnn.unsqueeze(1)
-                # For residual connection, need to match dimensions temporarily
-                x_context_expanded = x_context.unsqueeze(1)
-                x_context_residual = x_context_fnn + x_context_expanded
-                # Squeeze back to 3D for attention operations
-                x_context = x_context_residual.squeeze(1)
-            else:
-                x_context = x_context_fnn + x_context
+                # If FFN changed the shape, restore it
+                if x_context_fnn.shape != orig_shape:
+                    x_context_fnn = x_context_fnn.view(orig_shape)
+
+            x_context = x_context_fnn + x_context
 
             # Target cross/self-attention (context should now be 3D)
             x_target_norm = self.tar_norm1(x_target)
             context_for_att = x_context
+
             if self.separate_att:
                 x_target_att, _ = self.cross_att(x_target_norm, context_for_att, context_for_att)
             else:
@@ -739,17 +738,15 @@ class PFNTransformerLayer(nn.Module):
                 x_target_fnn, aux_loss = self.ffn(x_target_norm)
                 auxiliary_losses.append(aux_loss)
             else:
+                # Store original shape to preserve it
+                orig_shape = x_target_norm.shape
                 x_target_fnn = self.ffn(x_target_norm)
 
-            if self.unsqueeze:
-                x_target_fnn = x_target_fnn.unsqueeze(1)
-                # For residual connection, need to match dimensions temporarily
-                x_target_expanded = x_target.unsqueeze(1)
-                x_target_residual = x_target_fnn + x_target_expanded
-                # Squeeze back to 3D for consistency
-                x_target = x_target_residual.squeeze(1)
-            else:
-                x_target = x_target_fnn + x_target
+                # If FFN changed the shape, restore it
+                if x_target_fnn.shape != orig_shape:
+                    x_target_fnn = x_target_fnn.view(orig_shape)
+
+            x_target = x_target_fnn + x_target
 
         else:  # post-norm (original behavior)
             # Post-norm: LayerNorm after sublayers
@@ -763,21 +760,20 @@ class PFNTransformerLayer(nn.Module):
                 x_context_fnn, aux_loss = self.ffn(x_context)
                 auxiliary_losses.append(aux_loss)
             else:
+                # Store original shape to preserve it
+                orig_shape = x_context.shape
                 x_context_fnn = self.ffn(x_context)
 
-            if self.unsqueeze:
-                x_context_fnn = x_context_fnn.unsqueeze(1)
-                # For residual connection, need to match dimensions temporarily
-                x_context_expanded = x_context.unsqueeze(1)
-                x_context_residual = x_context_fnn + x_context_expanded
-                # Squeeze back to 3D for attention operations
-                x_context = x_context_residual.squeeze(1)
-            else:
-                x_context = x_context_fnn + x_context
+                # If FFN changed the shape, restore it
+                if x_context_fnn.shape != orig_shape:
+                    x_context_fnn = x_context_fnn.view(orig_shape)
+
+            x_context = x_context_fnn + x_context
             x_context = self.context_norm2(x_context)
 
             # Target cross/self-attention (context should now be 3D)
             context_for_att = x_context
+
             if self.separate_att:
                 x_target_att, _ = self.cross_att(x_target, context_for_att, context_for_att)
             else:
@@ -790,7 +786,13 @@ class PFNTransformerLayer(nn.Module):
                 x_target_fnn, aux_loss = self.ffn(x_target)
                 auxiliary_losses.append(aux_loss)
             else:
+                # Store original shape to preserve it
+                orig_shape = x_target.shape
                 x_target_fnn = self.ffn(x_target)
+
+                # If FFN changed the shape, restore it
+                if x_target_fnn.shape != orig_shape:
+                    x_target_fnn = x_target_fnn.view(orig_shape)
 
             if self.unsqueeze:
                 x_target_fnn = x_target_fnn.unsqueeze(1)
@@ -854,7 +856,7 @@ class PFNPredictorNodeCls(nn.Module):
                 dropout=dropout,
                 norm=norm,
                 separate_att=separate_att,
-                unsqueeze=True,
+                unsqueeze=False,
                 norm_type=norm_type,
                 use_moe=use_moe,
                 num_experts=moe_num_experts,
