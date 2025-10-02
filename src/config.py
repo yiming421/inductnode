@@ -53,7 +53,12 @@ def get_main_parser():
     parser.add_argument('--padding', type=str, default='zero', 
                         choices=['zero', 'mlp'], 
                         help='Padding method for PFN predictor: zero padding or MLP padding')
-    parser.add_argument('--sim', type=str, default='dot')
+    parser.add_argument('--sim', type=str, default='dot',
+                        choices=['dot', 'cos', 'euclidean', 'mlp'],
+                        help='Similarity measure: dot product, cosine, euclidean distance, or MLP')
+    parser.add_argument('--ffn_expansion_ratio', type=int, default=4,
+                        choices=[1, 2, 4, 8],
+                        help='FFN expansion ratio: hidden_dim * expansion_ratio')
     parser.add_argument('--att_pool', type=str2bool, default=False)
     parser.add_argument('--mlp_pool', type=str2bool, default=False)
     parser.add_argument('--orthogonal_push', type=float, default=0.001)
@@ -267,6 +272,9 @@ def parse_joint_training_args():
     parser.add_argument('--moe_auxiliary_loss_weight', type=float, default=0.01,
                         help='Weight for MoE auxiliary load balancing loss')
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
+    parser.add_argument('--ffn_expansion_ratio', type=int, default=4,
+                        choices=[1, 2, 4, 8],
+                        help='FFN expansion ratio: hidden_dim * expansion_ratio')
     parser.add_argument('--dp', type=float, default=0.08717780667044389, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
     parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections')
@@ -308,7 +316,13 @@ def parse_joint_training_args():
     parser.add_argument('--enable_gc', type=str2bool, default=True, help='Enable graph classification task')
     parser.add_argument('--lambda_nc', type=float, default=0.5339754552414909, help='Weight for node classification loss')
     parser.add_argument('--lambda_lp', type=float, default=2.735303979230086, help='Weight for link prediction loss')
-    
+
+    # === Hierarchical Training ===
+    parser.add_argument('--use_hierarchical_training', type=str2bool, default=False,
+                        help='Enable hierarchical/phased multi-task training to reduce task conflict')
+    parser.add_argument('--hierarchical_phases', type=str, default='lp,nc+lp,nc+lp+gc',
+                        help='Task schedule per phase (comma-separated). Use + for multiple tasks. Tasks: nc, lp, gc. Phases split at epochs 15 and 30.')
+
     # === Dataset Configuration ===
     parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
                        help='Node classification training datasets')
@@ -326,7 +340,7 @@ def parse_joint_training_args():
     parser.add_argument('--context_num', type=int, default=5, help='Number of context nodes')
     parser.add_argument('--seperate', type=str2bool, default=True, help='Separate processing in PFN predictor')
     parser.add_argument('--padding', type=str, default='zero', choices=['zero', 'mlp'], help='Padding method for PFN predictor')
-    parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'mlp'], help='Similarity function')
+    parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp'], help='Similarity function')
     parser.add_argument('--orthogonal_push', type=float, default=0, help='Orthogonal push regularization weight')
     parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize class embeddings')
     

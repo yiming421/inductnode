@@ -640,7 +640,8 @@ class Prodigy_Predictor_mlp(nn.Module):
 class PFNTransformerLayer(nn.Module):
     def __init__(self, hidden_dim, n_head=1, mlp_layers=2, dropout=0.2, norm=False,
                  separate_att=False, unsqueeze=False, norm_affine=True, norm_type='post',
-                 use_moe=False, num_experts=4, moe_top_k=2, moe_auxiliary_loss_weight=0.01):
+                 use_moe=False, num_experts=4, moe_top_k=2, moe_auxiliary_loss_weight=0.01,
+                 ffn_expansion_ratio=4):
         super(PFNTransformerLayer, self).__init__()
         self.hidden_dim = hidden_dim
         if separate_att:
@@ -667,7 +668,7 @@ class PFNTransformerLayer(nn.Module):
         if use_moe:
             self.ffn = MoELayer(
                 hidden_dim=hidden_dim,
-                expert_dim=4 * hidden_dim,
+                expert_dim=ffn_expansion_ratio * hidden_dim,
                 num_experts=num_experts,
                 top_k=moe_top_k,
                 mlp_layers=mlp_layers,
@@ -679,7 +680,7 @@ class PFNTransformerLayer(nn.Module):
         else:
             self.ffn = MLP(
                 in_channels=hidden_dim,
-                hidden_channels=4 * hidden_dim,
+                hidden_channels=ffn_expansion_ratio * hidden_dim,
                 out_channels=hidden_dim,
                 num_layers=mlp_layers,
                 dropout=dropout,
@@ -818,7 +819,8 @@ class PFNPredictorNodeCls(nn.Module):
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
                  padding='zero', norm_affine=True, normalize=False,
                  use_first_half_embedding=False, use_full_embedding=False, norm_type='post',
-                 use_moe=False, moe_num_experts=4, moe_top_k=2, moe_auxiliary_loss_weight=0.01):
+                 use_moe=False, moe_num_experts=4, moe_top_k=2, moe_auxiliary_loss_weight=0.01,
+                 ffn_expansion_ratio=4):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
@@ -861,7 +863,8 @@ class PFNPredictorNodeCls(nn.Module):
                 use_moe=use_moe,
                 num_experts=moe_num_experts,
                 moe_top_k=moe_top_k,
-                moe_auxiliary_loss_weight=moe_auxiliary_loss_weight
+                moe_auxiliary_loss_weight=moe_auxiliary_loss_weight,
+                ffn_expansion_ratio=ffn_expansion_ratio
             ) for _ in range(num_layers)
         ])
         self.degree = degree
@@ -988,12 +991,17 @@ class PFNPredictorNodeCls(nn.Module):
             target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
             class_emb = F.normalize(class_emb, p=2, dim=-1)
             logits = torch.matmul(target_label_emb, class_emb.t())
+        elif self.sim == 'euclidean':
+            # Euclidean distance: smaller distance = higher similarity
+            # Use negative distance as logits (closer = higher score)
+            distances = torch.cdist(target_label_emb, class_emb, p=2)
+            logits = -distances
         elif self.sim == 'mlp':
             target_label_emb = self.sim_mlp(target_label_emb)
             class_emb = self.sim_mlp(class_emb)
             logits = torch.matmul(target_label_emb, class_emb.t())
         else:
-            raise ValueError("Invalid similarity type. Choose 'dot', 'cos', or 'mlp'.")
+            raise ValueError("Invalid similarity type. Choose 'dot', 'cos', 'euclidean', or 'mlp'.")
         if self.use_moe and total_auxiliary_loss > 0:
             return logits, class_emb, total_auxiliary_loss
         else:

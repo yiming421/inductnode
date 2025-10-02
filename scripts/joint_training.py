@@ -1015,7 +1015,8 @@ def create_unified_model(args, input_dim, device):
             use_moe=getattr(args, 'use_moe', False),
             moe_num_experts=getattr(args, 'moe_num_experts', 4),
             moe_top_k=getattr(args, 'moe_top_k', 2),
-            moe_auxiliary_loss_weight=getattr(args, 'moe_auxiliary_loss_weight', 0.01)
+            moe_auxiliary_loss_weight=getattr(args, 'moe_auxiliary_loss_weight', 0.01),
+            ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4)
         )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
@@ -1451,19 +1452,71 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
     return data_dict
 
 
-def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch, 
+def get_hierarchical_task_schedule(epoch, args):
+    """
+    Get which tasks should be active for the current epoch based on hierarchical training schedule.
+
+    Args:
+        epoch: Current training epoch (0-indexed)
+        args: Arguments containing hierarchical_phases
+
+    Returns:
+        dict: {'nc': bool, 'lp': bool, 'gc': bool} indicating which tasks are active
+
+    Example:
+        hierarchical_phases = "lp,nc+lp,nc+lp+gc"
+        epoch 0-14:   {'nc': False, 'lp': True, 'gc': False}
+        epoch 15-29:  {'nc': True, 'lp': True, 'gc': False}
+        epoch 30+:    {'nc': True, 'lp': True, 'gc': True}
+    """
+    if not args.use_hierarchical_training:
+        # All tasks active if hierarchical training is disabled
+        return {'nc': True, 'lp': True, 'gc': True}
+
+    # Parse phase configuration
+    phases = args.hierarchical_phases.split(',')
+
+    # Fixed phase boundaries: epochs 15 and 30
+    phase_boundaries = [15, 30]
+
+    # Determine current phase
+    current_phase = 0
+    for boundary in phase_boundaries:
+        if epoch >= boundary:
+            current_phase += 1
+        else:
+            break
+
+    # Handle edge case: more epochs than phases
+    if current_phase >= len(phases):
+        current_phase = len(phases) - 1
+
+    # Parse active tasks for current phase
+    phase_tasks = phases[current_phase].strip()
+    active_tasks = {
+        'nc': 'nc' in phase_tasks,
+        'lp': 'lp' in phase_tasks,
+        'gc': 'gc' in phase_tasks
+    }
+
+    return active_tasks
+
+
+def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch,
                        identity_projection=None):
     """
     Perform one joint training step combining all three tasks.
-    
+
     This function calculates the loss for each task, combines them with weights,
     and performs a single backward pass and optimizer step.
+
+    Supports hierarchical/phased training to reduce task conflict.
     """
     global lp_tracker
-    
+
     model.train()
     predictor.train()
-    
+
     device = optimizer.param_groups[0]['params'][0].device
     total_nc_loss = torch.tensor(0.0, device=device)
     total_lp_loss = torch.tensor(0.0, device=device)
@@ -1471,16 +1524,26 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     nc_count = 0
     lp_count = 0
     gc_count = 0
-    
+
     # Unpack data
     nc_data_list, nc_split_idx_list, nc_external_embeddings = nc_data
     (lp_data_list, lp_split_idx_list, lp_context_data, lp_masks, lp_link_data_all) = lp_data
     gc_data_list, gc_processed_data_list = gc_data
-    
+
+    # Get hierarchical task schedule for this epoch
+    active_tasks = get_hierarchical_task_schedule(epoch, args)
+
+    # Log active tasks (only on rank 0 and first iteration to avoid spam)
+    if epoch == 0 or (args.use_hierarchical_training and (epoch == 15 or epoch == 30)):
+        active_task_names = [name.upper() for name, active in active_tasks.items() if active]
+        print(f"\n{'='*60}")
+        print(f"[HIERARCHICAL TRAINING] Epoch {epoch}: Active tasks = {', '.join(active_task_names)}")
+        print(f"{'='*60}\n")
+
     # --- 1. Calculate Losses without Optimization ---
-    
+
     # Node Classification Loss
-    if hasattr(args, 'enable_nc') and args.enable_nc and nc_data_list is not None and len(nc_data_list) > 0 and args.lambda_nc > 0:
+    if active_tasks['nc'] and hasattr(args, 'enable_nc') and args.enable_nc and nc_data_list is not None and len(nc_data_list) > 0 and args.lambda_nc > 0:
         nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=optimizer, pred=predictor,
                           batch_size=args.nc_batch_size, degree=False,
                           orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
@@ -1491,7 +1554,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
             nc_count = len(nc_data_list)
     
     # Link Prediction Loss
-    if hasattr(args, 'enable_lp') and args.enable_lp and lp_data_list is not None and len(lp_data_list) > 0 and args.lambda_lp > 0:
+    if active_tasks['lp'] and hasattr(args, 'enable_lp') and args.enable_lp and lp_data_list is not None and len(lp_data_list) > 0 and args.lambda_lp > 0:
         if lp_tracker is None:
             lp_tracker = LinkPredictionTracker(device=device)
         
@@ -1547,7 +1610,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
             total_lp_loss = lp_loss_sum / lp_count
     
     # Graph Classification Loss
-    if hasattr(args, 'enable_gc') and args.enable_gc and len(gc_data_list) > 0 and args.lambda_gc > 0:
+    if active_tasks['gc'] and hasattr(args, 'enable_gc') and args.enable_gc and len(gc_data_list) > 0 and args.lambda_gc > 0:
         gc_tracker.log_memory("gc_section_start")
         gc_loss_sum = 0.0
         gc_dataset_count = 0
