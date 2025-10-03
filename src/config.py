@@ -323,6 +323,10 @@ def parse_joint_training_args():
     parser.add_argument('--hierarchical_phases', type=str, default='lp,nc+lp,nc+lp+gc',
                         help='Task schedule per phase (comma-separated). Use + for multiple tasks. Tasks: nc, lp, gc. Phases split at epochs 15 and 30.')
 
+    # === Virtual Node ===
+    parser.add_argument('--use_virtual_node', type=str2bool, default=False,
+                        help='Add a virtual node connected to all graph nodes for global information aggregation (uses main dropout rate and residual connections)')
+
     # === Dataset Configuration ===
     parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
                        help='Node classification training datasets')

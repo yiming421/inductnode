@@ -174,7 +174,7 @@ class PureGCN(nn.Module):
 
 class PureGCN_v1(nn.Module):
     def __init__(self, input_dim, num_layers=2, hidden=256, dp=0, norm=False, res=False,
-                 relu=False, norm_affine=True, activation='relu'):
+                 relu=False, norm_affine=True, activation='relu', use_virtual_node=False):
         super().__init__()
 
         # Input projection
@@ -187,6 +187,7 @@ class PureGCN_v1(nn.Module):
         self.norm = norm
         self.res = res
         self.relu = relu  # Keep for backward compatibility
+        self.use_virtual_node = use_virtual_node
 
         # Handle activation function
         if relu:  # If relu is True, use activation function
@@ -198,8 +199,60 @@ class PureGCN_v1(nn.Module):
         if self.norm:
             self.norms = nn.ModuleList([nn.LayerNorm(hidden, elementwise_affine=norm_affine) for _ in range(num_layers)])
 
-    def forward(self, x, adj_t):
+        # Virtual node: learnable embedding added as real node in graph
+        if self.use_virtual_node:
+            self.virtualnode_embedding = nn.Embedding(1, hidden)
+            nn.init.constant_(self.virtualnode_embedding.weight.data, 0)
+
+    def forward(self, x, adj_t, batch=None):
+        import time
         x = self.lin(x)  # Apply input projection
+
+        # Add virtual node to graph if enabled (only for graph-level tasks with batch info)
+        if self.use_virtual_node and batch is not None:
+            vn_start = time.perf_counter()
+
+            num_nodes = x.size(0)
+            num_graphs = int(batch.max().item()) + 1
+
+            # Add virtual node embedding for each graph
+            virtualnode_emb = self.virtualnode_embedding.weight.repeat(num_graphs, 1)
+            x = torch.cat([virtualnode_emb, x], dim=0)
+
+            # Add virtual edges: bidirectional connections between virtual node and all real nodes
+            # Virtual node indices: 0, 1, 2, ... (num_graphs-1)
+            # Real node indices: num_graphs, num_graphs+1, ..., num_graphs+num_nodes-1
+            real_node_indices = torch.arange(num_graphs, num_graphs + num_nodes, device=x.device)
+            # Map each real node to its virtual node (use original batch indices)
+            virtual_node_indices = batch
+
+            # Create bidirectional edges
+            edge_list = []
+            edge_list.append(torch.stack([virtual_node_indices, real_node_indices], dim=0))  # vn -> real
+            edge_list.append(torch.stack([real_node_indices, virtual_node_indices], dim=0))  # real -> vn
+            vn_edges = torch.cat(edge_list, dim=1)
+
+            # Convert adj_t to edge_index, add virtual edges, convert back
+            from torch_sparse import SparseTensor
+            row, col, edge_attr = adj_t.coo()
+            # Shift existing edges by num_graphs
+            edge_index_shifted = torch.stack([row + num_graphs, col + num_graphs], dim=0)
+            # Combine with virtual edges
+            edge_index_full = torch.cat([vn_edges, edge_index_shifted], dim=1)
+            # Create new SparseTensor (symmetric and coalesced like original)
+            adj_t = SparseTensor(row=edge_index_full[0], col=edge_index_full[1],
+                                sparse_sizes=(x.size(0), x.size(0))).to_symmetric().coalesce()
+
+            vn_time = (time.perf_counter() - vn_start) * 1000  # Convert to ms
+            if not hasattr(self, '_vn_time_samples'):
+                self._vn_time_samples = []
+            self._vn_time_samples.append(vn_time)
+
+            # Log periodically (every 100 forward passes)
+            if len(self._vn_time_samples) % 100 == 0:
+                avg_time = sum(self._vn_time_samples[-100:]) / 100
+                print(f"[VN_TIME] Virtual node overhead: {avg_time:.3f}ms (avg over 100 batches)")
+
         ori = x
         for i in range(self.num_layers):
             if i != 0:
@@ -212,6 +265,13 @@ class PureGCN_v1(nn.Module):
                 if self.dp > 0:
                     x = F.dropout(x, p=self.dp, training=self.training)  # Safe dropout
             x = self.conv(x, adj_t)  # Apply GCN convolution
+
+        # Remove virtual node from output if present
+        if self.use_virtual_node and batch is not None:
+            virtualnode_out = x[:num_graphs]  # Extract virtual nodes
+            x = x[num_graphs:]  # Remove virtual nodes, keep only real nodes
+            return x, virtualnode_out
+
         return x
 
 class MLP(nn.Module):

@@ -976,7 +976,8 @@ def create_unified_model(args, input_dim, device):
     if args.model == 'PureGCN_v1':
         model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm,
                           args.res, args.relu, args.gnn_norm_affine,
-                          activation=getattr(args, 'activation', 'relu'))
+                          activation=getattr(args, 'activation', 'relu'),
+                          use_virtual_node=getattr(args, 'use_virtual_node', False))
     elif args.model == 'GCN':
         model = GCN(hidden, hidden, args.norm, args.relu, args.num_layers, args.dp,
                    args.multilayer, args.use_gin, args.res, args.gnn_norm_affine,

@@ -472,18 +472,29 @@ def log_gpu_memory(stage):
     mem = get_gpu_memory_usage()
     print(f"[GPU-MEM {stage}] {mem['allocated']:.4f}GB allocated, {mem['reserved']:.4f}GB reserved, {mem['max_allocated']:.4f}GB max allocated")
 
-def pool_graph_embeddings(node_embeddings, batch, pooling_method='mean'):
+def pool_graph_embeddings(node_embeddings, batch, pooling_method='mean', virtualnode_embeddings=None):
     """
     Pool node embeddings to create graph-level embeddings.
-    
+
     Args:
-        node_embeddings (torch.Tensor): Node embeddings [num_nodes, hidden_dim]
+        node_embeddings (torch.Tensor or tuple): Node embeddings [num_nodes, hidden_dim],
+                                                   or (node_embeddings, virtualnode_embeddings) if virtual node is used
         batch (torch.Tensor): Batch assignment for each node
-        pooling_method (str): Pooling method ('mean', 'max', 'sum')
-        
+        pooling_method (str): Pooling method ('mean', 'max', 'sum', 'virtual_node')
+        virtualnode_embeddings (torch.Tensor, optional): Virtual node embeddings [num_graphs, hidden_dim]
+
     Returns:
         torch.Tensor: Graph-level embeddings [num_graphs, hidden_dim]
     """
+    # Handle tuple return from model (when use_virtual_node=True)
+    if isinstance(node_embeddings, tuple):
+        node_embeddings, virtualnode_embeddings = node_embeddings
+
+    # If virtual node embeddings are provided, use them directly
+    if virtualnode_embeddings is not None:
+        return virtualnode_embeddings
+
+    # Otherwise use standard pooling
     if pooling_method == 'mean':
         return global_mean_pool(node_embeddings, batch)
     elif pooling_method == 'max':
@@ -545,8 +556,8 @@ def _create_context_embeddings_computed(model, context_structure, dataset, task_
         ).to_symmetric().coalesce()
         
         # Get node embeddings from GNN using SparseTensor format
-        node_embeddings = model(x_input, batch_data.adj_t)
-        
+        node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
+
         # Pool to get graph embeddings
         graph_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
         
@@ -731,8 +742,8 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
                 ).to_symmetric().coalesce()
                 
                 # Get node embeddings from GNN
-                node_embeddings = model(x_input, batch_data.adj_t)
-                
+                node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
+
                 # Pool to get graph embeddings
                 target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
                 
@@ -868,8 +879,8 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
     ).to_symmetric().coalesce()
 
     # Get node embeddings from GNN
-    node_embeddings = model(x_input, batch_data.adj_t)
-    
+    node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
+
     # Pool to get graph embeddings
     target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
 
@@ -1010,8 +1021,8 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         ).to_symmetric().coalesce()
 
         # Get node embeddings from GNN using SparseTensor format
-        node_embeddings = model(x_input, batch_data.adj_t)
-        
+        node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
+
         # Pool to get graph embeddings
         target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
 
@@ -1207,8 +1218,8 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
                 batch_data.edge_index,
                 sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
             ).to_symmetric().coalesce()
-            node_embeddings = model(x_input, batch_data.adj_t)
-            
+            node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
+
             target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
             
             # Get labels for this batch - all samples are valid for this task
