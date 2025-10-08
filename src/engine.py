@@ -105,6 +105,9 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         
         base_features = data.x
 
+        # Note: GPSE embeddings are already concatenated in process_data (data_utils.py)
+        # No need to concatenate again here
+
         # Apply different projection strategies
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
             x_input = identity_projection(base_features)
@@ -235,6 +238,9 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
         identity_projection.eval()
 
     base_features = data.x
+
+    # Note: GPSE embeddings are already concatenated in process_data (data_utils.py)
+    # No need to concatenate again here
 
     # Apply different projection strategies
     if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:

@@ -45,10 +45,13 @@ def load_gpse_embeddings(dataset_name, gpse_base_path="/home/maweishuo/GPSE/data
     # Map inductnode dataset names to GPSE dataset names
     dataset_mapping = {
         'bace': 'OGB-ogbg-molbace',
-        'bbbp': 'OGB-ogbg-molbbbp', 
+        'bbbp': 'OGB-ogbg-molbbbp',
         'chemhiv': 'OGB-ogbg-molhiv',
         'tox21': 'OGB-ogbg-moltox21',
         'toxcast': 'OGB-ogbg-moltoxcast',
+        'clintox': 'OGB-ogbg-molclintox',
+        'muv': 'OGB-ogbg-molmuv',
+        'sider': 'OGB-ogbg-molsider',
     }
     
     gpse_dataset_name = dataset_mapping.get(dataset_name)
@@ -515,18 +518,36 @@ def load_dataset(name, root='./dataset', embedding_family='ST'):
     """
     Load a graph classification dataset. Extended with optional FUG+OGB path.
     Priority:
-      0. FUG OGB embeddings (if env USE_FUG_EMB=1 and embeddings available)
-      1. TAGDataset (if TAG_DATASET_ROOT set)
-      2. TSGFM batched format
-      3. TU datasets
+      0. Original OGB features (if env USE_ORIGINAL_FEATURES=1)
+      1. FUG OGB embeddings (if env USE_FUG_EMB=1 and embeddings available)
+      2. TAGDataset (if TAG_DATASET_ROOT set)
+      3. TSGFM batched format
+      4. TU datasets
     """
+    # --- Original OGB features path (9-dim raw features) ---
+    if os.environ.get('USE_ORIGINAL_FEATURES', '0') == '1':
+        ogb_root = os.environ.get('OGB_ROOT', './dataset/ogb')
+
+        print(f"[Loader] Loading OGB dataset '{name}' with ORIGINAL features (9-dim)")
+
+        from .data_graph_fug_simple import load_ogb_original_features
+        result = load_ogb_original_features(name, ogb_root=ogb_root)
+        if result is not None:
+            dataset, original_features_mapping = result
+            print(f"[Loader] Successfully loaded OGB dataset '{name}' with original features")
+            dataset.name = name
+            # Return both dataset and mapping - same format as FUG
+            return dataset, original_features_mapping
+        else:
+            print(f"[Loader] Original features loading failed for '{name}'. Continuing...")
+
     # --- FUG OGB path (simplified for unified embedding setting) ---
     if os.environ.get('USE_FUG_EMB', '0') == '1':
         fug_root = os.environ.get('FUG_EMB_ROOT', './fug')
         ogb_root = os.environ.get('OGB_ROOT', './dataset/ogb')
-        
+
         print(f"[Loader] Loading FUG dataset '{name}' (unified embedding setting)")
-        
+
         # Simple unified loading - just one function needed
         from .data_graph_fug_simple import load_ogb_fug_dataset
         result = load_ogb_fug_dataset(name, ogb_root=ogb_root, fug_root=fug_root)

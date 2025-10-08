@@ -28,6 +28,7 @@ from src.data import load_all_data, load_all_data_train
 from src.data_link import load_all_data_link
 from src.data_graph import load_all_graph_datasets, process_graph_features, create_data_loaders, create_task_filtered_datasets
 from src.data_utils import process_data, prepare_link_data, select_link_context, process_link_data
+from src.minibatch_loader import MiniBatchNCLoader, compute_nc_loss_with_loader
 from src.engine import train_all, test_all, test_all_induct  # Node classification engines
 from src.engine_link_pred import train_link_prediction, evaluate_link_prediction  # Link prediction engines
 from src.engine_graph import (
@@ -1051,16 +1052,61 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         print("Loading node classification datasets...")
         nc_train_datasets = args.nc_train_dataset.split(',')
         nc_test_datasets = args.nc_test_dataset.split(',')
-        
+
+        # Auto-fix: Change 'legacy' to 'small_valid' for large datasets to prevent infinite loops
+        if args.split_rebalance_strategy == 'legacy':
+            large_datasets = ['ogbn-products', 'ogbn-papers100M']
+            if any(dataset in nc_train_datasets for dataset in large_datasets):
+                print(f"⚠️  WARNING: Detected large dataset(s) {[d for d in large_datasets if d in nc_train_datasets]} with 'legacy' split strategy.")
+                print(f"⚠️  Automatically changing split_rebalance_strategy from 'legacy' to 'small_valid' to prevent infinite training loops.")
+                args.split_rebalance_strategy = 'smallest_for_valid'
+
         # 1) Load training/test data lists first
         if not skip_training_data:
-            nc_train_data_list, nc_train_split_idx_list = load_all_data_train(nc_train_datasets)
+            nc_train_data_list, nc_train_split_idx_list = load_all_data_train(
+                nc_train_datasets,
+                split_strategy=args.split_rebalance_strategy
+            )
         else:
             print("  Skipping NC training data loading (using pretrained model)")
 
         nc_test_data_list, nc_test_split_idx_list = load_all_data(nc_test_datasets)
 
-        # 2) Load external embeddings (if enabled) before processing datasets so they can be used
+        # 2) Load GPSE/LapPE/RWSE embeddings (if enabled)
+        if args.use_gpse or args.use_lappe or args.use_rwse:
+            from src.data import attach_gpse_embeddings
+
+            pe_types = []
+            if args.use_gpse: pe_types.append('GPSE')
+            if args.use_lappe: pe_types.append('LapPE')
+            if args.use_rwse: pe_types.append('RWSE')
+            pe_str = '+'.join(pe_types)
+
+            print(f"\n📊 Loading {pe_str} embeddings...")
+            if not skip_training_data:
+                train_count = attach_gpse_embeddings(
+                    nc_train_data_list,
+                    nc_train_datasets,
+                    gpse_dir=args.gpse_dir,
+                    verbose=args.gpse_verbose,
+                    use_gpse=args.use_gpse,
+                    use_lappe=args.use_lappe,
+                    use_rwse=args.use_rwse
+                )
+                print(f"  ✓ {pe_str} embeddings loaded for {train_count}/{len(nc_train_data_list)} training datasets")
+
+            test_count = attach_gpse_embeddings(
+                nc_test_data_list,
+                nc_test_datasets,
+                gpse_dir=args.gpse_dir,
+                verbose=args.gpse_verbose,
+                use_gpse=args.use_gpse,
+                use_lappe=args.use_lappe,
+                use_rwse=args.use_rwse
+            )
+            print(f"  ✓ {pe_str} embeddings loaded for {test_count}/{len(nc_test_data_list)} test datasets\n")
+
+        # 3) Load external embeddings (if enabled) before processing datasets so they can be used
         if getattr(args, 'use_external_embeddings_nc', False):
             print("Loading external embeddings for node classification...")
 
@@ -1438,18 +1484,29 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
     else:
         print("Graph classification task disabled, skipping dataset loading...")
 
+    # Create mini-batch loaders for NC training datasets
+    nc_train_loaders = []
+    if args.enable_nc and nc_train_data_list is not None:
+        print("\n=== Creating Mini-Batch Loaders for NC Training ===")
+        for i, (data, split_idx) in enumerate(zip(nc_train_data_list, nc_train_split_idx_list)):
+            dataset_name = getattr(data, 'name', f'dataset_{i}')
+            print(f"  [{i+1}/{len(nc_train_data_list)}] {dataset_name}:")
+            loader = MiniBatchNCLoader(data, split_idx, args, device)
+            nc_train_loaders.append(loader)
+
     data_dict = {
         'nc_train': (nc_train_data_list, nc_train_split_idx_list, nc_train_external_embeddings),
         'nc_test': (nc_test_data_list, nc_test_split_idx_list, nc_test_external_embeddings),
+        'nc_train_loaders': nc_train_loaders,  # Add loaders to data_dict
         'lp_train': (lp_train_data_list, lp_train_split_idx_list, lp_train_context_data, lp_train_masks, lp_train_link_data_all),
         'lp_test': (lp_test_data_list, lp_test_split_idx_list, lp_test_context_data, lp_test_link_data_all),
         'gc_train': (gc_train_data_list, gc_train_processed_data_list),
         'gc_test': (gc_test_data_list, gc_test_processed_data_list)
     }
-    
+
     if gc_tracker:
         gc_tracker.log_memory("all_data_loading_complete")
-    
+
     return data_dict
 
 
@@ -1504,7 +1561,7 @@ def get_hierarchical_task_schedule(epoch, args):
 
 
 def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch,
-                       identity_projection=None):
+                       identity_projection=None, nc_loaders=None):
     """
     Perform one joint training step combining all three tasks.
 
@@ -1512,6 +1569,9 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     and performs a single backward pass and optimizer step.
 
     Supports hierarchical/phased training to reduce task conflict.
+
+    Args:
+        nc_loaders: List of MiniBatchNCLoader instances for NC datasets
     """
     global lp_tracker
 
@@ -1545,14 +1605,30 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
     # Node Classification Loss
     if active_tasks['nc'] and hasattr(args, 'enable_nc') and args.enable_nc and nc_data_list is not None and len(nc_data_list) > 0 and args.lambda_nc > 0:
-        nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=optimizer, pred=predictor,
-                          batch_size=args.nc_batch_size, degree=False,
-                          orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
-                          clip_grad=args.clip_grad, rank=0, epoch=epoch,
-                          identity_projection=identity_projection, lambda_=args.lambda_nc, args=args)
-        if nc_loss is not None:
-            total_nc_loss = nc_loss
-            nc_count = len(nc_data_list)
+        # Use mini-batch loaders if provided, otherwise fallback to train_all
+        if nc_loaders is not None and len(nc_loaders) > 0:
+            nc_loss_sum = 0.0
+            for i, (data_loader, split_idx) in enumerate(zip(nc_loaders, nc_split_idx_list)):
+                external_emb = nc_external_embeddings[i] if nc_external_embeddings else None
+                nc_loss = compute_nc_loss_with_loader(
+                    data_loader, split_idx, model, predictor, args, device,
+                    identity_projection=identity_projection,
+                    external_embeddings=external_emb,
+                    optimizer=optimizer
+                )
+                nc_loss_sum += nc_loss  # nc_loss is already a scalar
+            total_nc_loss = torch.tensor(nc_loss_sum, device=device)
+            nc_count = len(nc_loaders)
+        else:
+            # Fallback to original full-batch training
+            nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=optimizer, pred=predictor,
+                              batch_size=args.nc_batch_size, degree=False,
+                              orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
+                              clip_grad=args.clip_grad, rank=0, epoch=epoch,
+                              identity_projection=identity_projection, lambda_=args.lambda_nc, args=args)
+            if nc_loss is not None:
+                total_nc_loss = nc_loss
+                nc_count = len(nc_data_list)
     
     # Link Prediction Loss
     if active_tasks['lp'] and hasattr(args, 'enable_lp') and args.enable_lp and lp_data_list is not None and len(lp_data_list) > 0 and args.lambda_lp > 0:
@@ -1694,7 +1770,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     }
 
 
-def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None):
+def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None, nc_loaders=None):
     """
     Evaluate node classification task only.
 
@@ -1735,17 +1811,46 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     'evaluation_time': datasets_time
                 }
             else:
-                # Use transductive evaluation for seen datasets
-                train_metrics, valid_metrics, test_metrics = test_all(
-                    model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                    False, None, None, True, None, 0, identity_projection
-                )
-                results = {
-                    'train': train_metrics if isinstance(train_metrics, (int, float)) else sum(train_metrics) / len(train_metrics),
-                    'valid': valid_metrics if isinstance(valid_metrics, (int, float)) else sum(valid_metrics) / len(valid_metrics),
-                    'test': test_metrics if isinstance(test_metrics, (int, float)) else sum(test_metrics) / len(test_metrics),
-                    'individual_test_metrics': test_metrics if isinstance(test_metrics, list) else [test_metrics]
-                }
+                # Check if we should use mini-batch evaluation
+                if nc_loaders is not None and len(nc_loaders) > 0:
+                    # Use mini-batch evaluation
+                    from src.minibatch_loader import evaluate_with_loader
+                    device = next(model.parameters()).device
+                    eval_accs = []
+
+                    for i, (loader, split_idx) in enumerate(zip(nc_loaders, nc_split_idx_list)):
+                        if loader.is_minibatch():
+                            # Mini-batch evaluation
+                            eval_acc = evaluate_with_loader(
+                                loader, split_idx, model, predictor, args, device,
+                                eval_split=split, identity_projection=identity_projection
+                            )
+                            eval_accs.append(eval_acc)
+                        else:
+                            # Fall back to full-batch for small datasets
+                            from src.engine import test
+                            _, eval_acc, _ = test(
+                                model, predictor, loader.data, split_idx['train'], split_idx['valid'], split_idx['test'],
+                                args.test_batch_size, False, None, None, True, None, 0, identity_projection
+                            )
+                            eval_accs.append(eval_acc)
+
+                    results = {
+                        split: sum(eval_accs) / len(eval_accs) if eval_accs else 0.0,
+                        'individual_test_metrics': eval_accs
+                    }
+                else:
+                    # Use transductive evaluation for seen datasets (original approach)
+                    train_metrics, valid_metrics, test_metrics = test_all(
+                        model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                        False, None, None, True, None, 0, identity_projection
+                    )
+                    results = {
+                        'train': train_metrics if isinstance(train_metrics, (int, float)) else sum(train_metrics) / len(train_metrics),
+                        'valid': valid_metrics if isinstance(valid_metrics, (int, float)) else sum(valid_metrics) / len(valid_metrics),
+                        'test': test_metrics if isinstance(test_metrics, (int, float)) else sum(test_metrics) / len(test_metrics),
+                        'individual_test_metrics': test_metrics if isinstance(test_metrics, list) else [test_metrics]
+                    }
 
     eval_total_time = time.time() - eval_start_time
     print(f"Node classification evaluation ({split} split) completed in {eval_total_time:.2f}s")
@@ -2054,19 +2159,22 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
 
 
 def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='valid',
-                    identity_projection=None, gc_tracker=None):
+                    identity_projection=None, gc_tracker=None, nc_loaders=None):
     """
     Evaluate enabled tasks and return metrics.
-    
+
+    Args:
+        nc_loaders: Optional list of MiniBatchNCLoader for mini-batch evaluation
+
     Returns:
         Dictionary with metrics for enabled tasks
-    """    
+    """
 
     results = {'nc_metrics': {}, 'lp_metrics': {}, 'gc_metrics': {}}
-    
+
     # Evaluate node classification
     if hasattr(args, 'enable_nc') and args.enable_nc and nc_data is not None and nc_data[0] is not None:
-            nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection)
+            nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection, nc_loaders)
             results['nc_metrics'] = nc_results
     
     # Evaluate link prediction  
@@ -2312,26 +2420,28 @@ def run_joint_training(args, device='cuda:0'):
     
     for epoch in range(args.epochs):
         start_time = time.time()
-        
+
         # Refresh contexts if needed
         refresh_contexts_if_needed(epoch, args, data_dict)
-        
+
         # Joint training step
         train_results = joint_training_step(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
-            optimizer, args, epoch, identity_projection
+            optimizer, args, epoch, identity_projection,
+            nc_loaders=data_dict.get('nc_train_loaders', None)
         )
-        
+
         # Step scheduler
         if scheduler is not None:
             scheduler.step()
-        
+
         # Every epoch: Validation on seen datasets (training data) for early stopping
         seen_valid_results = joint_evaluation(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
-            args, 'valid', identity_projection, gc_tracker
+            args, 'valid', identity_projection, gc_tracker,
+            nc_loaders=data_dict.get('nc_train_loaders', None)
         )
-        
+
         # Compute combined validation score on seen datasets
         nc_valid_seen = seen_valid_results['nc_metrics'].get('valid', 0.0) if seen_valid_results['nc_metrics'] else 0.0
         lp_valid_seen = seen_valid_results['lp_metrics'].get('valid', 0.0) if seen_valid_results['lp_metrics'] else 0.0
@@ -2723,11 +2833,11 @@ def main():
         print(f"\n{'='*50}")
         print(f"Run {run + 1}/{args.runs}")
         print(f"{'='*50}")
-        
+
         # Set different seed for each run with all generators
         run_seed = args.seed + run
         set_all_random_seeds(run_seed)
-        
+
         nc_result, lp_result, gc_result, nc_individual, lp_individual, gc_individual = run_joint_training(args, device)
         all_nc_results.append(nc_result)
         all_lp_results.append(lp_result)
@@ -2735,6 +2845,11 @@ def main():
         all_nc_individual_results.append(nc_individual)
         all_lp_individual_results.append(lp_individual)
         all_gc_individual_results.append(gc_individual)
+
+        # Force cleanup between runs
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
     
     # Aggregate results
     avg_nc = sum(all_nc_results) / len(all_nc_results)

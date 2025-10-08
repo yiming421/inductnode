@@ -172,6 +172,30 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     else:
         input_features = data.x
 
+    # GPSE Enhancement: Concatenate GPSE embeddings if available
+    if hasattr(data, 'gpse_embeddings') and data.gpse_embeddings is not None:
+        gpse_emb = data.gpse_embeddings.to(device)
+        original_dim = input_features.size(1)
+        input_features = torch.cat([input_features, gpse_emb], dim=1)
+        if rank == 0:
+            print(f"Dataset {data.name}: Concatenated GPSE embeddings ({original_dim}D + {gpse_emb.size(1)}D = {input_features.size(1)}D)")
+
+    # LapPE Enhancement: Concatenate Laplacian PE if available
+    if hasattr(data, 'lappe_embeddings') and data.lappe_embeddings is not None:
+        lappe_emb = data.lappe_embeddings.to(device)
+        original_dim = input_features.size(1)
+        input_features = torch.cat([input_features, lappe_emb], dim=1)
+        if rank == 0:
+            print(f"Dataset {data.name}: Concatenated LapPE embeddings ({original_dim}D + {lappe_emb.size(1)}D = {input_features.size(1)}D)")
+
+    # RWSE Enhancement: Concatenate Random Walk SE if available
+    if hasattr(data, 'rwse_embeddings') and data.rwse_embeddings is not None:
+        rwse_emb = data.rwse_embeddings.to(device)
+        original_dim = input_features.size(1)
+        input_features = torch.cat([input_features, rwse_emb], dim=1)
+        if rank == 0:
+            print(f"Dataset {data.name}: Concatenated RWSE embeddings ({original_dim}D + {rwse_emb.size(1)}D = {input_features.size(1)}D)")
+
     # Identity projection approach - PCA to small_dim, then project to large_dim
     if use_identity_projection:
         original_dim = input_features.size(1)

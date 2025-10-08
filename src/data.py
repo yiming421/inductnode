@@ -1,4 +1,6 @@
-from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, Twitch, FacebookPagePage
+from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit2, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
+from src.twitch_dataset import TwitchFixed
+from src.heterophilous_dataset import HeterophilousGraphDataset
 from torch_geometric.data import Data
 from ogb.nodeproppred import PygNodePropPredDataset
 from torch_sparse import SparseTensor
@@ -165,6 +167,68 @@ def get_project_root():
     # The root is 'inductnode', which is one level up from 'inductnode/src'
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
+def rebalance_splits_for_pretraining(split_idx, strategy='smallest_for_valid'):
+    """
+    Rebalance splits for pretraining data efficiency.
+
+    Args:
+        split_idx: Dict with 'train', 'valid', 'test' keys
+        strategy:
+            - 'smallest_for_valid': Use smallest split for validation, rest for training (NEW, recommended)
+            - 'legacy': Use train+valid for training, test for validation (OLD, problematic for large test sets)
+            - 'original': Keep original splits unchanged
+
+    Returns:
+        Rebalanced split_idx dict
+    """
+    if strategy == 'original':
+        return split_idx
+
+    train_size = len(split_idx['train'])
+    valid_size = len(split_idx['valid'])
+    test_size = len(split_idx['test'])
+
+    if strategy == 'smallest_for_valid':
+        # Find smallest split
+        sizes = {'train': train_size, 'valid': valid_size, 'test': test_size}
+        smallest_split = min(sizes, key=sizes.get)
+
+        print(f"  [Split Rebalance] Original - Train: {train_size:,} | Valid: {valid_size:,} | Test: {test_size:,}")
+        print(f"  [Split Rebalance] Using '{smallest_split}' ({sizes[smallest_split]:,} nodes) for validation")
+
+        # Use smallest for validation, combine others for training
+        valid_idx = split_idx[smallest_split]
+
+        # Combine all non-validation indices for training
+        all_idx = torch.cat([split_idx['train'], split_idx['valid'], split_idx['test']])
+        all_set = set(all_idx.tolist())
+        valid_set = set(valid_idx.tolist())
+        train_set = all_set - valid_set
+        train_idx = torch.tensor(sorted(list(train_set)))
+
+        new_split = {
+            'train': train_idx,
+            'valid': valid_idx,
+            'test': valid_idx  # Use same as valid (not used in pretraining)
+        }
+
+        print(f"  [Split Rebalance] New      - Train: {len(train_idx):,} | Valid: {len(valid_idx):,}")
+        return new_split
+
+    elif strategy == 'legacy':
+        # Old behavior: train+valid for training, test for validation
+        train_idx = torch.cat([split_idx['train'], split_idx['valid']])
+        valid_idx = split_idx['test']
+        test_idx = split_idx['test']
+
+        print(f"  [Split Rebalance] Legacy mode - Train: {len(train_idx):,} (train+valid) | Valid: {len(valid_idx):,} (test)")
+
+        return {'train': train_idx, 'valid': valid_idx, 'test': test_idx}
+
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+
 def load_ogbn_data(dataset):
     name = dataset
     dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
@@ -176,7 +240,17 @@ def load_ogbn_data(dataset):
     data.y = data.y.squeeze()
     return data, split_idx
 
-def load_ogbn_data_train(dataset):
+def load_ogbn_data_train(dataset, split_strategy='smallest_for_valid'):
+    """
+    Load OGB node dataset for pretraining.
+
+    Args:
+        dataset: Dataset name (e.g., 'ogbn-products')
+        split_strategy: How to rebalance splits for pretraining
+            - 'smallest_for_valid': Use smallest split for validation, rest for training (recommended)
+            - 'legacy': Use train+valid for training, test for validation (old behavior)
+            - 'original': Keep original splits
+    """
     name = dataset
     dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
     data = dataset[0]
@@ -185,10 +259,10 @@ def load_ogbn_data_train(dataset):
     split_idx = dataset.get_idx_split()
     data.name = name
     data.y = data.y.squeeze()
-    train_idx = torch.cat([split_idx['train'], split_idx['valid']])
-    valid_idx = split_idx['test']
-    test_idx = split_idx['test']
-    split_idx = {'train': train_idx, 'valid': valid_idx, 'test': test_idx}
+
+    # Rebalance splits using the specified strategy
+    split_idx = rebalance_splits_for_pretraining(split_idx, strategy=split_strategy)
+
     return data, split_idx
 
 def load_text_enhanced_dataset(dataset_name: str):
@@ -232,6 +306,7 @@ def load_data_train(dataset_name: str):
         return data, split_idx
     # --- 2. Load the dataset using its specific loader ---
     root = os.path.join(get_project_root(), 'dataset')
+    print(f"Loading dataset {dataset_name} from root {root}", flush=True)
     if dataset_name in ['Cora', 'Citeseer', 'Pubmed']:
         dataset = Planetoid(root=root, name=dataset_name)
     elif dataset_name == 'WikiCS':
@@ -240,8 +315,9 @@ def load_data_train(dataset_name: str):
         dataset = Coauthor(root=os.path.join(root, 'Coauthor'), name=dataset_name)
     elif dataset_name in ['Computers', 'Photo']:
         dataset = Amazon(root=os.path.join(root, 'Amazon'), name=dataset_name)
-    elif dataset_name == 'Reddit':
-        dataset = Reddit(root=os.path.join(root, 'Reddit'))
+    elif dataset_name == 'Reddit2':
+        print('[DEBUG]: Using Reddit2 dataset loader')
+        dataset = Reddit2(root=os.path.join(root, 'Reddit2'))
     elif dataset_name == 'Flickr':
         flickr_root = os.path.join(root, 'Flickr')
         
@@ -277,9 +353,11 @@ def load_data_train(dataset_name: str):
     elif dataset_name.startswith('Twitch-'):
         # Extract region from dataset name (e.g., 'Twitch-DE' -> 'DE')
         region = dataset_name.split('-')[1]
-        dataset = Twitch(root=os.path.join(root, 'Twitch'), name=region)
+        dataset = TwitchFixed(root=os.path.join(root, 'Twitch'), name=region)
     elif dataset_name == 'FacebookPagePage':
         dataset = FacebookPagePage(root=os.path.join(root, 'FacebookPagePage'))
+    elif dataset_name in ['Roman-empire', 'Amazon-ratings', 'Minesweeper', 'Tolokers', 'Questions']:
+        dataset = HeterophilousGraphDataset(root=os.path.join(root, 'HeterophilousGraphs'), name=dataset_name)
     elif dataset_name == 'MAG240M':
         # Load MAG240M subset directly
         data, split_idx = load_mag240m_subset()
@@ -374,6 +452,8 @@ def load_data(dataset):
         return data, split_idx
     elif dataset == 'FacebookPagePage':
         dataset = FacebookPagePage(root=os.path.join(get_project_root(), 'dataset', 'FacebookPagePage'))
+    elif dataset in ['Roman-empire', 'Amazon-ratings', 'Minesweeper', 'Tolokers', 'Questions']:
+        dataset = HeterophilousGraphDataset(root=os.path.join(get_project_root(), 'dataset', 'HeterophilousGraphs'), name=dataset)
     elif dataset == 'MAG240M':
         # Load MAG240M subset directly
         data, split_idx = load_mag240m_subset()
@@ -419,21 +499,106 @@ def expand_dataset_names(train_datasets):
             expanded_datasets.append(dataset)
     return expanded_datasets
 
-def load_all_data_train(train_datasets):
+def load_all_data_train(train_datasets, split_strategy='smallest_for_valid'):
+    """
+    Load training datasets with optional split rebalancing.
+
+    Args:
+        train_datasets: List of dataset names
+        split_strategy: Strategy for rebalancing splits (passed to load_ogbn_data_train)
+    """
     # Expand any special dataset names first
     expanded_datasets = expand_dataset_names(train_datasets)
-    
+
     data_list = []
     split_idx_list = []
     for dataset in expanded_datasets:
         print(dataset, flush=True)
         if dataset.startswith('ogbn-'):
-            data, split_edge = load_ogbn_data_train(dataset)
+            data, split_edge = load_ogbn_data_train(dataset, split_strategy=split_strategy)
         else:
             data, split_edge = load_data_train(dataset)
         data_list.append(data)
         split_idx_list.append(split_edge)
     return data_list, split_idx_list
+
+
+def attach_gpse_embeddings(data_list, dataset_names, gpse_dir='../GPSE/datasets', verbose=False,
+                          use_gpse=False, use_lappe=False, use_rwse=False):
+    """
+    Attach GPSE, LapPE, and/or RWSE embeddings to loaded datasets.
+
+    Args:
+        data_list: List of PyG Data objects
+        dataset_names: List of dataset names corresponding to data_list
+        gpse_dir: Directory containing GPSE/LapPE/RWSE embeddings
+        verbose: Print loading information
+        use_gpse: Whether to load GPSE embeddings
+        use_lappe: Whether to load LapPE embeddings
+        use_rwse: Whether to load RWSE embeddings
+
+    Returns:
+        Number of datasets successfully enhanced
+    """
+    from .gpse_loader import GPSEEmbeddingLoader
+
+    loader = GPSEEmbeddingLoader(gpse_dir, verbose=verbose)
+    success_count = 0
+
+    for data, dataset_name in zip(data_list, dataset_names):
+        enhanced = False
+
+        # GPSE
+        if use_gpse:
+            try:
+                loader.attach_gpse_to_data(data, dataset_name)
+                enhanced = True
+                if verbose:
+                    print(f"  [GPSE] ✓ Enhanced {dataset_name}")
+            except FileNotFoundError:
+                if verbose:
+                    print(f"  [GPSE] ⚠ Skipping {dataset_name} (embeddings not found)")
+            except Exception as e:
+                print(f"  [GPSE] ✗ Error loading {dataset_name}: {e}")
+
+        # LapPE
+        if use_lappe:
+            try:
+                loader.attach_lappe_to_data(data, dataset_name)
+                enhanced = True
+                if verbose:
+                    print(f"  [LapPE] ✓ Enhanced {dataset_name}")
+            except FileNotFoundError:
+                if verbose:
+                    print(f"  [LapPE] ⚠ Skipping {dataset_name} (embeddings not found)")
+            except Exception as e:
+                print(f"  [LapPE] ✗ Error loading {dataset_name}: {e}")
+
+        # RWSE
+        if use_rwse:
+            try:
+                loader.attach_rwse_to_data(data, dataset_name)
+                enhanced = True
+                if verbose:
+                    print(f"  [RWSE] ✓ Enhanced {dataset_name}")
+            except FileNotFoundError:
+                if verbose:
+                    print(f"  [RWSE] ⚠ Skipping {dataset_name} (embeddings not found)")
+            except Exception as e:
+                print(f"  [RWSE] ✗ Error loading {dataset_name}: {e}")
+
+        if enhanced:
+            success_count += 1
+
+    if verbose:
+        pe_types = []
+        if use_gpse: pe_types.append('GPSE')
+        if use_lappe: pe_types.append('LapPE')
+        if use_rwse: pe_types.append('RWSE')
+        pe_str = '+'.join(pe_types) if pe_types else 'None'
+        print(f"  [{pe_str}] Enhanced {success_count}/{len(data_list)} datasets")
+
+    return success_count
 
 def load_products_subset():
     """Load Products subset dataset"""

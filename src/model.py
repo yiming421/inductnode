@@ -210,8 +210,6 @@ class PureGCN_v1(nn.Module):
 
         # Add virtual node to graph if enabled (only for graph-level tasks with batch info)
         if self.use_virtual_node and batch is not None:
-            vn_start = time.perf_counter()
-
             num_nodes = x.size(0)
             num_graphs = int(batch.max().item()) + 1
 
@@ -242,16 +240,6 @@ class PureGCN_v1(nn.Module):
             # Create new SparseTensor (symmetric and coalesced like original)
             adj_t = SparseTensor(row=edge_index_full[0], col=edge_index_full[1],
                                 sparse_sizes=(x.size(0), x.size(0))).to_symmetric().coalesce()
-
-            vn_time = (time.perf_counter() - vn_start) * 1000  # Convert to ms
-            if not hasattr(self, '_vn_time_samples'):
-                self._vn_time_samples = []
-            self._vn_time_samples.append(vn_time)
-
-            # Log periodically (every 100 forward passes)
-            if len(self._vn_time_samples) % 100 == 0:
-                avg_time = sum(self._vn_time_samples[-100:]) / 100
-                print(f"[VN_TIME] Virtual node overhead: {avg_time:.3f}ms (avg over 100 batches)")
 
         ori = x
         for i in range(self.num_layers):

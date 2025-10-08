@@ -377,12 +377,48 @@ def parse_joint_training_args():
     parser.add_argument('--feature_dropout_type', type=str, default='channel_wise',
                        choices=['element_wise', 'channel_wise', 'gaussian_noise'],
                        help='Type of feature dropout: element_wise, channel_wise, or gaussian_noise')
+
+    # === GPSE Embeddings ===
+    parser.add_argument('--use_gpse', type=str2bool, default=False,
+                       help='Use GPSE (Graph Positional and Structural Encoder) embeddings to enhance node features')
+    parser.add_argument('--gpse_dir', type=str, default='../GPSE/datasets',
+                       help='Directory containing pre-computed GPSE embeddings')
+    parser.add_argument('--gpse_verbose', type=str2bool, default=False,
+                       help='Print GPSE loading information')
+    parser.add_argument('--use_lappe', type=str2bool, default=False,
+                       help='Use Laplacian Positional Encoding (top-k eigenvectors of graph Laplacian)')
+    parser.add_argument('--use_rwse', type=str2bool, default=False,
+                       help='Use Random Walk Structural Encoding (return probabilities after k steps)')
     parser.add_argument('--verbose_feature_dropout', type=str2bool, default=False,
                        help='Print feature dropout timing and statistics')
 
     # === External Embeddings (FUG) ===
     parser.add_argument('--use_external_embeddings_nc', type=str2bool, default=False,
                        help='Use external embeddings for node classification (load from fug_root)')
+
+    # === Mini-Batch Sampling for Large Datasets ===
+    parser.add_argument('--use_minibatch_sampling', type=str2bool, default=True,
+                       help='Enable mini-batch sampling with NeighborLoader for large datasets')
+    parser.add_argument('--minibatch_node_threshold', type=int, default=1000000,
+                       help='Datasets with more nodes than this threshold will use mini-batch sampling')
+    parser.add_argument('--minibatch_batch_size', type=int, default=1024,
+                       help='Batch size for mini-batch sampling (nodes per batch)')
+    parser.add_argument('--minibatch_num_neighbors', type=str, default='8,6,4,3,2',
+                       help='Number of neighbors to sample per layer (comma-separated, outer to inner). Will be capped at 5 layers.')
+    parser.add_argument('--minibatch_batches_per_epoch', type=int, default=50,
+                       help='Number of batches to sample per epoch for large datasets')
+    parser.add_argument('--minibatch_num_workers', type=int, default=2,
+                       help='Number of worker threads for parallel batch loading')
+
+    # === Split Rebalancing for Pretraining ===
+    parser.add_argument('--split_rebalance_strategy', type=str, default='legacy',
+                       choices=['smallest_for_valid', 'legacy', 'original'],
+                       help='How to rebalance dataset splits for pretraining: '
+                            'smallest_for_valid (use smallest split for validation), '
+                            'legacy (train+valid for training, test for validation), '
+                            'original (keep original splits)')
+    parser.add_argument('--eval_max_batches', type=int, default=100,
+                       help='Maximum number of batches for mini-batch evaluation (0 = no limit, evaluate all)')
 
     # === Link Prediction Specific ===
     parser.add_argument('--context_neg_ratio', type=int, default=3, help='Negative sampling ratio for context')
@@ -405,6 +441,8 @@ def parse_joint_training_args():
     # === OGB FUG embeddings arguments (for graph classification) ===
     parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
                         help='Use OGB datasets with FUG embeddings (replaces node features with FUG molecular embeddings)')
+    parser.add_argument('--use_original_features', type=str2bool, default=False,
+                        help='Use original OGB raw features (9-dim) instead of FUG embeddings. Will be processed with PCA/padding to hidden_dim.')
     parser.add_argument('--fug_root', type=str, default='./fug',
                         help='Root directory for FUG embeddings')
     parser.add_argument('--ogb_root', type=str, default='./dataset/ogb',
