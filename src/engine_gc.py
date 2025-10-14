@@ -10,7 +10,7 @@ from torch_geometric.nn import global_mean_pool, global_max_pool, global_add_poo
 from torch_sparse import SparseTensor
 import gc
 from sklearn.metrics import roc_auc_score, average_precision_score
-from .data_graph import create_graph_batch, create_task_filtered_datasets
+from .data_gc import create_graph_batch, create_task_filtered_datasets
 from .utils import process_node_features
 from .data_utils import batch_edge_dropout, feature_dropout
 import numpy as np
@@ -77,7 +77,7 @@ def refresh_gc_context_graphs(dataset_info, args, device):
     """
     Refresh context graphs structure by resampling context graphs for each task/class.
     """
-    from .data_graph import prepare_graph_data_for_pfn
+    from .data_gc import prepare_graph_data_for_pfn
     
     if 'context_graphs' not in dataset_info:
         return
@@ -101,13 +101,13 @@ def _get_node_embedding_table(dataset, task_idx, device, dataset_info=None):
     Get the node embedding table for a dataset.
     Under the new unified setting, all datasets just have dataset.node_embs.
     For FUG datasets with external mapping, use the FUG embedding table.
-    
+
     Args:
         dataset: Dataset with node_embs attribute
         task_idx: Task index (unused)
         device: Target device
         dataset_info: Optional dataset info containing FUG mapping
-        
+
     Returns:
         torch.Tensor: Node embedding table [N_nodes, emb_dim]
     """
@@ -116,11 +116,11 @@ def _get_node_embedding_table(dataset, task_idx, device, dataset_info=None):
         fug_mapping = dataset_info['fug_mapping']
         if fug_mapping and 'node_embs' in fug_mapping:
             return fug_mapping['node_embs']  # Keep on CPU, move batches as needed
-    
+
     # Fallback to regular dataset embeddings
     if hasattr(dataset, 'node_embs') and dataset.node_embs is not None:
         return dataset.node_embs.to(device)
-    
+
     print(f"[ERROR] No node_embs found in dataset - expected under unified setting")
     return None
 
@@ -129,21 +129,19 @@ def _safe_lookup_node_embeddings_micro_optimized(node_emb_table: torch.Tensor, x
                                                 batch_data=None, dataset_info=None) -> torch.Tensor:
     """
     Micro-transfer optimized version - eliminates thousands of GPU-CPU transfers.
-    Same algorithm as original but with only 2 transfers total instead of 40,000+.
+    Handles external mapping for both OGB (integer features) and TU (float features).
     """
     import numpy as np
-    
-    # Case 4: FUG external mapping - handle original OGB features  
-    if (dataset_info and 'fug_mapping' in dataset_info and 
-        x.dim() == 2 and x.size(1) > 1 and not x.dtype.is_floating_point):
-        
-            
+
+    # External mapping for FUG/Original Features - works for both OGB integer and TU float features
+    # NOTE: x can be ANY shape when using external mapping - we don't use x values, only graph indices
+    if dataset_info and 'fug_mapping' in dataset_info:
         if batch_data is None or not hasattr(batch_data, 'original_graph_indices'):
             raise ValueError(f"[FUG] Batch data with original_graph_indices required for external mapping in {context}")
-        
+
         fug_mapping = dataset_info['fug_mapping']
         node_mapping = fug_mapping['node_index_mapping']
-        
+
         # 1. Single GPU->CPU transfer for original graph indices
         original_indices_cpu = batch_data.original_graph_indices.cpu()
 
@@ -159,39 +157,40 @@ def _safe_lookup_node_embeddings_micro_optimized(node_emb_table: torch.Tensor, x
 
         # 4. Perform the SINGLE, vectorized embedding lookup on the CPU table.
         processed_embeddings_cpu = node_emb_table[all_fug_indices_cpu]
-        
+
         # --- Optional Sanity Check ---
         if processed_embeddings_cpu.shape[0] != x.shape[0]:
-             raise ValueError(f"[FUG] Size mismatch after mapping.")
-             
+             raise ValueError(f"[FUG] Size mismatch after mapping: got {processed_embeddings_cpu.shape[0]} embeddings for {x.shape[0]} nodes")
+
         # 5. Transfer the final result to the GPU in one go.
         target_device = x.device if x.numel() > 0 else 'cuda'
         result = processed_embeddings_cpu.to(target_device)
-        
-        
+
+
         return result
-    
-    # For non-FUG cases, fall back to original implementation
-    return _safe_lookup_node_embeddings_original(node_emb_table, x, context, batch_data, dataset_info)
+
+    # Should never reach here if called correctly from _safe_lookup_node_embeddings
+    raise ValueError(f"[FUG] _safe_lookup_node_embeddings_micro_optimized called without FUG mapping in {context}")
 
 
-def _safe_lookup_node_embeddings(node_emb_table: torch.Tensor, x: torch.Tensor, context: str="", 
+def _safe_lookup_node_embeddings(node_emb_table: torch.Tensor, x: torch.Tensor, context: str="",
                                  batch_data=None, dataset_info=None) -> torch.Tensor:
     """Return embedded node features ensuring indices are valid.
     Handles cases:
-      1) x already is an embedding matrix (float, 2D) -> return as-is.
-      2) x is Long indices (1D or [N,1]) -> validate range then index.
-      3) x is numeric but not long -> cast after verifying integral values.
-      4) FUG: x is original OGB features (2D, non-float) -> use external mapping.
+      1) FUG/Original Features: Use external mapping (both integer OGB and float TU features)
+      2) x already is an embedding matrix (float, 2D) -> return as-is.
+      3) x is Long indices (1D or [N,1]) -> validate range then index.
+      4) x is numeric but not long -> cast after verifying integral values.
     Raises a clear Python exception instead of triggering a CUDA device-side assert.
     """
-    
-    # For FUG cases, use the micro-optimized version
-    if (dataset_info and 'fug_mapping' in dataset_info and 
-        x.dim() == 2 and x.size(1) > 1 and not x.dtype.is_floating_point):
+    # CRITICAL: Check for FUG/original features mapping FIRST (handles both OGB integer and TU float features)
+    # NOTE: For datasets with external mapping, x can be ANY shape (including [N,1] for single-feature datasets)
+    # The actual embeddings are in fug_mapping['node_embs'], so we use graph indices to lookup
+    if dataset_info and 'fug_mapping' in dataset_info:
+        # Use micro-optimized version for external mapping (works for both int and float raw features)
         return _safe_lookup_node_embeddings_micro_optimized(node_emb_table, x, context, batch_data, dataset_info)
-    
-    # Case 1: already embedded (float & 2D & width not 1)
+
+    # Case 1: already embedded (float & 2D & width not 1) - ONLY if no FUG mapping
     if x.dim() == 2 and x.size(1) > 1 and x.dtype.is_floating_point:
         return x  # Already features / embeddings
     # Squeeze [N,1]
@@ -618,7 +617,7 @@ def train_graph_classification_full_batch(model, predictor, train_dataset_info, 
     dataset_batches = 0
     
     # Create unfiltered data loader - use ALL graphs in training set
-    from .data_graph import create_data_loaders
+    from .data_gc import create_data_loaders
     # Check if FUG mapping is present to use index tracking
     use_fug_tracking = 'fug_mapping' in train_dataset_info
     data_loaders = create_data_loaders(
@@ -1321,7 +1320,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
     Returns:
         dict: Final results for all datasets
     """
-    from .data_graph import create_data_loaders
+    from .data_gc import create_data_loaders
     
     if len(train_datasets) == 0:
         raise ValueError("No training datasets provided")
@@ -1429,7 +1428,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                     # Check if FUG mapping is present to use index tracking
                     use_fug_tracking = 'fug_mapping' in train_dataset_info
                     task_data_loaders = create_data_loaders(
-                        train_dataset_info['dataset'], 
+                        train_dataset_info['dataset'],
                         task_splits,
                         batch_size=args.batch_size,
                         shuffle=True,

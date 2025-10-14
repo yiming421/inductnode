@@ -334,7 +334,7 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
 
         else:
             # Full-batch: delegate to original train() function
-            from src.engine import train
+            from src.engine_nc import train
             data = batch  # batch is actually full data
             train_idx = split_idx['train']
 

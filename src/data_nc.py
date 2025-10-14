@@ -1,6 +1,6 @@
 from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit2, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
-from src.twitch_dataset import TwitchFixed
-from src.heterophilous_dataset import HeterophilousGraphDataset
+from src.dataset_twitch import TwitchFixed
+from src.dataset_heterophilous import HeterophilousGraphDataset
 from torch_geometric.data import Data
 from ogb.nodeproppred import PygNodePropPredDataset
 from torch_sparse import SparseTensor
@@ -540,7 +540,7 @@ def attach_gpse_embeddings(data_list, dataset_names, gpse_dir='../GPSE/datasets'
     Returns:
         Number of datasets successfully enhanced
     """
-    from .gpse_loader import GPSEEmbeddingLoader
+    from .data_gpse import GPSEEmbeddingLoader
 
     loader = GPSEEmbeddingLoader(gpse_dir, verbose=verbose)
     success_count = 0

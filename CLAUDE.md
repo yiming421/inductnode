@@ -1,0 +1,2 @@
+- Try `source /home/maweishuo/miniconda3/etc/profile.d/conda.sh` and `conda activate gnn` before run a program that need `torch`.
+- Always write comprehensive unit tests for complex functions.

@@ -55,7 +55,7 @@ def load_ogb_fug_dataset_minimal(name, ogb_root='./dataset/ogb', fug_root='./fug
     Returns:
         (dataset, fug_mapping_minimal) or None if failed
     """
-    from .data_fug import load_ogb_fug_dataset
+    from .data_graph_fug_simple import load_ogb_fug_dataset
     
     # Dataset name mapping (same as original)
     ogb_names = {
@@ -153,7 +153,7 @@ def load_dataset_cache_aware(name, root='./dataset', embedding_family='ST', hidd
     Returns:
         Same as original load_dataset but with potential memory savings
     """
-    from .data_gc import load_dataset
+    from .data_graph import load_dataset
     
     # Check if PCA cache exists for this dataset
     use_cache_mode = False
@@ -193,7 +193,7 @@ def load_all_graph_datasets_cache_aware(dataset_names, device='cuda', pretrainin
     Returns:
         Same as original but with potential 95% memory reduction
     """
-    from .data_gc import create_dataset_splits, prepare_graph_data_for_pfn
+    from .data_graph import create_dataset_splits, prepare_graph_data_for_pfn
     
     import time
     overall_start = time.time()

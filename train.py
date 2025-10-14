@@ -18,20 +18,20 @@ from sknetwork.ranking import PageRank
 from torch_geometric.utils import to_scipy_sparse_matrix
 
 # Add the project root to the Python path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+project_root = os.path.abspath(os.path.dirname(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Core imports - reuse from existing scripts
 from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN
-from src.data import load_all_data, load_all_data_train
-from src.data_link import load_all_data_link
-from src.data_graph import load_all_graph_datasets, process_graph_features, create_data_loaders, create_task_filtered_datasets
+from src.data_nc import load_all_data, load_all_data_train
+from src.data_lp import load_all_data_link
+from src.data_gc import load_all_graph_datasets, process_graph_features, create_data_loaders, create_task_filtered_datasets
 from src.data_utils import process_data, prepare_link_data, select_link_context, process_link_data
-from src.minibatch_loader import MiniBatchNCLoader, compute_nc_loss_with_loader
-from src.engine import train_all, test_all, test_all_induct  # Node classification engines
-from src.engine_link_pred import train_link_prediction, evaluate_link_prediction  # Link prediction engines
-from src.engine_graph import (
+from src.data_minibatch import MiniBatchNCLoader, compute_nc_loss_with_loader
+from src.engine_nc import train_all, test_all, test_all_induct  # Node classification engines
+from src.engine_lp import train_link_prediction, evaluate_link_prediction  # Link prediction engines
+from src.engine_gc import (
     train_graph_classification_single_task,
     evaluate_graph_classification_single_task,
     aggregate_task_metrics,
@@ -877,8 +877,18 @@ def setup_graph_dataset_environment(args):
         os.environ.pop('TAG_DATASET_ROOT', None)
         return
         
-    # Priority: FUG > TAGDataset > TSGFM
-    if hasattr(args, 'use_ogb_fug') and args.use_ogb_fug:
+    # Priority: Original Features > FUG > TAGDataset > TSGFM
+    if hasattr(args, 'use_original_features') and args.use_original_features:
+        print(f"Enabling ORIGINAL FEATURES for graph classification")
+        print(f"OGB root: {args.ogb_root}, TU root: ./dataset/TU")
+        os.environ['USE_ORIGINAL_FEATURES'] = '1'
+        os.environ['OGB_ROOT'] = args.ogb_root
+        os.environ['TU_ROOT'] = './dataset/TU'
+        # Clear other embedding settings
+        os.environ.pop('USE_FUG_EMB', None)
+        os.environ.pop('TAG_DATASET_ROOT', None)
+
+    elif hasattr(args, 'use_ogb_fug') and args.use_ogb_fug:
         print(f"Enabling OGB FUG embeddings for graph classification")
         print(f"FUG root: {args.fug_root}, OGB root: {args.ogb_root}")
         os.environ['USE_FUG_EMB'] = '1'
@@ -886,7 +896,8 @@ def setup_graph_dataset_environment(args):
         os.environ['OGB_ROOT'] = args.ogb_root
         # Clear other embedding settings
         os.environ.pop('TAG_DATASET_ROOT', None)
-        
+        os.environ.pop('USE_ORIGINAL_FEATURES', None)
+
     elif hasattr(args, 'use_tag_dataset') and args.use_tag_dataset:
         print(f"Enabling TAGDataset embeddings for graph classification")
         print(f"TAGDataset root: {args.tag_dataset_root}, Embedding family: {args.embedding_family}")
@@ -953,7 +964,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
             )
         
         processed_datasets.append(dataset)
-        
+
         # Update dataset info with processing information
         dataset_info.update(processing_info)
     
@@ -1358,17 +1369,27 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         if not skip_training_data:
             if gc_tracker:
                 gc_tracker.log_memory("gc_train_data_loading_start")
-            
-            # Use cache-aware loading for training data
-            from src.data_graph_cache_aware import load_all_graph_datasets_cache_aware
-            try:
-                gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets_cache_aware(
-                    gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num,
-                    hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
-                )
-                print(f"✅ Used cache-aware loading for training datasets")
-            except ImportError:
-                print(f"⚠️  Cache-aware module not available, using standard loading")
+
+            # Use cache-aware loading ONLY for FUG embeddings (not for original features)
+            use_cache_aware = (hasattr(args, 'use_ogb_fug') and args.use_ogb_fug) and \
+                              not (hasattr(args, 'use_original_features') and args.use_original_features)
+
+            if use_cache_aware:
+                from src.data_graph_cache_aware import load_all_graph_datasets_cache_aware
+                try:
+                    gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets_cache_aware(
+                        gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num,
+                        hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
+                    )
+                    print(f"✅ Used cache-aware loading for training datasets")
+                except ImportError:
+                    print(f"⚠️  Cache-aware module not available, using standard loading")
+                    gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets(
+                        gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num
+                    )
+            else:
+                # Standard loading for original features (no PCA cache needed)
+                print(f"Using standard loading (original features, no PCA cache)")
                 gc_train_data_list, gc_train_processed_data_list = load_all_graph_datasets(
                     gc_train_datasets, device, pretraining_mode=True, context_k=args.context_graph_num
                 )
@@ -1403,48 +1424,62 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         # Load test data for graph classification
         if gc_tracker:
             gc_tracker.log_memory("gc_test_data_loading_start")
-            
+
         # Handle per-dataset context resolution for GC test datasets
         gc_test_data_list = []
         gc_test_processed_data_list = []
-        
-        # Use cache-aware loading for test datasets
-        from src.data_graph_cache_aware import load_all_graph_datasets_cache_aware, check_pca_cache_availability
-        
-        # Check cache status for all test datasets
-        cache_status = check_pca_cache_availability(gc_test_datasets, args.hidden, args.pca_cache_dir)
-        cache_hits = sum(cache_status.values())
-        total_datasets = len(gc_test_datasets)
-        print(f"📊 Test Dataset Cache Status: {cache_hits}/{total_datasets} datasets have PCA cache")
-        
-        # Estimate potential memory savings
-        if cache_hits > 0:
-            estimated_savings = cache_hits * 48  # Rough estimate: 48GB per dataset
-            print(f"🎉 Estimated memory savings: ~{estimated_savings}GB!")
-        
+
+        # Use cache-aware loading ONLY for FUG embeddings (not for original features)
+        use_cache_aware = (hasattr(args, 'use_ogb_fug') and args.use_ogb_fug) and \
+                          not (hasattr(args, 'use_original_features') and args.use_original_features)
+
+        if use_cache_aware:
+            # Use cache-aware loading for test datasets
+            from src.data_graph_cache_aware import load_all_graph_datasets_cache_aware, check_pca_cache_availability
+
+            # Check cache status for all test datasets
+            cache_status = check_pca_cache_availability(gc_test_datasets, args.hidden, args.pca_cache_dir)
+            cache_hits = sum(cache_status.values())
+            total_datasets = len(gc_test_datasets)
+            print(f"📊 Test Dataset Cache Status: {cache_hits}/{total_datasets} datasets have PCA cache")
+
+            # Estimate potential memory savings
+            if cache_hits > 0:
+                estimated_savings = cache_hits * 48  # Rough estimate: 48GB per dataset
+                print(f"🎉 Estimated memory savings: ~{estimated_savings}GB!")
+        else:
+            print(f"Using standard loading for test datasets (original features, no PCA cache)")
+
         for dataset_name in gc_test_datasets:
             dataset_name = dataset_name.strip()
             if gc_tracker:
                 gc_tracker.log_memory(f"gc_test_dataset_{dataset_name}_loading_start")
-                
+
             # Resolve context shots for this specific dataset
             context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch=None)
-            
-            # Use cache-aware loading for individual datasets
-            try:
-                single_data_list, single_processed_list = load_all_graph_datasets_cache_aware(
-                    [dataset_name], device, context_k=context_shots,
-                    hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
-                )
-                cache_used = cache_status.get(dataset_name, False)
-                memory_status = " (🚀 Cache used - 48GB saved!)" if cache_used else " (Full loading)"
-                print(f"  {dataset_name}: Loaded{memory_status}")
-            except ImportError:
-                print(f"⚠️  Cache-aware module not available for {dataset_name}, using standard loading")
+
+            # Use cache-aware loading only for FUG, standard loading for original features
+            if use_cache_aware:
+                try:
+                    single_data_list, single_processed_list = load_all_graph_datasets_cache_aware(
+                        [dataset_name], device, context_k=context_shots,
+                        hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
+                    )
+                    cache_used = cache_status.get(dataset_name, False)
+                    memory_status = " (🚀 Cache used - 48GB saved!)" if cache_used else " (Full loading)"
+                    print(f"  {dataset_name}: Loaded{memory_status}")
+                except ImportError:
+                    print(f"⚠️  Cache-aware module not available for {dataset_name}, using standard loading")
+                    single_data_list, single_processed_list = load_all_graph_datasets(
+                        [dataset_name], device, context_k=context_shots
+                    )
+            else:
+                # Standard loading for original features (no cache)
                 single_data_list, single_processed_list = load_all_graph_datasets(
                     [dataset_name], device, context_k=context_shots
                 )
-            
+                print(f"  {dataset_name}: Loaded (original features, no cache)")
+
             gc_test_data_list.extend(single_data_list)
             gc_test_processed_data_list.extend(single_processed_list)
             
@@ -1706,12 +1741,12 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
             # Train on each task separately using prefiltered data
             for task_idx, task_splits in task_filtered_splits.items():
                 gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_task_{task_idx}_start")
-                
+
                 # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
-                use_index_tracking = ('fug_mapping' in dataset_info or 
-                                    'tsgfm_mapping' in dataset_info or 
+                use_index_tracking = ('fug_mapping' in dataset_info or
+                                    'tsgfm_mapping' in dataset_info or
                                     'tag_mapping' in dataset_info)
-                
+
                 # Create task-specific data loaders
                 task_data_loaders = create_data_loaders(
                     dataset_info['dataset'], 
@@ -1814,7 +1849,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                 # Check if we should use mini-batch evaluation
                 if nc_loaders is not None and len(nc_loaders) > 0:
                     # Use mini-batch evaluation
-                    from src.minibatch_loader import evaluate_with_loader
+                    from src.data_minibatch import evaluate_with_loader
                     device = next(model.parameters()).device
                     eval_accs = []
 
@@ -1828,7 +1863,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                             eval_accs.append(eval_acc)
                         else:
                             # Fall back to full-batch for small datasets
-                            from src.engine import test
+                            from src.engine_nc import test
                             _, eval_acc, _ = test(
                                 model, predictor, loader.data, split_idx['train'], split_idx['valid'], split_idx['test'],
                                 args.test_batch_size, False, None, None, True, None, 0, identity_projection

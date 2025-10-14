@@ -7,8 +7,8 @@ Supports both TUDataset and TSGFM datasets with text features.
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
-from torch_geometric.datasets import TUDataset
-from torch_geometric.transforms import NormalizeFeatures
+from torch_geometric.datasets import TUDataset, GNNBenchmarkDataset, ModelNet, MNISTSuperpixels
+from torch_geometric.transforms import NormalizeFeatures, FaceToEdge
 from torch_geometric.loader import DataLoader
 from torch.utils.data import Subset
 import numpy as np
@@ -22,13 +22,27 @@ import hashlib
 from pathlib import Path
 # FUG-specific loaders moved to separate module
 try:
-    from .data_graph_fug_simple import load_ogb_fug_dataset
+    from .data_fug import load_ogb_fug_dataset, load_ogb_original_features, load_tu_original_features, load_gnn_benchmark_original_features, load_mnist_superpixels_original_features, load_modelnet_original_features
 except ImportError:
     # Fallback if relative import path differs when executed as script
     try:
-        from data_graph_fug_simple import load_ogb_fug_dataset
-    except Exception:
-        load_ogb_fug_dataset = lambda *a, **k: None
+        from data_fug import load_ogb_fug_dataset, load_ogb_original_features, load_tu_original_features, load_gnn_benchmark_original_features, load_mnist_superpixels_original_features, load_modelnet_original_features
+    except ImportError:
+        try:
+            from data_graph_fug_simple import load_ogb_fug_dataset
+            # Set other functions to None if not available
+            load_ogb_original_features = lambda *a, **k: None
+            load_tu_original_features = lambda *a, **k: None
+            load_gnn_benchmark_original_features = lambda *a, **k: None
+            load_mnist_superpixels_original_features = lambda *a, **k: None
+            load_modelnet_original_features = lambda *a, **k: None
+        except Exception:
+            load_ogb_fug_dataset = lambda *a, **k: None
+            load_ogb_original_features = lambda *a, **k: None
+            load_tu_original_features = lambda *a, **k: None
+            load_gnn_benchmark_original_features = lambda *a, **k: None
+            load_mnist_superpixels_original_features = lambda *a, **k: None
+            load_modelnet_original_features = lambda *a, **k: None
 
 
 def load_gpse_embeddings(dataset_name, gpse_base_path="/home/maweishuo/GPSE/datasets"):
@@ -388,12 +402,15 @@ def load_tu_dataset(name, root='../dataset/TU'):
     """
     Load a TUDataset (graph classification benchmark).
     
+    NOTE: TU datasets only support USE_ORIGINAL_FEATURES=1 mode.
+    They do NOT create unified node_embs tables - use load_tu_original_features() in data_fug.py instead.
+    
     Args:
         name (str): Dataset name (e.g., 'MUTAG', 'PROTEINS', 'DD', etc.)
         root (str): Root directory for storing datasets
         
     Returns:
-        dataset: PyTorch Geometric dataset
+        dataset: PyTorch Geometric dataset (with graph.x as actual features, not indices)
     """
     try:
         # Ensure the directory exists
@@ -409,6 +426,63 @@ def load_tu_dataset(name, root='../dataset/TU'):
     except Exception as e:
         print(f"Failed to load TU dataset {name}: {e}")
         return None
+
+
+def load_gnn_benchmark_dataset(name, root='./dataset/GNN_Benchmark', split='train'):
+    """
+    Load a GNNBenchmarkDataset (graph classification benchmark).
+    Concatenates pos (position) features with x when available to match PyG documentation.
+    
+    NOTE: GNN Benchmark datasets only support USE_ORIGINAL_FEATURES=1 mode.
+    They do NOT create unified node_embs tables - use load_gnn_benchmark_original_features() in data_fug.py instead.
+    
+    Args:
+        name (str): Dataset name (e.g., 'MNIST', 'CIFAR10', 'PATTERN', 'CLUSTER', etc.)
+                   Case-insensitive - will be converted to uppercase
+        root (str): Root directory for storing datasets
+        split (str): Which split to load ('train', 'val', 'test')
+        
+    Returns:
+        dataset: PyTorch Geometric dataset with graph.x as actual features (not indices)
+    """
+    try:
+        # Ensure the directory exists
+        os.makedirs(root, exist_ok=True)
+        
+        # GNNBenchmarkDataset expects uppercase names
+        name_upper = name.upper()
+        
+        # Transform to concatenate x and pos when pos is available
+        class ConcatPosTransform:
+            def __call__(self, data):
+                if hasattr(data, 'pos') and data.pos is not None:
+                    data.x = torch.cat([data.x, data.pos], dim=1)
+                return data
+        
+        # Combine NormalizeFeatures and ConcatPos transforms
+        from torch_geometric.transforms import Compose
+        transform = Compose([NormalizeFeatures(), ConcatPosTransform()])
+        
+        # Load the dataset
+        dataset = GNNBenchmarkDataset(root=root, name=name_upper, split=split, transform=transform)
+        
+        print(f"Loaded {name_upper} ({split}): {len(dataset)} graphs, {dataset.num_classes} classes, "
+              f"{dataset.num_node_features} node features")
+        
+        return dataset
+    except Exception as e:
+        print(f"Failed to load GNN Benchmark dataset {name}: {e}")
+        return None
+
+
+# NOTE: TU, GNN Benchmark, ModelNet, and MNISTSuperpixels datasets only support USE_ORIGINAL_FEATURES=1 mode.
+# They do NOT create unified node_embs tables in this file.
+# Use the corresponding *_original_features() loaders in data_fug.py when USE_ORIGINAL_FEATURES=1:
+#   - load_tu_original_features()
+#   - load_gnn_benchmark_original_features()
+#   - load_mnist_superpixels_original_features()
+#   - load_modelnet_original_features()
+# These datasets keep graph.x as actual features (not indices) and use external mapping.
 
 
 def _create_tag_dataset(data, slices, name):
@@ -524,13 +598,18 @@ def load_dataset(name, root='./dataset', embedding_family='ST'):
       3. TSGFM batched format
       4. TU datasets
     """
-    # --- Original OGB features path (9-dim raw features) ---
+    # --- Original features path (raw features from OGB or TU datasets) ---
     if os.environ.get('USE_ORIGINAL_FEATURES', '0') == '1':
         ogb_root = os.environ.get('OGB_ROOT', './dataset/ogb')
+        tu_root = os.environ.get('TU_ROOT', './dataset/TU')
+        gnn_benchmark_root = os.environ.get('GNN_BENCHMARK_ROOT', './dataset/GNN_Benchmark')
+        mnist_superpixels_root = os.environ.get('MNIST_SUPERPIXELS_ROOT', './dataset/MNISTSuperpixels')
 
-        print(f"[Loader] Loading OGB dataset '{name}' with ORIGINAL features (9-dim)")
+        # Try OGB first
+        print(f"[Loader] Loading dataset '{name}' with ORIGINAL features")
+        print(f"[Loader] Trying OGB first...")
 
-        from .data_graph_fug_simple import load_ogb_original_features
+        # Functions imported at module level
         result = load_ogb_original_features(name, ogb_root=ogb_root)
         if result is not None:
             dataset, original_features_mapping = result
@@ -538,8 +617,53 @@ def load_dataset(name, root='./dataset', embedding_family='ST'):
             dataset.name = name
             # Return both dataset and mapping - same format as FUG
             return dataset, original_features_mapping
-        else:
-            print(f"[Loader] Original features loading failed for '{name}'. Continuing...")
+
+        # If OGB fails, try TU datasets
+        print(f"[Loader] OGB loading failed, trying TU dataset...")
+        result = load_tu_original_features(name, tu_root=tu_root)
+        if result is not None:
+            dataset, original_features_mapping = result
+            print(f"[Loader] Successfully loaded TU dataset '{name}' with original features")
+            dataset.name = name
+            # Return both dataset and mapping - same format as OGB/FUG
+            return dataset, original_features_mapping
+        
+        # If TU fails, try GNN Benchmark datasets
+        print(f"[Loader] TU loading failed, trying GNN Benchmark dataset...")
+        result = load_gnn_benchmark_original_features(name, gnn_benchmark_root=gnn_benchmark_root, split='train')
+        if result is not None:
+            dataset, original_features_mapping = result
+            print(f"[Loader] Successfully loaded GNN Benchmark dataset '{name}' with original features")
+            dataset.name = name
+            # Return both dataset and mapping - same format as OGB/TU/FUG
+            return dataset, original_features_mapping
+        
+        # If GNN Benchmark fails, try MNISTSuperpixels
+        if name.lower() == 'mnistsuperpixels':
+            print(f"[Loader] GNN Benchmark loading failed, trying MNISTSuperpixels dataset...")
+            result = load_mnist_superpixels_original_features(root=mnist_superpixels_root, train=True)
+            if result is not None:
+                dataset, original_features_mapping = result
+                print(f"[Loader] Successfully loaded MNISTSuperpixels dataset with original features")
+                dataset.name = name
+                # Return both dataset and mapping - same format as OGB/TU/GNN Benchmark/FUG
+                return dataset, original_features_mapping
+
+        # If MNISTSuperpixels fails, try ModelNet
+        if name.lower() in ['modelnet10', 'modelnet40']:
+            print(f"[Loader] Trying ModelNet dataset...")
+            modelnet_root = os.environ.get('MODELNET_ROOT', './dataset/ModelNet')
+            # Extract variant ('10' or '40')
+            variant = '10' if '10' in name.lower() else '40'
+            result = load_modelnet_original_features(name=variant, modelnet_root=modelnet_root, train=True)
+            if result is not None:
+                dataset, original_features_mapping = result
+                print(f"[Loader] Successfully loaded ModelNet{variant} dataset with original features")
+                dataset.name = name
+                # Return both dataset and mapping - same format as OGB/TU/GNN Benchmark/MNISTSuperpixels/FUG
+                return dataset, original_features_mapping
+
+        print(f"[Loader] Original features loading failed for '{name}'. Continuing...")
 
     # --- FUG OGB path (simplified for unified embedding setting) ---
     if os.environ.get('USE_FUG_EMB', '0') == '1':
@@ -548,8 +672,7 @@ def load_dataset(name, root='./dataset', embedding_family='ST'):
 
         print(f"[Loader] Loading FUG dataset '{name}' (unified embedding setting)")
 
-        # Simple unified loading - just one function needed
-        from .data_graph_fug_simple import load_ogb_fug_dataset
+        # Simple unified loading - function imported at module level
         result = load_ogb_fug_dataset(name, ogb_root=ogb_root, fug_root=fug_root)
         if result is not None:
             dataset, fug_mapping = result  # Unpack pristine dataset and external mapping
@@ -573,6 +696,9 @@ def load_dataset(name, root='./dataset', embedding_family='ST'):
     # List of known TSGFM graph classification datasets (batched format)
     tsgfm_graph_datasets = ['bace', 'bbbp', 'chemhiv', 'chempcba', 'chemblpre', 'muv', 'tox21', 'toxcast']
     
+    # List of known GNN Benchmark datasets  
+    gnn_benchmark_datasets = ['mnist', 'cifar10', 'pattern', 'cluster']
+    
     # Try TSGFM format first for known datasets
     if name.lower() in tsgfm_graph_datasets:
         print(f"Attempting to load {name} as TSGFM dataset...")
@@ -581,8 +707,19 @@ def load_dataset(name, root='./dataset', embedding_family='ST'):
             dataset.name = name  # Set dataset name for consistency
             return dataset
         print(f"Failed to load {name} as TSGFM dataset, trying TU format...")
+    
+    # Try GNN Benchmark format for known datasets
+    # NOTE: These only work with USE_ORIGINAL_FEATURES=1 mode (handled earlier in this function)
+    if name.lower() in gnn_benchmark_datasets:
+        print(f"Attempting to load {name} as GNN Benchmark dataset...")
+        dataset = load_gnn_benchmark_dataset(name, os.path.join(root, 'GNN_Benchmark'), split='train')
+        if dataset is not None:
+            dataset.name = name  # Set dataset name for consistency
+            return dataset
+        print(f"Failed to load {name} as GNN Benchmark dataset, trying TU format...")
 
     # Try TU format
+    # NOTE: TU datasets only work with USE_ORIGINAL_FEATURES=1 mode (handled earlier in this function)
     print(f"Attempting to load {name} as TU dataset...")
     dataset = load_tu_dataset(name, os.path.join(root, 'TU'))
 
@@ -983,13 +1120,21 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
                             reservoir[j] = idx
             return reservoir
         
-        # Binary classification datasets always have classes [0, 1]
-        available_classes = {0, 1}
-        
+        # Determine available classes from the dataset
+        all_labels_in_train = []
+        for idx in split_idx['train']:
+            idx_int = idx.item() if torch.is_tensor(idx) else idx
+            graph = dataset[idx_int]
+            label = graph.y.item() if graph.y.numel() == 1 else graph.y[0].item()
+            all_labels_in_train.append(label)
+
+        available_classes = sorted(set(all_labels_in_train))
+        print(f"  Detected {len(available_classes)} classes in training set: {available_classes}")
+
         # Direct sampling per class
         task_contexts = {0: {}}  # Single task = task 0
         unique_indices = set()
-        
+
         for class_label in available_classes:
             selected_indices = reservoir_sample_for_class(class_label, context_k)
             
@@ -1086,26 +1231,67 @@ def graph_pooling(node_embeddings, batch, pooling_method='mean'):
         raise ValueError(f"Unsupported pooling method: {pooling_method}")
 
 
+def get_tu_pretraining_datasets():
+    """
+    Get list of safe TU datasets for pretraining.
+    Excludes: Tox21 (potential OGB overlap), regression datasets, no-feature datasets.
+
+    Returns 42 verified classification datasets with ~660K graphs.
+    """
+    # Traditional bioinformatics (17 datasets)
+    traditional_bio = [
+        'MUTAG', 'PROTEINS', 'ENZYMES', 'DD', 'NCI1', 'NCI109',
+        'PROTEINS_full', 'PTC_MR', 'PTC_MM', 'PTC_FM', 'PTC_FR',
+        'DHFR', 'COX2', 'BZR', 'ER_MD', 'Mutagenicity', 'AIDS',
+    ]
+
+    # NCI cancer cell line series (17 datasets)
+    nci_cancer = [
+        'MCF-7', 'MCF-7H', 'MOLT-4', 'MOLT-4H', 'OVCAR-8', 'OVCAR-8H',
+        'P388', 'P388H', 'PC-3', 'PC-3H', 'SF-295', 'SF-295H',
+        'SW-620', 'SN12C', 'SN12CH', 'UACC257', 'UACC257H',
+    ]
+
+    # Other domains (8 datasets)
+    other_domains = [
+        'MSRC_9', 'MSRC_21', 'MSRC_21C', 'SYNTHETIC', 'Cuneiform',
+        'KKI', 'OHSU', 'Peking_1',
+    ]
+
+    # Combine all (42 total)
+    all_datasets = traditional_bio + nci_cancer + other_domains
+
+    return all_datasets
+
+
 def load_all_graph_datasets(dataset_names, device='cuda', pretraining_mode=False, context_k=32, embedding_family='ST'):
     """
     Load multiple graph classification datasets with memory-efficient context sampling.
-    
+
     Args:
-        dataset_names (list): List of dataset names to load
+        dataset_names (list): List of dataset names to load, or special keywords:
+            - "TU_ALL": Load all 42 safe TU datasets
         device (str): Device to load data onto
         pretraining_mode (bool): If True, optimize splits for pretraining (train/val only)
         context_k (int): Number of context graphs per class to sample
         embedding_family (str): Text embedding family ('ST' for Sentence Transformer, 'e5' for E5 embeddings)
-        
+
     Returns:
         tuple: (datasets, processed_data_list)
     """
     import time
     overall_start = time.time()
-    
+
+    # Handle special keywords
+    if isinstance(dataset_names, list) and "TU_ALL" in dataset_names:
+        # Replace "TU_ALL" with actual TU dataset list
+        tu_datasets = get_tu_pretraining_datasets()
+        dataset_names = [name for name in dataset_names if name != "TU_ALL"] + tu_datasets
+        print(f"Expanded TU_ALL to {len(tu_datasets)} TU datasets")
+
     datasets = []
     processed_data_list = []
-    
+
     for name in dataset_names:
         print(f"\nLoading dataset: {name}")
         
@@ -1604,7 +1790,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
     node_embs = None
     if processed_data is not None and 'fug_mapping' in processed_data:
         fug_mapping = processed_data['fug_mapping']
-        
+
         # Handle cache mode for FUG datasets
         if fug_mapping.get('cache_mode', False) and use_pca_cache and dataset_name:
             print(f"🚀 Cache mode enabled for {dataset_name} - attempting to load cached PCA features")
@@ -1637,10 +1823,12 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         
         # Normal FUG mode (embeddings already loaded or set from cache)
         if fug_mapping.get('node_embs') is not None:
-            if 'node_embs' not in locals():  # Only set if not already set by cache mode
+            if 'node_embs' not in locals() or node_embs is None:  # Only set if not already set by cache mode
                 node_embs = fug_mapping['node_embs']
-                original_dim = node_embs.shape[1]
                 print(f"Using FUG external embeddings: {node_embs.shape}")
+            # Always set original_dim from node_embs shape
+            if 'original_dim' not in locals():
+                original_dim = node_embs.shape[1]
     # Fall back to dataset.node_embs for unified setting
     elif hasattr(dataset, 'node_embs') and dataset.node_embs is not None:
         node_embs = dataset.node_embs
@@ -1829,7 +2017,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
     if fug_mapping is not None:
         # FUG dataset: update the external mapping
         fug_mapping['node_embs'] = processed_features
-        print(f"  Updated FUG mapping embeddings: {processed_features.shape} - all graphs now use reduced embeddings!")
+        print(f"  Updated FUG mapping embeddings: {processed_features.shape}")
     else:
         # Regular dataset: update dataset.node_embs
         dataset.node_embs = processed_features

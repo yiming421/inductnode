@@ -324,7 +324,7 @@ def parse_joint_training_args():
                         help='Task schedule per phase (comma-separated). Use + for multiple tasks. Tasks: nc, lp, gc. Phases split at epochs 15 and 30.')
 
     # === Virtual Node ===
-    parser.add_argument('--use_virtual_node', type=str2bool, default=False,
+    parser.add_argument('--use_virtual_node', type=str2bool, default=True,
                         help='Add a virtual node connected to all graph nodes for global information aggregation (uses main dropout rate and residual connections)')
 
     # === Dataset Configuration ===
@@ -474,7 +474,7 @@ def parse_joint_training_args():
                        help='Refresh contexts every N batches within each task (0 = disabled)')
     parser.add_argument('--context_sampling_plan', type=str, default='decay', choices=['ori', 'random', 'decay'],
                        help='Context sampling strategy: ori=original fixed, random=random sampling, decay=gradual decay')
-    parser.add_argument('--context_bounds', type=str, default='(5,20)(8,32)(8,32)',
+    parser.add_argument('--context_bounds', type=str, default='(5,20)(5,20)(5,20)',
                        help='Context bounds for NC/LP/GC: (lower,upper)(lower,upper)(lower,upper). Used for random sampling range and decay start/end.')
     parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=True,
                        help='Use K-Medoids clustering to guide context sampling for better representativeness')

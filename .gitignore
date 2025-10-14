@@ -134,6 +134,11 @@ cache/
 
 *.gz
 *.sh
-*.md
 TAGDataset
 /fug
+
+# Allow important documentation
+!README.md
+!CLAUDE.md
+!legacy/README.md
+!docs/*.md
