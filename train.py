@@ -1765,7 +1765,8 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     model, predictor, dataset_info, task_data_loaders, optimizer, task_idx,
                     pooling_method=args.graph_pooling, device=device,
                     clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
-                    normalize_class_h=args.normalize_class_h, identity_projection=identity_projection
+                    normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
+                    lambda_=args.lambda_gc
                 )
                 
                 # Track memory after graph classification training
@@ -1786,7 +1787,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
             gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_complete")
         
         if gc_dataset_count > 0:
-            total_gc_loss = args.lambda_gc * (gc_loss_sum / gc_dataset_count)
+            total_gc_loss = gc_loss_sum / gc_dataset_count  # Already scaled in train_graph_classification_single_task
             gc_count = gc_dataset_count
             
         gc_tracker.log_memory("gc_section_complete")
@@ -2067,7 +2068,6 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     
                     # Debug: Check profiling setting
                     profiling_enabled = getattr(args, 'enable_profiling', False)
-                    print(f"      [DEBUG] Task {task_idx}: enable_profiling = {profiling_enabled}, dataloader: {dataloader_time:.3f}s")
                     
                     if gc_tracker:
                         gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_before_eval")
@@ -2124,7 +2124,9 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                         gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_complete")
                     
                     # Extract the appropriate split result
-                    split_result = task_eval_results.get(split, 0.0)
+                    # Map 'valid' to 'val' for consistency with data loader keys
+                    result_key = 'val' if split == 'valid' else split
+                    split_result = task_eval_results.get(result_key, 0.0)
                     task_results.append(split_result)
                     
                     task_time = time.time() - task_start_time

@@ -1523,7 +1523,6 @@ def create_data_loaders(dataset, split_idx, batch_size=128, shuffle=True, task_i
     num_workers = 0
 
     for split_name, indices in split_idx.items():        
-        # DEBUG: Check subset graphs before DataLoader creation
         subset = Subset(dataset, indices)
         
         shuffle_data = shuffle if split_name == 'train' else False

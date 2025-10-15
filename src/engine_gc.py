@@ -287,13 +287,14 @@ class MultiApr:
         self.targets = []
 
 
-def get_dataset_metric(dataset_name, is_multitask=None):
+def get_dataset_metric(dataset_name, num_classes=None, is_multitask=None):
     """
     Get the appropriate evaluation metric(s) for a given dataset.
     Uses intelligent defaults based on task type with specific overrides.
     
     Args:
         dataset_name (str): Name of the dataset
+        num_classes (int, optional): Number of classes in the dataset
         is_multitask (bool, optional): Whether this is a multi-task dataset
         
     Returns:
@@ -307,14 +308,26 @@ def get_dataset_metric(dataset_name, is_multitask=None):
     elif 'chempcba' in dataset_name or 'pcba' in dataset_name:
         # PCBA uses AUC metric
         return 'auc'
+    elif 'mnist' in dataset_name:
+        # MNIST is multi-class classification
+        return 'accuracy'
     
-    # Intelligent defaults based on task type
+    # Intelligent defaults based on number of classes
+    if num_classes is not None:
+        if num_classes == 2:
+            # Binary classification uses AUC
+            return 'auc'
+        else:
+            # Multi-class classification uses accuracy
+            return 'accuracy'
+    
+    # Intelligent defaults based on task type (legacy fallback)
     if is_multitask is not None:
         if is_multitask:
             # Multi-task datasets typically use AP (average precision)
             return 'ap'
         else:
-            # Single-task datasets typically use AUC for binary classification
+            # Single-task datasets: assume binary for AUC (may not be correct)
             return 'auc'
     
     # Fallback to accuracy if task type is unknown
@@ -412,7 +425,8 @@ def calculate_metric(predictions, labels, probabilities, metric_type):
         float: Calculated metric value
     """
     if metric_type == 'accuracy':
-        return (predictions == labels).float().mean().item()
+        accuracy = (predictions == labels).float().mean().item()
+        return accuracy
     elif metric_type == 'auc':
         # For binary classification, use probabilities of positive class
         if probabilities.shape[1] == 2:
@@ -694,7 +708,8 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
     
     # Determine the appropriate metric for this dataset
     is_multitask = sample_graph.y.numel() > 1
-    metric_type = get_dataset_metric(dataset_name, is_multitask) if dataset_name else 'accuracy'
+    num_classes = dataset_info.get('num_classes', None)
+    metric_type = get_dataset_metric(dataset_name, num_classes=num_classes, is_multitask=is_multitask) if dataset_name else 'accuracy'
     
     split_results = {}
     
@@ -702,7 +717,6 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
     for split_name in ['train', 'val', 'test']:
         if split_name not in data_loaders:
             continue
-            
         all_task_metrics = []
         
         # For each task, collect predictions across all graphs in this split
@@ -833,7 +847,8 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
                 split_results[split_name] = aggregated_metrics
             else:
                 # Single metric: simple average
-                split_results[split_name] = sum(all_task_metrics) / len(all_task_metrics)
+                avg_metric = sum(all_task_metrics) / len(all_task_metrics)
+                split_results[split_name] = avg_metric
         else:
             if isinstance(metric_type, list):
                 split_results[split_name] = {metric_name: 0.0 for metric_name in metric_type}
@@ -951,7 +966,7 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
 
 def train_graph_classification_single_task(model, predictor, dataset_info, data_loaders, optimizer, task_idx,
                                          pooling_method='mean', device='cuda', clip_grad=1.0,
-                                         orthogonal_push=0.0, normalize_class_h=True, identity_projection=None, context_k=None, args=None):
+                                         orthogonal_push=0.0, normalize_class_h=True, identity_projection=None, context_k=None, args=None, lambda_=1.0):
     """
     Train graph classification for one epoch on a single task with prefiltered data.
     All samples in each batch are guaranteed to have valid labels for the specified task.
@@ -1097,6 +1112,7 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
             orthogonal_loss = torch.tensor(0.0, device=device)
 
         loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
+        loss = loss * lambda_  # Apply lambda scaling (same as NC and LP)
 
         # Backward pass
         optimizer.zero_grad()
@@ -1174,7 +1190,8 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
     # Check if this is a multi-task dataset
     sample_graph = dataset_info['dataset'][0]
     is_multitask = sample_graph.y.numel() > 1
-    metric_type = get_dataset_metric(dataset_name, is_multitask) if dataset_name else 'accuracy'
+    num_classes = dataset_info.get('num_classes', None)
+    metric_type = get_dataset_metric(dataset_name, num_classes=num_classes, is_multitask=is_multitask) if dataset_name else 'accuracy'
 
     # Evaluate on each split
     split_times = {}
@@ -1343,9 +1360,10 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
         # We want all graphs in each batch, then dynamically check all 128 tasks
         all_task_filtered_splits = []  # Keep variable for compatibility, but won't use task filtering
         
-        for train_dataset_info in train_processed_data_list:
+        for idx, train_dataset_info in enumerate(train_processed_data_list):
             # Use original splits WITHOUT task filtering
-            all_task_filtered_splits.append(train_dataset_info['split_idx'])
+            splits = train_dataset_info['split_idx']
+            all_task_filtered_splits.append(splits)
     else:
         print("Task-specific training: using task-filtered data loaders")
         # Create task-filtered data loaders for task-specific training
@@ -1442,7 +1460,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         pooling_method=args.graph_pooling, device=device,
                         clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
                         normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
-                        context_k=getattr(args, 'context_k', None), args=args
+                        context_k=getattr(args, 'context_k', None), args=args, lambda_=1.0
                     )
                     
                     dataset_loss += task_loss
@@ -1500,7 +1518,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                 
                 sample_graph = train_dataset_info['dataset'][0]
                 is_multitask = sample_graph.y.numel() > 1
-                metric_type = get_dataset_metric(dataset_name, is_multitask)
+                metric_type = get_dataset_metric(dataset_name, num_classes=train_dataset_info.get("num_classes", None), is_multitask=is_multitask)
                 
                 if isinstance(metric_type, list):
                     # Multiple metrics (e.g., PCBA with AUC and AP)
@@ -1566,7 +1584,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                 # Check if this is a multi-task dataset
                 sample_graph = train_dataset_info['dataset'][0]
                 is_multitask = sample_graph.y.numel() > 1
-                metric_type = get_dataset_metric(dataset_name, is_multitask)
+                metric_type = get_dataset_metric(dataset_name, num_classes=train_dataset_info.get("num_classes", None), is_multitask=is_multitask)
                 
                 if isinstance(metric_type, list):
                     # Multiple metrics (e.g., PCBA with AUC and AP)
@@ -1663,7 +1681,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         
                         test_sample_graph = test_dataset_info['dataset'][0]
                         test_is_multitask = test_sample_graph.y.numel() > 1
-                        test_metric_type = get_dataset_metric(test_name, test_is_multitask)
+                        test_metric_type = get_dataset_metric(test_name, num_classes=test_dataset_info.get("num_classes", None), is_multitask=test_is_multitask)
                         
                         if isinstance(test_metric_type, list):
                             # Multiple metrics (e.g., PCBA with AUC and AP)
@@ -1710,7 +1728,6 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                             
                             # Debug: Check profiling setting
                             profiling_enabled = getattr(args, 'enable_profiling', False)
-                            print(f"      [DEBUG] Task {task_idx}: enable_profiling = {profiling_enabled}")
                             
                             # Per-task profiling if enabled
                             if profiling_enabled:
@@ -1766,7 +1783,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         # Check if this is a multi-task dataset for label only
                         test_sample_graph = test_dataset_info['dataset'][0]
                         test_is_multitask = test_sample_graph.y.numel() > 1
-                        test_metric_type = get_dataset_metric(test_name, test_is_multitask)
+                        test_metric_type = get_dataset_metric(test_name, num_classes=test_dataset_info.get("num_classes", None), is_multitask=test_is_multitask)
                         
                         if isinstance(test_metric_type, list):
                             # Multiple metrics (e.g., PCBA with AUC and AP)
