@@ -2327,9 +2327,9 @@ def run_joint_training(args, device='cuda:0'):
             parameters.extend(list(module.parameters()))
     
     if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
     elif args.optimizer == 'adamw':
-        optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
     
     if args.schedule == 'cosine':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)

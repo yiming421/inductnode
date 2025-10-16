@@ -304,6 +304,7 @@ def parse_joint_training_args():
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
     parser.add_argument('--lr', type=float, default=0.000001995432810684568, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.00041043056600071503, help='Weight decay')
+    parser.add_argument('--eps', type=float, default=1e-8, help='Epsilon for optimizer (term added to denominator for numerical stability)')
     parser.add_argument('--schedule', type=str, default='step', choices=['cosine', 'step', 'warmup', 'none'])
     parser.add_argument('--nc_batch_size', type=int, default=8192, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=32768, help='Link prediction batch size')
@@ -328,7 +329,7 @@ def parse_joint_training_args():
                         help='Add a virtual node connected to all graph nodes for global information aggregation (uses main dropout rate and residual connections)')
 
     # === Dataset Configuration ===
-    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
+    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Actor,DeezerEurope,LastFMAsia,Twitch-DE,Twitch-EN,Twitch-ES,Twitch-FR,Twitch-PT,Twitch-RU', 
                        help='Node classification training datasets')
     parser.add_argument('--nc_test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS', 
                        help='Node classification test datasets')
@@ -430,7 +431,7 @@ def parse_joint_training_args():
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
     
     # === Graph Classification Specific ===
-    parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')
+    parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp,tox21,toxcast,clintox,muv,sider', help='Graph classification training datasets')
     parser.add_argument('--gc_test_dataset', type=str, default='hiv,pcba', help='Graph classification test datasets')
     parser.add_argument('--gc_batch_size', type=int, default=1024, help='Graph classification batch size')
     parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
@@ -441,7 +442,7 @@ def parse_joint_training_args():
     # === OGB FUG embeddings arguments (for graph classification) ===
     parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
                         help='Use OGB datasets with FUG embeddings (replaces node features with FUG molecular embeddings)')
-    parser.add_argument('--use_original_features', type=str2bool, default=False,
+    parser.add_argument('--use_original_features', type=str2bool, default=True,
                         help='Use original OGB raw features (9-dim) instead of FUG embeddings. Will be processed with PCA/padding to hidden_dim.')
     parser.add_argument('--fug_root', type=str, default='./fug',
                         help='Root directory for FUG embeddings')

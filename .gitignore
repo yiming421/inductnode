@@ -139,6 +139,10 @@ TAGDataset
 
 # Allow important documentation
 !README.md
-!CLAUDE.md
+CLAUDE.md
 !legacy/README.md
 !docs/*.md
+
+scripts/
+pca_cache/
+setup/
