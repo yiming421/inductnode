@@ -32,8 +32,8 @@ def refresh_lp_context_if_needed(data, batch_idx, epoch, args, context_edges, tr
             project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
             if project_root not in sys.path:
                 sys.path.insert(0, project_root)
-            
-            from scripts.joint_training import resolve_context_shots
+
+            from train import resolve_context_shots
             from src.data_utils import select_link_context
             
             # Get dynamic context shots using the same logic as epoch refresh

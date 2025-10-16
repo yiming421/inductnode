@@ -1596,7 +1596,7 @@ def get_hierarchical_task_schedule(epoch, args):
 
 
 def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch,
-                       identity_projection=None, nc_loaders=None):
+                       identity_projection=None, nc_loaders=None, optimizer_nc=None, optimizer_lp=None, optimizer_gc=None):
     """
     Perform one joint training step combining all three tasks.
 
@@ -1607,11 +1607,27 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
     Args:
         nc_loaders: List of MiniBatchNCLoader instances for NC datasets
+        optimizer_nc/lp/gc: Separate optimizers for each task (if use_separate_optimizers=True)
     """
     global lp_tracker
 
     model.train()
     predictor.train()
+
+    # Use task-specific optimizers if provided, otherwise use unified optimizer
+    opt_nc = optimizer_nc if optimizer_nc is not None else optimizer
+    opt_lp = optimizer_lp if optimizer_lp is not None else optimizer
+    opt_gc = optimizer_gc if optimizer_gc is not None else optimizer
+
+    # When using separate optimizers, disable lambda scaling (use LR instead)
+    # Temporarily override lambda values to 1.0 for this training step
+    if args.use_separate_optimizers:
+        original_lambda_nc = args.lambda_nc
+        original_lambda_lp = args.lambda_lp
+        original_lambda_gc = args.lambda_gc
+        args.lambda_nc = 1.0
+        args.lambda_lp = 1.0
+        args.lambda_gc = 1.0
 
     device = optimizer.param_groups[0]['params'][0].device
     total_nc_loss = torch.tensor(0.0, device=device)
@@ -1649,14 +1665,14 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     data_loader, split_idx, model, predictor, args, device,
                     identity_projection=identity_projection,
                     external_embeddings=external_emb,
-                    optimizer=optimizer
+                    optimizer=opt_nc
                 )
                 nc_loss_sum += nc_loss  # nc_loss is already a scalar
-            total_nc_loss = torch.tensor(nc_loss_sum, device=device)
+            total_nc_loss = torch.tensor(nc_loss_sum / len(nc_loaders), device=device)  # Average across datasets
             nc_count = len(nc_loaders)
         else:
             # Fallback to original full-batch training
-            nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=optimizer, pred=predictor,
+            nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=opt_nc, pred=predictor,
                               batch_size=args.nc_batch_size, degree=False,
                               orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
                               clip_grad=args.clip_grad, rank=0, epoch=epoch,
@@ -1690,10 +1706,10 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     with lp_tracker.time_operation('forward_pass'):
                         lp_loss = train_link_prediction(
                             model, predictor, data, link_data_all['train'], context_data, train_mask,
-                            optimizer=optimizer, batch_size=args.lp_batch_size, 
-                            identity_projection=identity_projection, 
-                            clip_grad=args.clip_grad, rank=0, orthogonal_push=args.orthogonal_push, 
-                            normalize_class_h=args.normalize_class_h, epoch=epoch, 
+                            optimizer=opt_lp, batch_size=args.lp_batch_size,
+                            identity_projection=identity_projection,
+                            clip_grad=args.clip_grad, rank=0, orthogonal_push=args.orthogonal_push,
+                            normalize_class_h=args.normalize_class_h, epoch=epoch,
                             mask_target_edges=args.mask_target_edges, degree=False, lambda_=args.lambda_lp,
                             args=args
                         )
@@ -1762,7 +1778,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                 
                 # Train on this specific task
                 task_loss = train_graph_classification_single_task(
-                    model, predictor, dataset_info, task_data_loaders, optimizer, task_idx,
+                    model, predictor, dataset_info, task_data_loaders, opt_gc, task_idx,
                     pooling_method=args.graph_pooling, device=device,
                     clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
                     normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
@@ -1794,7 +1810,13 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     
     # Combined loss
     combined_loss = total_nc_loss + total_lp_loss + total_gc_loss
-    
+
+    # Restore original lambda values if we temporarily changed them
+    if args.use_separate_optimizers:
+        args.lambda_nc = original_lambda_nc
+        args.lambda_lp = original_lambda_lp
+        args.lambda_gc = original_lambda_gc
+
     return {
         'nc_loss': total_nc_loss,
         'lp_loss': total_lp_loss,
@@ -2325,23 +2347,65 @@ def run_joint_training(args, device='cuda:0'):
     for module in [model, predictor, identity_projection]:
         if module is not None:
             parameters.extend(list(module.parameters()))
-    
-    if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
-    elif args.optimizer == 'adamw':
-        optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
-    
-    if args.schedule == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    elif args.schedule == 'step':
-        step = max(1, args.epochs // 5)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step, gamma=0.5)
-    elif args.schedule == 'warmup':
-        scheduler = get_cosine_schedule_with_warmup(optimizer, 
-                                                  num_warmup_steps=args.epochs // 10, 
-                                                  num_training_steps=args.epochs)
+
+    if args.use_separate_optimizers:
+        # Separate optimizers mode: one optimizer per task
+        lr_nc = args.lr_nc if args.lr_nc is not None else args.lr
+        lr_lp = args.lr_lp if args.lr_lp is not None else args.lr
+        lr_gc = args.lr_gc if args.lr_gc is not None else args.lr
+
+        print(f"Using separate optimizers - NC LR: {lr_nc:.2e}, LP LR: {lr_lp:.2e}, GC LR: {lr_gc:.2e}")
+
+        if args.optimizer == 'adam':
+            optimizer_nc = torch.optim.Adam(parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_lp = torch.optim.Adam(parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_gc = torch.optim.Adam(parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
+        elif args.optimizer == 'adamw':
+            optimizer_nc = torch.optim.AdamW(parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_lp = torch.optim.AdamW(parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_gc = torch.optim.AdamW(parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
+
+        def create_scheduler(opt):
+            if args.schedule == 'cosine':
+                return torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+            elif args.schedule == 'step':
+                step = max(1, args.epochs // 5)
+                return torch.optim.lr_scheduler.StepLR(opt, step_size=step, gamma=0.5)
+            elif args.schedule == 'warmup':
+                return get_cosine_schedule_with_warmup(opt, num_warmup_steps=args.epochs // 10, num_training_steps=args.epochs)
+            else:
+                return None
+
+        scheduler_nc = create_scheduler(optimizer_nc)
+        scheduler_lp = create_scheduler(optimizer_lp)
+        scheduler_gc = create_scheduler(optimizer_gc)
+
+        # For compatibility, set primary optimizer to NC
+        optimizer = optimizer_nc
+        scheduler = scheduler_nc
     else:
-        scheduler = None
+        # Traditional unified optimizer
+        print(f"Using unified optimizer with LR: {args.lr:.2e}")
+
+        if args.optimizer == 'adam':
+            optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
+        elif args.optimizer == 'adamw':
+            optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
+
+        if args.schedule == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        elif args.schedule == 'step':
+            step = max(1, args.epochs // 5)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step, gamma=0.5)
+        elif args.schedule == 'warmup':
+            scheduler = get_cosine_schedule_with_warmup(optimizer,
+                                                      num_warmup_steps=args.epochs // 10,
+                                                      num_training_steps=args.epochs)
+        else:
+            scheduler = None
+
+        optimizer_nc = optimizer_lp = optimizer_gc = None
+        scheduler_nc = scheduler_lp = scheduler_gc = None
     
     print(f"Total parameters: {sum(p.numel() for p in parameters):,}")
     
@@ -2465,12 +2529,23 @@ def run_joint_training(args, device='cuda:0'):
         train_results = joint_training_step(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
             optimizer, args, epoch, identity_projection,
-            nc_loaders=data_dict.get('nc_train_loaders', None)
+            nc_loaders=data_dict.get('nc_train_loaders', None),
+            optimizer_nc=optimizer_nc if args.use_separate_optimizers else None,
+            optimizer_lp=optimizer_lp if args.use_separate_optimizers else None,
+            optimizer_gc=optimizer_gc if args.use_separate_optimizers else None
         )
 
-        # Step scheduler
-        if scheduler is not None:
-            scheduler.step()
+        # Step scheduler(s)
+        if args.use_separate_optimizers:
+            if scheduler_nc is not None:
+                scheduler_nc.step()
+            if scheduler_lp is not None:
+                scheduler_lp.step()
+            if scheduler_gc is not None:
+                scheduler_gc.step()
+        else:
+            if scheduler is not None:
+                scheduler.step()
 
         # Every epoch: Validation on seen datasets (training data) for early stopping
         seen_valid_results = joint_evaluation(

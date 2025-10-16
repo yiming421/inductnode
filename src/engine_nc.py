@@ -182,7 +182,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         # Only perform optimization if optimizer is provided (for joint training compatibility)
         optimizer.zero_grad()
         loss.backward()
-        
+
         # Apply gradient clipping
         if clip_grad > 0:
             # Handle DDP wrapped models
@@ -196,7 +196,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                 nn.utils.clip_grad_norm_(projector.parameters(), clip_grad)
             if identity_projection is not None:
                 nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
-        
+
         optimizer.step()
         
         # Memory cleanup after optimization step

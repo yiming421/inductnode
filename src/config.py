@@ -309,14 +309,25 @@ def parse_joint_training_args():
     parser.add_argument('--nc_batch_size', type=int, default=8192, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=32768, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
-    parser.add_argument('--clip_grad', type=float, default=0.9893307302161596, help='Gradient clipping')
+    parser.add_argument('--clip_grad', type=float, default=5.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
     parser.add_argument('--enable_nc', type=str2bool, default=True, help='Enable node classification task')
     parser.add_argument('--enable_lp', type=str2bool, default=True, help='Enable link prediction task')
     parser.add_argument('--enable_gc', type=str2bool, default=True, help='Enable graph classification task')
-    parser.add_argument('--lambda_nc', type=float, default=0.5339754552414909, help='Weight for node classification loss')
-    parser.add_argument('--lambda_lp', type=float, default=2.735303979230086, help='Weight for link prediction loss')
+
+    # Separate optimizers option
+    parser.add_argument('--use_separate_optimizers', type=str2bool, default=False,
+                        help='Use separate optimizers for each task with task-specific learning rates')
+
+    # Task-specific learning rates (only used when use_separate_optimizers=True)
+    parser.add_argument('--lr_nc', type=float, default=None, help='Learning rate for node classification (uses --lr if None)')
+    parser.add_argument('--lr_lp', type=float, default=None, help='Learning rate for link prediction (uses --lr if None)')
+    parser.add_argument('--lr_gc', type=float, default=None, help='Learning rate for graph classification (uses --lr if None)')
+
+    # Legacy lambda weights (deprecated, kept for backward compatibility)
+    parser.add_argument('--lambda_nc', type=float, default=0.5339754552414909, help='[DEPRECATED] Weight for node classification loss - use --lr_nc instead')
+    parser.add_argument('--lambda_lp', type=float, default=2.735303979230086, help='[DEPRECATED] Weight for link prediction loss - use --lr_lp instead')
 
     # === Hierarchical Training ===
     parser.add_argument('--use_hierarchical_training', type=str2bool, default=False,
@@ -329,7 +340,7 @@ def parse_joint_training_args():
                         help='Add a virtual node connected to all graph nodes for global information aggregation (uses main dropout rate and residual connections)')
 
     # === Dataset Configuration ===
-    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Actor,DeezerEurope,LastFMAsia,Twitch-DE,Twitch-EN,Twitch-ES,Twitch-FR,Twitch-PT,Twitch-RU', 
+    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
                        help='Node classification training datasets')
     parser.add_argument('--nc_test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS', 
                        help='Node classification test datasets')
@@ -431,7 +442,7 @@ def parse_joint_training_args():
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
     
     # === Graph Classification Specific ===
-    parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp,tox21,toxcast,clintox,muv,sider', help='Graph classification training datasets')
+    parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')
     parser.add_argument('--gc_test_dataset', type=str, default='hiv,pcba', help='Graph classification test datasets')
     parser.add_argument('--gc_batch_size', type=int, default=1024, help='Graph classification batch size')
     parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
