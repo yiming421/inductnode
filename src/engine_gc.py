@@ -15,6 +15,7 @@ from .utils import process_node_features
 from .data_utils import batch_edge_dropout, feature_dropout
 import numpy as np
 from torch.profiler import profile, record_function, ProfilerActivity
+from .training_monitor import TrainingMonitor
 
 
 def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
@@ -67,7 +68,7 @@ def refresh_gc_context_if_needed(dataset_info, batch_idx, epoch, args, device='c
         
         # Refresh context_graphs structure
         if 'context_graphs' in dataset_info:
-            refresh_gc_context_graphs(dataset_info, args, device, task_idx)
+            refresh_gc_context_graphs(dataset_info, args, device)
             if task_idx is not None:
                 print(f"🔄 GC Dataset {dataset_name} context refreshed for task {task_idx} at batch {batch_idx}")
             else:
@@ -970,7 +971,7 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
     """
     Train graph classification for one epoch on a single task with prefiltered data.
     All samples in each batch are guaranteed to have valid labels for the specified task.
-    
+
     Args:
         model: GNN model
         predictor: PFN predictor
@@ -983,13 +984,22 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         clip_grad (float): Gradient clipping value
         orthogonal_push (float): Orthogonal loss weight
         normalize_class_h (bool): Whether to normalize class embeddings
-        
+
     Returns:
         float: Average training loss for this task
     """
     model.train()
     predictor.train()
-    
+
+    # Create monitor for detailed logging (disabled by default)
+    # Set enable_training_monitor=True in args to enable
+    enable_monitoring = getattr(args, 'enable_training_monitor', False) if args else False
+    log_interval = getattr(args, 'monitor_log_interval', 1) if args else 1  # Log every batch by default
+    monitor = TrainingMonitor(log_interval=log_interval, detailed=False) if enable_monitoring else None
+
+    if monitor is not None:
+        print(f"[MONITOR] Training monitoring ENABLED (log_interval={log_interval})")
+
     total_loss = 0
     num_batches = 0
 
@@ -1093,14 +1103,16 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         # Use PFN predictor (all samples are valid, no masking needed)
         pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
         if len(pred_output) == 3:  # MoE case with auxiliary loss
-            scores, refined_class_h, auxiliary_loss = pred_output
+            scores_raw, refined_class_h, auxiliary_loss = pred_output
         else:  # Standard case
-            scores, refined_class_h = pred_output
+            scores_raw, refined_class_h = pred_output
             auxiliary_loss = 0.0
-        scores = F.log_softmax(scores, dim=1)
+
+        # Apply log_softmax for loss computation
+        scores_log = F.log_softmax(scores_raw, dim=1)
 
         # Compute loss - no masking needed since all samples are valid
-        nll_loss = F.nll_loss(scores, batch_labels)
+        nll_loss = F.nll_loss(scores_log, batch_labels)
 
         # Orthogonal loss for refined class prototypes
         if orthogonal_push > 0:
@@ -1114,24 +1126,74 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
         loss = loss * lambda_  # Apply lambda scaling (same as NC and LP)
 
+        # ===== MONITORING: Collect statistics before backward =====
+        if monitor is not None:
+            stats = {}
+
+            # Check predictor outputs (use RAW scores before log_softmax for proper statistics)
+            stats.update(monitor.check_predictor_outputs(scores_raw, batch_labels))
+
+            # Check batch statistics
+            stats.update(monitor.check_batch_statistics(batch_data, labels=batch_labels))
+
+            # Check context embedding statistics
+            stats.update(monitor.check_embeddings(context_embeddings, "context_emb"))
+            stats.update(monitor.check_embeddings(target_embeddings, "target_emb"))
+
+            # Check loss components
+            stats.update(monitor.check_loss_components(nll_loss, auxiliary_loss, orthogonal_loss, loss))
+
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
-        
+
+        # ===== MONITORING: Check gradients before clipping =====
+        if monitor is not None:
+            grad_stats = monitor.check_gradients(model, predictor, identity_projection, prefix="before_clip")
+            stats.update(grad_stats)
+
         # Gradient clipping
+        total_grad_norm_before = 0.0
         if clip_grad > 0:
+            # Compute total norm before clipping for monitoring
+            if monitor is not None:
+                for p in list(model.parameters()) + list(predictor.parameters()) + (list(identity_projection.parameters()) if identity_projection else []):
+                    if p.grad is not None:
+                        total_grad_norm_before += p.grad.data.norm(2).item() ** 2
+                total_grad_norm_before = total_grad_norm_before ** 0.5
+                stats['grad_norm_before_clip'] = total_grad_norm_before
+
+            # Apply clipping (current per-module approach)
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
             torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
             if identity_projection: torch.nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
-        
+
+        # ===== MONITORING: Check gradients after clipping =====
+        if monitor is not None:
+            grad_stats_after = monitor.check_gradients(model, predictor, identity_projection, prefix="after_clip")
+            for key, val in grad_stats_after.items():
+                stats[key.replace("before_clip", "after_clip")] = val
+
+            # Log all statistics for this batch
+            monitor.log_batch_stats(stats, task_idx=task_idx, batch_idx=batch_idx)
+
         optimizer.step()
-        
+
         total_loss += loss.item()
         num_batches += 1
-        print(f"\rTraining batch {batch_idx+1}/{total_batches} completed (loss: {loss.item():.4f})", end="", flush=True)
+
+        # Simpler progress message when monitoring is disabled
+        if monitor is None:
+            print(f"\rTraining batch {batch_idx+1}/{total_batches} completed (loss: {loss.item():.4f})", end="", flush=True)
     
-    print(f"\nTraining completed: {num_batches} batches, avg loss: {total_loss/num_batches if num_batches > 0 else 0.0:.4f}")
-    return total_loss / num_batches if num_batches > 0 else 0.0
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    print(f"\nTraining completed: {num_batches} batches, avg loss: {avg_loss:.4f}")
+
+    # Print epoch summary if monitoring is enabled
+    if monitor is not None:
+        monitor.print_epoch_summary(epoch=0)  # epoch passed from outer loop would be better
+
+    return avg_loss
 
 @torch.no_grad()
 def evaluate_graph_classification_single_task(model, predictor, dataset_info, data_loaders, task_idx,

@@ -340,7 +340,7 @@ def parse_joint_training_args():
                         help='Add a virtual node connected to all graph nodes for global information aggregation (uses main dropout rate and residual connections)')
 
     # === Dataset Configuration ===
-    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage', 
+    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Actor,DeezerEurope,LastFMAsia,Twitch-DE,Twitch-EN,Twitch-ES,Twitch-FR,Twitch-PT,Twitch-RU', 
                        help='Node classification training datasets')
     parser.add_argument('--nc_test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS', 
                        help='Node classification test datasets')
@@ -449,6 +449,15 @@ def parse_joint_training_args():
     parser.add_argument('--graph_pooling', type=str, default='max', choices=['mean', 'max', 'sum'], help='Graph pooling method')
     parser.add_argument('--lambda_gc', type=float, default=0.41834063194474214, help='Weight for graph classification loss')
     parser.add_argument('--context_graph_num', type=int, default=5, help='Number of context graphs for graph classification')
+
+    # === Multi-Dataset Sampling Arguments ===
+    parser.add_argument('--multi_dataset_sampling', type=str2bool, default=False,
+                       help='Enable temperature-based multi-dataset random sampling for graph classification')
+    parser.add_argument('--sampling_temperature', type=float, default=0.5,
+                       help='Temperature for dataset sampling probability (0=uniform, 1=size-proportional). '
+                            'Formula: p_i = (N_i)^T / sum_j((N_j)^T) where N_i = num_graphs_i * num_tasks_i')
+    parser.add_argument('--verbose_sampling', type=str2bool, default=False,
+                       help='Print detailed sampling statistics during training')
     
     # === OGB FUG embeddings arguments (for graph classification) ===
     parser.add_argument('--use_ogb_fug', type=str2bool, default=True,
@@ -478,7 +487,7 @@ def parse_joint_training_args():
                        help='Per-dataset context overrides for LP: "dataset1:shots1,dataset2:shots2"')
     parser.add_argument('--gc_context_overrides', type=str, default=None,
                        help='Per-dataset context overrides for GC: "dataset1:shots1,dataset2:shots2"')
-    
+
     # === Dynamic Context Refresh ===
     parser.add_argument('--context_refresh_interval', type=int, default=1,
                        help='Refresh contexts every N epochs (0 = never refresh)')

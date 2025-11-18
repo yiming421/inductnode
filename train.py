@@ -1742,70 +1742,106 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
         gc_tracker.log_memory("gc_section_start")
         gc_loss_sum = 0.0
         gc_dataset_count = 0
-        
-        for dataset_idx, dataset_info in enumerate(gc_processed_data_list):
-            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_start")
-            
-            # Use precomputed task-filtered splits
-            task_filtered_splits = dataset_info['task_filtered_splits']
-            
-            dataset_loss = 0.0
-            dataset_tasks = 0
-            
-            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_splits_loaded")
-            
-            # Train on each task separately using prefiltered data
-            for task_idx, task_splits in task_filtered_splits.items():
-                gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_task_{task_idx}_start")
 
-                # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
-                use_index_tracking = ('fug_mapping' in dataset_info or
-                                    'tsgfm_mapping' in dataset_info or
-                                    'tag_mapping' in dataset_info)
+        # Check if multi-dataset sampling is enabled
+        use_multi_dataset_sampling = getattr(args, 'multi_dataset_sampling', False)
 
-                # Create task-specific data loaders
-                task_data_loaders = create_data_loaders(
-                    dataset_info['dataset'], 
-                    task_splits,
-                    batch_size=args.gc_batch_size,
-                    shuffle=True,
-                    task_idx=task_idx,
-                    use_index_tracking=use_index_tracking
-                )
-                
-                # Track memory before graph classification training
-                gc_tracker.log_memory(f"gc_task_{task_idx}_training_start")
-                
-                # Train on this specific task
-                task_loss = train_graph_classification_single_task(
-                    model, predictor, dataset_info, task_data_loaders, opt_gc, task_idx,
-                    pooling_method=args.graph_pooling, device=device,
-                    clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
-                    normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
-                    lambda_=args.lambda_gc
-                )
-                
-                # Track memory after graph classification training
-                gc_tracker.log_memory(f"gc_task_{task_idx}_training_complete")
-                
-                dataset_loss += task_loss
-                dataset_tasks += 1
-            
-            # Track memory after processing all tasks for this dataset
-            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_all_tasks_complete")
-            
-            # Average loss across tasks for this dataset
-            if dataset_tasks > 0:
-                avg_dataset_loss = dataset_loss / dataset_tasks
-                gc_loss_sum += avg_dataset_loss
-                gc_dataset_count += 1
-                
-            gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_complete")
-        
-        if gc_dataset_count > 0:
-            total_gc_loss = gc_loss_sum / gc_dataset_count  # Already scaled in train_graph_classification_single_task
-            gc_count = gc_dataset_count
-            
+        if use_multi_dataset_sampling:
+            # NEW: Multi-dataset sampling with temperature
+            from src.engine_gc_multi_dataset import train_graph_classification_multi_dataset_sampling
+
+            # Extract splits from processed data
+            all_splits = [dataset_info['split_idx'] for dataset_info in gc_processed_data_list]
+
+            # Get temperature parameter
+            temperature = getattr(args, 'sampling_temperature', 0.5)
+
+            gc_tracker.log_memory("gc_multi_dataset_sampling_start")
+
+            # Train using multi-dataset sampling
+            total_gc_loss = train_graph_classification_multi_dataset_sampling(
+                model, predictor, gc_processed_data_list, all_splits, opt_gc,
+                temperature,
+                pooling_method=args.graph_pooling,
+                device=device,
+                batch_size=args.gc_batch_size,
+                clip_grad=args.clip_grad,
+                orthogonal_push=args.orthogonal_push,
+                normalize_class_h=args.normalize_class_h,
+                identity_projection=identity_projection,
+                context_k=getattr(args, 'context_k', None),
+                args=args
+            ) * args.lambda_gc  # Scale by lambda
+
+            gc_count = len(gc_processed_data_list)
+
+            gc_tracker.log_memory("gc_multi_dataset_sampling_complete")
+
+        else:
+            # ORIGINAL: Task-specific training (dataset by dataset, task by task)
+            for dataset_idx, dataset_info in enumerate(gc_processed_data_list):
+                gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_start")
+
+                # Use precomputed task-filtered splits
+                task_filtered_splits = dataset_info['task_filtered_splits']
+
+                dataset_loss = 0.0
+                dataset_tasks = 0
+
+                gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_splits_loaded")
+
+                # Train on each task separately using prefiltered data
+                for task_idx, task_splits in task_filtered_splits.items():
+                    gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_task_{task_idx}_start")
+
+                    # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
+                    use_index_tracking = ('fug_mapping' in dataset_info or
+                                        'tsgfm_mapping' in dataset_info or
+                                        'tag_mapping' in dataset_info)
+
+                    # Create task-specific data loaders
+                    task_data_loaders = create_data_loaders(
+                        dataset_info['dataset'],
+                        task_splits,
+                        batch_size=args.gc_batch_size,
+                        shuffle=True,
+                        task_idx=task_idx,
+                        use_index_tracking=use_index_tracking
+                    )
+
+                    # Track memory before graph classification training
+                    gc_tracker.log_memory(f"gc_task_{task_idx}_training_start")
+
+                    # Train on this specific task
+                    task_loss = train_graph_classification_single_task(
+                        model, predictor, dataset_info, task_data_loaders, opt_gc, task_idx,
+                        pooling_method=args.graph_pooling, device=device,
+                        clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
+                        normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
+                        lambda_=args.lambda_gc
+                    )
+
+                    # Track memory after graph classification training
+                    gc_tracker.log_memory(f"gc_task_{task_idx}_training_complete")
+
+                    dataset_loss += task_loss
+                    dataset_tasks += 1
+
+                # Track memory after processing all tasks for this dataset
+                gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_all_tasks_complete")
+
+                # Average loss across tasks for this dataset
+                if dataset_tasks > 0:
+                    avg_dataset_loss = dataset_loss / dataset_tasks
+                    gc_loss_sum += avg_dataset_loss
+                    gc_dataset_count += 1
+
+                gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_complete")
+
+            if gc_dataset_count > 0:
+                total_gc_loss = gc_loss_sum / gc_dataset_count  # Already scaled in train_graph_classification_single_task
+                gc_count = gc_dataset_count
+
         gc_tracker.log_memory("gc_section_complete")
     
     # Combined loss
