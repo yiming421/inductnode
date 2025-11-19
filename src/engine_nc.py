@@ -109,7 +109,12 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         # No need to concatenate again here
 
         # Apply different projection strategies
-        if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
+        # Priority: FUG embeddings > identity projection > standard projection > raw features
+        if hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
+            # FUG embeddings are uniform 1024-dim, just use simple MLP projection to hidden
+            # No need for PCA or identity projection since FUG already provides consistent embeddings
+            x_input = projector(base_features)
+        elif hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
             x_input = identity_projection(base_features)
         elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
             projected_features = projector(base_features)
@@ -156,12 +161,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         )
 
         target_y = data.y[train_perm_idx]
-        pred_output = pred(data, context_h, target_h, context_y, class_h)
-        if len(pred_output) == 3:  # MoE case with auxiliary loss
-            score, class_h, auxiliary_loss = pred_output
-        else:  # Standard case
-            score, class_h = pred_output
-            auxiliary_loss = 0.0
+        score, class_h = pred(data, context_h, target_h, context_y, class_h)
         score = F.log_softmax(score, dim=1)
         label = data.y[train_perm_idx].squeeze()
 
@@ -174,9 +174,9 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             orthogonal_loss = torch.sum(class_matrix[mask]**2)
         else:
             orthogonal_loss = torch.tensor(0.0, device=label.device)
-        
+
         nll_loss = F.nll_loss(score, label)
-        loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
+        loss = nll_loss + orthogonal_push * orthogonal_loss
         loss = loss * lambda_  # Apply lambda scaling
 
         # Only perform optimization if optimizer is provided (for joint training compatibility)
@@ -243,7 +243,12 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     # No need to concatenate again here
 
     # Apply different projection strategies
-    if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
+    # Priority: FUG embeddings > identity projection > standard projection > raw features
+    if hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
+        # FUG embeddings are uniform 1024-dim, just use simple MLP projection to hidden
+        # No need for PCA or identity projection since FUG already provides consistent embeddings
+        x_input = projector(base_features)
+    elif hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
         # Apply identity projection
         x_input = identity_projection(base_features)
     elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:

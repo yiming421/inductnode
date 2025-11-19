@@ -950,17 +950,11 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
     )
     
     # Use PFN predictor
-    pred_output = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
-    if len(pred_output) == 3:  # MoE case with auxiliary loss
-        scores, _, auxiliary_loss = pred_output
-    else:  # Standard case
-        scores, _ = pred_output
-        auxiliary_loss = 0.0
+    scores, _ = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
     scores = F.log_softmax(scores, dim=1)
 
     # Compute loss
-    nll_loss = F.nll_loss(scores, valid_labels)
-    total_loss = nll_loss + auxiliary_loss
+    total_loss = F.nll_loss(scores, valid_labels)
 
     return total_loss
 
@@ -1101,12 +1095,7 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         )
         
         # Use PFN predictor (all samples are valid, no masking needed)
-        pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
-        if len(pred_output) == 3:  # MoE case with auxiliary loss
-            scores_raw, refined_class_h, auxiliary_loss = pred_output
-        else:  # Standard case
-            scores_raw, refined_class_h = pred_output
-            auxiliary_loss = 0.0
+        scores_raw, refined_class_h = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
 
         # Apply log_softmax for loss computation
         scores_log = F.log_softmax(scores_raw, dim=1)
@@ -1123,7 +1112,7 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         else:
             orthogonal_loss = torch.tensor(0.0, device=device)
 
-        loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
+        loss = nll_loss + orthogonal_push * orthogonal_loss
         loss = loss * lambda_  # Apply lambda scaling (same as NC and LP)
 
         # ===== MONITORING: Collect statistics before backward =====

@@ -307,20 +307,11 @@ def train_graph_classification_multi_dataset_sampling(
         )
 
         # PFN prediction (following exact signature in engine_gc.py line 1104)
-        pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
-        if len(pred_output) == 3:  # MoE case with auxiliary loss
-            scores_raw, refined_class_h, auxiliary_loss = pred_output
-        else:  # Standard case
-            scores_raw, refined_class_h = pred_output
-            auxiliary_loss = 0.0
+        scores_raw, refined_class_h = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
 
         # Compute loss (following engine_gc.py line 1115)
         scores_log = F.log_softmax(scores_raw, dim=1)
         loss = F.nll_loss(scores_log, batch_labels)
-
-        # Add auxiliary loss (from MoE)
-        if auxiliary_loss > 0:
-            loss = loss + auxiliary_loss
 
         # Backward and optimize
         loss.backward()

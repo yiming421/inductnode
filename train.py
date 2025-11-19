@@ -37,6 +37,12 @@ from src.engine_gc import (
     aggregate_task_metrics,
     format_metric_results
 )
+from src.engine_graphcl import (
+    train_graphcl,
+    load_graphcl_datasets,
+    prepare_graphcl_data,
+    create_graphcl_projection_head
+)
 from src.gpu_utils import parse_gpu_spec, setup_cuda_visible_devices, validate_gpu_availability, print_gpu_info
 from transformers import get_cosine_schedule_with_warmup
 
@@ -938,7 +944,7 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
         # Process features using PCA and padding
         if test_datasets:
             processing_info = process_graph_features(
-                dataset, args.hidden, device, 
+                dataset, args.hidden, device,
                 args.use_identity_projection, args.projection_small_dim, args.projection_large_dim,
                 args.use_full_pca, False, args.normalize_data,
                 args.padding_strategy, args.use_batchnorm,
@@ -947,11 +953,13 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 processed_data=dataset_info,  # Pass embedding mapping info (FUG/TSGFM/TAGDataset)
                 pcba_context_only_pca=False,  # Use full optimization for test datasets
                 use_pca_cache=use_pca_cache_for_dataset, pca_cache_dir=args.pca_cache_dir,
-                dataset_name=getattr(dataset, 'name', None)
+                dataset_name=getattr(dataset, 'name', None),
+                use_random_orthogonal=args.use_random_orthogonal,
+                plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir
             )
         else:
             processing_info = process_graph_features(
-                dataset, args.hidden, device, 
+                dataset, args.hidden, device,
                 args.use_identity_projection, args.projection_small_dim, args.projection_large_dim,
                 args.use_full_pca, False, args.normalize_data,
                 args.padding_strategy, args.use_batchnorm,
@@ -960,7 +968,9 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 processed_data=dataset_info,  # Pass embedding mapping info (FUG/TSGFM/TAGDataset)
                 pcba_context_only_pca=False,  # Use full optimization for training datasets
                 use_pca_cache=use_pca_cache_for_dataset, pca_cache_dir=args.pca_cache_dir,
-                dataset_name=getattr(dataset, 'name', None)
+                dataset_name=getattr(dataset, 'name', None),
+                use_random_orthogonal=args.use_random_orthogonal,
+                plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir
             )
         
         processed_datasets.append(dataset)
@@ -977,12 +987,30 @@ def create_unified_model(args, input_dim, device):
     """
     # Initialize optional components
     identity_projection = None
+    projector = None
 
-    hidden = args.projection_large_dim if args.use_identity_projection else args.hidden
-        
-    if args.use_identity_projection:
+    # Determine the actual hidden dimension for GNN input
+    # Priority: FUG embeddings > identity projection > raw features
+    if getattr(args, 'use_external_embeddings_nc', False):
+        # FUG embeddings mode: use MLP projector to map 1024 -> hidden
+        hidden = args.hidden
+        from src.model import MLP
+        projector = MLP(
+            in_channels=1024,  # FUG generates uniform 1024-dim embeddings
+            hidden_channels=args.hidden,
+            out_channels=args.hidden,
+            num_layers=2,
+            dropout=args.dp,
+            norm=args.norm
+        )
+        projector = projector.to(device)
+        print(f"Created FUG projector: 1024 -> {args.hidden} (MLP with 2 layers)")
+    elif args.use_identity_projection:
+        hidden = args.projection_large_dim
         identity_projection = IdentityProjection(args.projection_small_dim, args.projection_large_dim)
         identity_projection = identity_projection.to(device)
+    else:
+        hidden = args.hidden
     
     # Create GNN backbone
     if args.model == 'PureGCN_v1':
@@ -1025,10 +1053,6 @@ def create_unified_model(args, input_dim, device):
             args.dp, args.norm, args.seperate, False, None, None, args.sim,
             args.padding, args.mlp_norm_affine, args.normalize_class_h,
             norm_type=getattr(args, 'transformer_norm_type', 'post'),
-            use_moe=getattr(args, 'use_moe', False),
-            moe_num_experts=getattr(args, 'moe_num_experts', 4),
-            moe_top_k=getattr(args, 'moe_top_k', 2),
-            moe_auxiliary_loss_weight=getattr(args, 'moe_auxiliary_loss_weight', 0.01),
             ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4)
         )
     else:
@@ -1036,8 +1060,8 @@ def create_unified_model(args, input_dim, device):
     
     model = model.to(device)
     predictor = predictor.to(device)
-    
-    return model, predictor, identity_projection
+
+    return model, predictor, identity_projection, projector
 
 
 def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=None):
@@ -1173,12 +1197,17 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
 
                 external_emb = nc_train_external_embeddings[i] if nc_train_external_embeddings else None
 
+                print(f"DEBUG [train.py BEFORE process_data]: args.plot_tsne={args.plot_tsne}, args.tsne_save_dir={args.tsne_save_dir}")
                 process_data(
                     data, split_idx, args.hidden, args.context_num, False, args.use_full_pca,
                     args.normalize_data, False, 32, 0, args.padding_strategy,
                     args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
-                    args.incremental_pca_batch_size, external_emb
+                    args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
+                    args.use_sparse_random, args.sparse_random_density,
+                    args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
+                    getattr(args, 'use_external_embeddings_nc', False)
                 )
+                print(f"DEBUG [train.py AFTER process_data]: Done")
 
                 if getattr(args, 'use_kmedoids_sampling', False):
                     new_context_sample = sample_context_with_kmedoids(
@@ -1199,7 +1228,10 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 data, split_idx, args.hidden, context_shots, False, args.use_full_pca,
                 args.normalize_data, False, 32, 0, args.padding_strategy,
                 args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
-                args.incremental_pca_batch_size, external_emb
+                args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
+                args.use_sparse_random, args.sparse_random_density,
+                args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
+                getattr(args, 'use_external_embeddings_nc', False)
             )
 
             if getattr(args, 'use_kmedoids_sampling', False):
@@ -1564,7 +1596,7 @@ def get_hierarchical_task_schedule(epoch, args):
     """
     if not args.use_hierarchical_training:
         # All tasks active if hierarchical training is disabled
-        return {'nc': True, 'lp': True, 'gc': True}
+        return {'nc': True, 'lp': True, 'gc': True, 'graphcl': True}
 
     # Parse phase configuration
     phases = args.hierarchical_phases.split(',')
@@ -1589,14 +1621,16 @@ def get_hierarchical_task_schedule(epoch, args):
     active_tasks = {
         'nc': 'nc' in phase_tasks,
         'lp': 'lp' in phase_tasks,
-        'gc': 'gc' in phase_tasks
+        'gc': 'gc' in phase_tasks,
+        'graphcl': 'graphcl' in phase_tasks or 'gcl' in phase_tasks  # Support both names
     }
 
     return active_tasks
 
 
 def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch,
-                       identity_projection=None, nc_loaders=None, optimizer_nc=None, optimizer_lp=None, optimizer_gc=None):
+                       identity_projection=None, nc_loaders=None, optimizer_nc=None, optimizer_lp=None, optimizer_gc=None,
+                       optimizer_graphcl=None, graphcl_projection_head=None, graphcl_data_loader=None):
     """
     Perform one joint training step combining all three tasks.
 
@@ -1675,7 +1709,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
             nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=opt_nc, pred=predictor,
                               batch_size=args.nc_batch_size, degree=False,
                               orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
-                              clip_grad=args.clip_grad, rank=0, epoch=epoch,
+                              clip_grad=args.clip_grad, projector=projector, rank=0, epoch=epoch,
                               identity_projection=identity_projection, lambda_=args.lambda_nc, args=args)
             if nc_loss is not None:
                 total_nc_loss = nc_loss
@@ -1843,9 +1877,23 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                 gc_count = gc_dataset_count
 
         gc_tracker.log_memory("gc_section_complete")
-    
+
+    # GraphCL Loss (Contrastive Learning)
+    total_graphcl_loss = torch.tensor(0.0, device=device)
+    graphcl_count = 0
+    if active_tasks.get('graphcl', False) and getattr(args, 'enable_graphcl', False) and graphcl_data_loader is not None and graphcl_projection_head is not None and args.lambda_graphcl > 0:
+        opt_graphcl = optimizer_graphcl if optimizer_graphcl is not None else optimizer
+
+        # Train GraphCL for one epoch on the data loader
+        graphcl_results = train_graphcl(
+            model, graphcl_projection_head, graphcl_data_loader, opt_graphcl, args,
+            device=device, identity_projection=identity_projection, rank=0, lambda_=args.lambda_graphcl
+        )
+        total_graphcl_loss = torch.tensor(graphcl_results['loss'], device=device)  # Loss already includes lambda scaling
+        graphcl_count = 1
+
     # Combined loss
-    combined_loss = total_nc_loss + total_lp_loss + total_gc_loss
+    combined_loss = total_nc_loss + total_lp_loss + total_gc_loss + total_graphcl_loss
 
     # Restore original lambda values if we temporarily changed them
     if args.use_separate_optimizers:
@@ -1857,10 +1905,12 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
         'nc_loss': total_nc_loss,
         'lp_loss': total_lp_loss,
         'gc_loss': total_gc_loss,
+        'graphcl_loss': total_graphcl_loss,
         'combined_loss': combined_loss,
         'nc_count': nc_count,
         'lp_count': lp_count,
-        'gc_count': gc_count
+        'gc_count': gc_count,
+        'graphcl_count': graphcl_count
     }
 
 
@@ -1891,7 +1941,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                 # Use inductive evaluation for unseen datasets
                 train_metrics, valid_metrics, test_metrics = test_all_induct(
                     model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                    False, None, None, True, None, 0, identity_projection
+                    False, None, None, True, projector, 0, identity_projection
                 )
 
                 datasets_time = time.time() - datasets_start_time
@@ -1937,7 +1987,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     # Use transductive evaluation for seen datasets (original approach)
                     train_metrics, valid_metrics, test_metrics = test_all(
                         model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                        False, None, None, True, None, 0, identity_projection
+                        False, None, None, True, projector, 0, identity_projection
                     )
                     results = {
                         'train': train_metrics if isinstance(train_metrics, (int, float)) else sum(train_metrics) / len(train_metrics),
@@ -2301,6 +2351,7 @@ def run_joint_training(args, device='cuda:0'):
     print(f"  Node Classification: {'✓' if getattr(args, 'enable_nc', True) else '✗'} (lambda: {args.lambda_nc})")
     print(f"  Link Prediction: {'✓' if getattr(args, 'enable_lp', True) else '✗'} (lambda: {args.lambda_lp})")
     print(f"  Graph Classification: {'✓' if getattr(args, 'enable_gc', True) else '✗'} (lambda: {args.lambda_gc})")
+    print(f"  GraphCL (Contrastive): {'✓' if getattr(args, 'enable_graphcl', False) else '✗'} (lambda: {getattr(args, 'lambda_graphcl', 0.0)})")
     
     # Initialize link prediction tracker early if link prediction is enabled
     if getattr(args, 'enable_lp', True) and lp_tracker is None:
@@ -2370,17 +2421,38 @@ def run_joint_training(args, device='cuda:0'):
     
     # Create unified model
     with lp_tracker.time_operation('data_preparation') if lp_tracker else nullcontext():
-        model, predictor, identity_projection = create_unified_model(
+        model, predictor, identity_projection, projector = create_unified_model(
             args, args.hidden, device)
     
     if lp_tracker:
         lp_tracker.record_memory()
         after_model_stats = lp_tracker.get_memory_stats()
         print(f"After Model Creation - GPU: {after_model_stats['gpu_allocated']:.2f}GB, CPU: {after_model_stats['cpu_memory']:.2f}GB")
-    
+
+    # Setup GraphCL if enabled
+    graphcl_projection_head = None
+    graphcl_data_loader = None
+    if getattr(args, 'enable_graphcl', False):
+        print(f"\n=== Setting up GraphCL ===")
+        # Load GraphCL datasets
+        dataset_names = [name.strip() for name in args.graphcl_dataset.split(',')]
+        graphcl_datasets = load_graphcl_datasets(dataset_names, args, device=device, rank=0)
+
+        # Prepare data loader
+        if len(graphcl_datasets) > 0:
+            graphcl_data_loader = prepare_graphcl_data(graphcl_datasets, args, device=device, rank=0)
+
+            # Create projection head
+            graphcl_projection_head = create_graphcl_projection_head(args, device=device)
+            print(f"GraphCL projection head created: {args.hidden}D -> {args.graphcl_projection_dim}D")
+            print(f"GraphCL datasets loaded: {len(graphcl_datasets)} datasets, {len(graphcl_data_loader.dataset)} graphs")
+        else:
+            print("Warning: No GraphCL datasets loaded, disabling GraphCL")
+            args.enable_graphcl = False
+
     # Setup optimizer and scheduler
     parameters = []
-    for module in [model, predictor, identity_projection]:
+    for module in [model, predictor, identity_projection, graphcl_projection_head]:
         if module is not None:
             parameters.extend(list(module.parameters()))
 
@@ -2389,17 +2461,20 @@ def run_joint_training(args, device='cuda:0'):
         lr_nc = args.lr_nc if args.lr_nc is not None else args.lr
         lr_lp = args.lr_lp if args.lr_lp is not None else args.lr
         lr_gc = args.lr_gc if args.lr_gc is not None else args.lr
+        lr_graphcl = getattr(args, 'lr_graphcl', None) if hasattr(args, 'lr_graphcl') else args.lr
 
-        print(f"Using separate optimizers - NC LR: {lr_nc:.2e}, LP LR: {lr_lp:.2e}, GC LR: {lr_gc:.2e}")
+        print(f"Using separate optimizers - NC LR: {lr_nc:.2e}, LP LR: {lr_lp:.2e}, GC LR: {lr_gc:.2e}, GraphCL LR: {lr_graphcl:.2e}")
 
         if args.optimizer == 'adam':
             optimizer_nc = torch.optim.Adam(parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
             optimizer_lp = torch.optim.Adam(parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
             optimizer_gc = torch.optim.Adam(parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_graphcl = torch.optim.Adam(parameters, lr=lr_graphcl, weight_decay=args.weight_decay, eps=args.eps) if getattr(args, 'enable_graphcl', False) else None
         elif args.optimizer == 'adamw':
             optimizer_nc = torch.optim.AdamW(parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
             optimizer_lp = torch.optim.AdamW(parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
             optimizer_gc = torch.optim.AdamW(parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_graphcl = torch.optim.AdamW(parameters, lr=lr_graphcl, weight_decay=args.weight_decay, eps=args.eps) if getattr(args, 'enable_graphcl', False) else None
 
         def create_scheduler(opt):
             if args.schedule == 'cosine':
@@ -2415,6 +2490,7 @@ def run_joint_training(args, device='cuda:0'):
         scheduler_nc = create_scheduler(optimizer_nc)
         scheduler_lp = create_scheduler(optimizer_lp)
         scheduler_gc = create_scheduler(optimizer_gc)
+        scheduler_graphcl = create_scheduler(optimizer_graphcl) if optimizer_graphcl is not None else None
 
         # For compatibility, set primary optimizer to NC
         optimizer = optimizer_nc
@@ -2440,8 +2516,8 @@ def run_joint_training(args, device='cuda:0'):
         else:
             scheduler = None
 
-        optimizer_nc = optimizer_lp = optimizer_gc = None
-        scheduler_nc = scheduler_lp = scheduler_gc = None
+        optimizer_nc = optimizer_lp = optimizer_gc = optimizer_graphcl = None
+        scheduler_nc = scheduler_lp = scheduler_gc = scheduler_graphcl = None
     
     print(f"Total parameters: {sum(p.numel() for p in parameters):,}")
     
@@ -2568,7 +2644,10 @@ def run_joint_training(args, device='cuda:0'):
             nc_loaders=data_dict.get('nc_train_loaders', None),
             optimizer_nc=optimizer_nc if args.use_separate_optimizers else None,
             optimizer_lp=optimizer_lp if args.use_separate_optimizers else None,
-            optimizer_gc=optimizer_gc if args.use_separate_optimizers else None
+            optimizer_gc=optimizer_gc if args.use_separate_optimizers else None,
+            optimizer_graphcl=optimizer_graphcl if args.use_separate_optimizers else None,
+            graphcl_projection_head=graphcl_projection_head,
+            graphcl_data_loader=graphcl_data_loader
         )
 
         # Step scheduler(s)
@@ -2579,6 +2658,8 @@ def run_joint_training(args, device='cuda:0'):
                 scheduler_lp.step()
             if scheduler_gc is not None:
                 scheduler_gc.step()
+            if scheduler_graphcl is not None:
+                scheduler_graphcl.step()
         else:
             if scheduler is not None:
                 scheduler.step()
@@ -2684,6 +2765,7 @@ def run_joint_training(args, device='cuda:0'):
                          f"NC Loss: {train_results['nc_loss']:.4f} | "
                          f"LP Loss: {train_results['lp_loss']:.4f} | "
                          f"GC Loss: {train_results['gc_loss']:.4f} | "
+                         f"GraphCL Loss: {train_results['graphcl_loss']:.4f} | "
                          f"Combined: {train_results['combined_loss']:.4f} | "
                          f"NC Valid (Seen): {nc_valid_seen:.4f} | LP Valid (Seen): {lp_valid_seen:.4f} | GC Valid (Seen): {gc_valid_seen:.4f}")
             

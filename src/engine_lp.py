@@ -313,14 +313,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     continue
 
                 # Use unified PFNPredictorNodeCls for link prediction
-                pred_output = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(),
+                scores, link_prototypes = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(),
                                       link_prototypes, "link_prediction")
-                if len(pred_output) == 3:  # MoE case with auxiliary loss
-                    scores, link_prototypes, auxiliary_loss = pred_output
-                else:  # Standard case
-                    scores, link_prototypes = pred_output
-                    auxiliary_loss = 0.0
-                
+
                 # Use the train_mask to ensure loss is only calculated on non-context edges
                 # Make sure the mask is properly aligned with batch indices
                 if train_mask.size(0) != edge_pairs.size(0):
@@ -331,10 +326,10 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 else:
                     # Index with CPU batch_indices, then move result to GPU
                     mask_for_loss = train_mask[batch_indices].to(device)
-                
+
                 # Use CrossEntropyLoss for multi-class classification (link vs no-link)
                 nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
-                
+
                 # Compute optional orthogonal loss on prototypes
                 if orthogonal_push > 0:
                     proto_norm = F.normalize(link_prototypes, p=2, dim=1)
@@ -343,8 +338,8 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     orthogonal_loss = torch.sum(proto_matrix[mask]**2)
                 else:
                     orthogonal_loss = torch.tensor(0.0, device=device)
-                    
-                loss = nll_loss + orthogonal_push * orthogonal_loss + auxiliary_loss
+
+                loss = nll_loss + orthogonal_push * orthogonal_loss
                 loss = loss * lambda_  # Apply lambda scaling
                 
                 try:

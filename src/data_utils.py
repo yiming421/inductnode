@@ -5,6 +5,11 @@ import numpy as np
 from sklearn.decomposition import PCA, IncrementalPCA
 from torch_geometric.utils import negative_sampling
 from torch_sparse import SparseTensor
+import os
+
+# Import ablation study modules
+from src.projection_methods import apply_random_orthogonal_projection, apply_sparse_random_projection
+from src.feature_analysis import compute_feature_statistics, print_feature_statistics, plot_tsne_features
 
 def apply_incremental_pca_cpu(data_tensor, target_dim, batch_size=10000, sign_normalize=False, rank=0):
     """
@@ -117,6 +122,10 @@ def apply_incremental_pca_cpu(data_tensor, target_dim, batch_size=10000, sign_no
     
     return result_tensor
 
+# Note: apply_random_orthogonal_projection, apply_sparse_random_projection,
+# compute_feature_statistics, print_feature_statistics, and plot_tsne_features
+# have been moved to src/projection_methods.py and src/feature_analysis.py
+
 def select_k_shot_context(data, k, index):
     classes = data.y.unique()
     context_samples = []
@@ -153,7 +162,11 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
                  normalize_data=False, use_projector=False, min_pca_dim=32, rank=0,
                  padding_strategy='zero', use_batchnorm=False, use_identity_projection=False,
                  projection_small_dim=128, projection_large_dim=256, pca_device='gpu',
-                 incremental_pca_batch_size=10000, external_embeddings=None):
+                 incremental_pca_batch_size=10000, external_embeddings=None, use_random_orthogonal=False,
+                 use_sparse_random=False, sparse_random_density=0.1,
+                 plot_tsne=False, tsne_save_dir='./tsne_plots', use_pca_whitening=False, whitening_epsilon=0.01,
+                 use_fug_embeddings=False):
+    print(f"DEBUG [process_data ENTRY]: plot_tsne={plot_tsne}, rank={rank}, dataset={data.name}")
     device = data.x.device
     split_idx['train'] = split_idx['train'].to(device)
     split_idx['valid'] = split_idx['valid'].to(device)
@@ -172,7 +185,25 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     else:
         input_features = data.x
 
-    # GPSE Enhancement: Concatenate GPSE embeddings if available
+    # FUG embeddings mode: Skip PCA/identity projection, just use features directly
+    # IMPORTANT: FUG embeddings should NOT be combined with GPSE/LapPE/RWSE to maintain uniform 1024-dim
+    # The projector MLP in engine_nc.py will handle 1024 -> hidden projection
+    if use_fug_embeddings and external_embeddings is not None:
+        data.uses_fug_embeddings = True
+        data.x = input_features
+        data.needs_projection = False
+        data.needs_identity_projection = False
+        if rank == 0:
+            print(f"Dataset {data.name}: FUG embeddings mode - using features directly ({input_features.size(1)}D)")
+            print(f"Dataset {data.name}: Skipping GPSE/LapPE/RWSE concatenation to preserve FUG's uniform dimension")
+            print(f"Dataset {data.name}: Projector MLP will handle {input_features.size(1)}D -> hidden projection")
+            print(f"Data preprocessing time: {time.time()-st:.2f}s", flush=True)
+        return
+
+    # Not using FUG embeddings
+    data.uses_fug_embeddings = False
+
+    # GPSE Enhancement: Concatenate GPSE embeddings if available (only when not using FUG)
     if hasattr(data, 'gpse_embeddings') and data.gpse_embeddings is not None:
         gpse_emb = data.gpse_embeddings.to(device)
         original_dim = input_features.size(1)
@@ -180,7 +211,7 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         if rank == 0:
             print(f"Dataset {data.name}: Concatenated GPSE embeddings ({original_dim}D + {gpse_emb.size(1)}D = {input_features.size(1)}D)")
 
-    # LapPE Enhancement: Concatenate Laplacian PE if available
+    # LapPE Enhancement: Concatenate Laplacian PE if available (only when not using FUG)
     if hasattr(data, 'lappe_embeddings') and data.lappe_embeddings is not None:
         lappe_emb = data.lappe_embeddings.to(device)
         original_dim = input_features.size(1)
@@ -188,7 +219,7 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         if rank == 0:
             print(f"Dataset {data.name}: Concatenated LapPE embeddings ({original_dim}D + {lappe_emb.size(1)}D = {input_features.size(1)}D)")
 
-    # RWSE Enhancement: Concatenate Random Walk SE if available
+    # RWSE Enhancement: Concatenate Random Walk SE if available (only when not using FUG)
     if hasattr(data, 'rwse_embeddings') and data.rwse_embeddings is not None:
         rwse_emb = data.rwse_embeddings.to(device)
         original_dim = input_features.size(1)
@@ -202,25 +233,61 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         if rank == 0:
             print(f"Dataset {data.name}: Identity projection ({original_dim}D -> PCA to {projection_small_dim}D -> Project to {projection_large_dim}D)")
         
-        # Step 1: PCA to small dimension (NO padding needed!)
+        # Step 1: PCA or random projection to small dimension (NO padding needed!)
         if original_dim >= projection_small_dim:
-            # Standard PCA to small_dim
-            if use_full_pca:
+            if use_sparse_random:
+                # Use sparse random projection instead of PCA
+                data.x_pca = apply_sparse_random_projection(
+                    input_features, input_dim=original_dim, target_dim=projection_small_dim,
+                    density=sparse_random_density, seed=42, rank=rank
+                )
+            elif use_random_orthogonal:
+                # Use dense random orthogonal projection instead of PCA
+                data.x_pca = apply_random_orthogonal_projection(
+                    input_features, input_dim=original_dim, target_dim=projection_small_dim, seed=42, rank=rank
+                )
+            elif use_full_pca:
+                # Standard full PCA to small_dim
                 U, S, V = torch.svd(input_features)
                 U = U[:, :projection_small_dim]
                 S = S[:projection_small_dim]
+
+                # Sign normalization if requested
+                if sign_normalize:
+                    for i in range(projection_small_dim):
+                        feature_vector = U[:, i] * S[i]
+                        max_idx = torch.argmax(torch.abs(feature_vector))
+                        if feature_vector[max_idx] < 0:
+                            U[:, i] = -U[:, i]
+
+                if use_pca_whitening:
+                    # Whitening: divide by sqrt(eigenvalues + epsilon)
+                    S_whitened = torch.sqrt(S + whitening_epsilon)
+                    data.x_pca = torch.mm(U, torch.diag(S / S_whitened))
+                    if rank == 0:
+                        print(f"Dataset {data.name}: Applied PCA whitening (epsilon={whitening_epsilon})")
+                else:
+                    data.x_pca = torch.mm(U, torch.diag(S))
             else:
+                # Low-rank PCA to small_dim
                 U, S, V = torch.pca_lowrank(input_features, q=projection_small_dim)
 
-            # Sign normalization if requested
-            if sign_normalize:
-                for i in range(projection_small_dim):
-                    feature_vector = U[:, i] * S[i]
-                    max_idx = torch.argmax(torch.abs(feature_vector))
-                    if feature_vector[max_idx] < 0:
-                        U[:, i] = -U[:, i]
+                # Sign normalization if requested
+                if sign_normalize:
+                    for i in range(projection_small_dim):
+                        feature_vector = U[:, i] * S[i]
+                        max_idx = torch.argmax(torch.abs(feature_vector))
+                        if feature_vector[max_idx] < 0:
+                            U[:, i] = -U[:, i]
 
-            data.x_pca = torch.mm(U, torch.diag(S))
+                if use_pca_whitening:
+                    # Whitening: divide by sqrt(eigenvalues + epsilon)
+                    S_whitened = torch.sqrt(S + whitening_epsilon)
+                    data.x_pca = torch.mm(U, torch.diag(S / S_whitened))
+                    if rank == 0:
+                        print(f"Dataset {data.name}: Applied PCA whitening (epsilon={whitening_epsilon})")
+                else:
+                    data.x_pca = torch.mm(U, torch.diag(S))
         else:
             # For very small datasets, use all dimensions + minimal padding if needed
             data.x_pca = input_features
@@ -235,7 +302,10 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         data.x = data.x_pca  # Input to identity projection layer
         data.needs_identity_projection = True
         data.projection_target_dim = projection_large_dim
-        
+
+        # Save features before normalization for t-SNE visualization
+        features_before_norm = data.x.clone() if plot_tsne and rank == 0 else None
+
         # Apply normalization if requested
         if normalize_data:
             if use_batchnorm:
@@ -248,9 +318,54 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
                 data.x = F.normalize(data.x, p=2, dim=1)
                 if rank == 0:
                     print(f"Dataset {data.name}: Applied LayerNorm-style normalization")
-        
+
+        # Save features after normalization too
+        features_after_norm = data.x.clone() if plot_tsne and rank == 0 else None
+
         if rank == 0:
             print(f"Identity projection preprocessing time: {time.time()-st:.2f}s", flush=True)
+
+        # Plot t-SNE if requested (identity projection path)
+        # Compare BEFORE and AFTER normalization to see BatchNorm's effect
+        if plot_tsne and rank == 0:
+            print(f"DEBUG: Creating t-SNE plot for {data.name} (identity projection path)")
+            if use_sparse_random:
+                method_name = "Sparse Random Projection"
+            elif use_random_orthogonal:
+                method_name = "Dense Random Orthogonal Projection"
+            else:
+                method_name = "PCA"
+                if use_pca_whitening:
+                    method_name += " + Whitening"
+
+            # Plot BEFORE BatchNorm
+            print(f"\n{'='*70}")
+            print(f"BEFORE BatchNorm:")
+            print(f"{'='*70}")
+            plot_tsne_features(
+                original_features=input_features,
+                processed_features=features_before_norm,
+                labels=data.y,
+                dataset_name=data.name,
+                method_name=method_name + " (Before BN)",
+                save_dir=tsne_save_dir,
+                rank=rank
+            )
+
+            # Plot AFTER BatchNorm (if normalization was applied)
+            if normalize_data and features_after_norm is not None:
+                print(f"\n{'='*70}")
+                print(f"AFTER BatchNorm:")
+                print(f"{'='*70}")
+                plot_tsne_features(
+                    original_features=input_features,
+                    processed_features=features_after_norm,
+                    labels=data.y,
+                    dataset_name=data.name,
+                    method_name=method_name + " (After BN)",
+                    save_dir=tsne_save_dir,
+                    rank=rank
+                )
         return
     
     # Original PCA-based approach
@@ -278,8 +393,21 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         if rank == 0:
             print(f"Dataset {data.name}: Using zero padding ({original_dim} -> zero-pad to {hidden})")
     
-    # Apply PCA - choose method based on configuration
-    if pca_device == 'cpu':
+    # Apply PCA or Random Orthogonal Projection - choose method based on configuration
+    if use_random_orthogonal:
+        # Use random orthogonal projection instead of PCA (ablation study)
+        projection_start = time.time()
+        data.x_pca = apply_random_orthogonal_projection(
+            input_features,
+            input_dim=original_dim,
+            target_dim=pca_target_dim,
+            seed=42,
+            rank=rank
+        )
+        projection_time = time.time() - projection_start
+        if rank == 0:
+            print(f"Dataset {data.name}: Random orthogonal projection completed in {projection_time:.2f}s")
+    elif pca_device == 'cpu':
         # Use CPU-based Incremental PCA (stays on CPU)
         pca_start = time.time()
         data.x_pca = apply_incremental_pca_cpu(
@@ -379,7 +507,24 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
                 print(f"Dataset {data.name}: Applied LayerNorm-style normalization")
 
     if rank == 0:
-        print(f"PCA time: {time.time()-st:.2f}s", flush=True) 
+        print(f"PCA time: {time.time()-st:.2f}s", flush=True)
+
+    # Plot t-SNE if requested
+    print(f"DEBUG: plot_tsne={plot_tsne}, rank={rank}")
+    if plot_tsne and rank == 0:
+        print(f"DEBUG: Creating t-SNE plot for {data.name}")
+        method_name = "Random Orthogonal Projection" if use_random_orthogonal else "PCA"
+        plot_tsne_features(
+            original_features=input_features,
+            processed_features=data.x,
+            labels=data.y,
+            dataset_name=data.name,
+            method_name=method_name,
+            save_dir=tsne_save_dir,
+            rank=rank
+        )
+    else:
+        print(f"DEBUG: Skipping t-SNE plot (plot_tsne={plot_tsne}, rank={rank})") 
 
 def prepare_link_data(data, split_idx, negative_ratio=1.0):
     """
@@ -505,6 +650,7 @@ def process_link_data(data, args, rank=0):
     normalize_data = args.normalize_data
     use_batchnorm = args.use_batchnorm
     padding_strategy = args.padding_strategy
+    use_random_orthogonal = getattr(args, 'use_random_orthogonal', False)
     
     # Identity projection approach
     if use_identity_projection:
@@ -513,15 +659,21 @@ def process_link_data(data, args, rank=0):
             print(f"Dataset {data.name}: Identity projection ({original_dim}D -> PCA to {projection_small_dim}D -> Project to {projection_large_dim}D)")
         
         if original_dim >= projection_small_dim:
-            if use_full_pca:
+            if use_random_orthogonal:
+                # Use random orthogonal projection instead of PCA
+                data.x_pca = apply_random_orthogonal_projection(
+                    data.x, input_dim=original_dim, target_dim=projection_small_dim, seed=42, rank=rank
+                )
+            elif use_full_pca:
                 # Full PCA to small_dim
                 U, S, V = torch.svd(data.x)
                 U = U[:, :projection_small_dim]
                 S = S[:projection_small_dim]
+                data.x_pca = torch.mm(U, torch.diag(S))
             else:
                 # Low-rank PCA to small_dim
                 U, S, V = torch.pca_lowrank(data.x, q=projection_small_dim)
-            data.x_pca = torch.mm(U, torch.diag(S))
+                data.x_pca = torch.mm(U, torch.diag(S))
         else:
             raise ValueError(f"Original dimension {original_dim} is less than projection_small_dim {projection_small_dim}. Cannot apply identity projection.")
         
@@ -536,16 +688,22 @@ def process_link_data(data, args, rank=0):
             pca_target_dim = hidden_dim
         else:
             pca_target_dim = original_dim
-        
-        if use_full_pca:
+
+        if use_random_orthogonal:
+            # Use random orthogonal projection instead of PCA
+            data.x_pca = apply_random_orthogonal_projection(
+                data.x, input_dim=original_dim, target_dim=pca_target_dim, seed=42, rank=rank
+            ).to(device)
+        elif use_full_pca:
             U, S, V = torch.svd(data.x)
+            U = U[:, :pca_target_dim]
+            S = S[:pca_target_dim]
+            data.x_pca = torch.mm(U, torch.diag(S)).to(device)
         else:
             U, S, V = torch.pca_lowrank(data.x, q=pca_target_dim)
-        
-        U = U[:, :pca_target_dim]
-        S = S[:pca_target_dim]
-        
-        data.x_pca = torch.mm(U, torch.diag(S)).to(device)
+            U = U[:, :pca_target_dim]
+            S = S[:pca_target_dim]
+            data.x_pca = torch.mm(U, torch.diag(S)).to(device)
         
         if data.x_pca.size(1) < hidden_dim:
             padding_size = hidden_dim - data.x_pca.size(1)

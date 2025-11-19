@@ -1603,27 +1603,45 @@ def _load_pca_cache(dataset_name, target_dim, cache_dir="./pca_cache"):
         return None
 
 
-def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pca_device, incremental_pca_batch_size, pca_sample_threshold=float('inf'), use_pca_cache=False, pca_cache_dir="./pca_cache", dataset_name=None, target_cuda_device=None):
+def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pca_device, incremental_pca_batch_size, pca_sample_threshold=float('inf'), use_pca_cache=False, pca_cache_dir="./pca_cache", dataset_name=None, target_cuda_device=None, use_random_orthogonal=False):
     """
     Unified PCA application with support for sampling large datasets on GPU.
+    Can also use random orthogonal projection instead of PCA for ablation studies.
     """
 
-    
+
     pca_start = time.time()
     n_samples = data_tensor.shape[0]
-    print(f"Applying PCA on {n_samples:,} samples with target dimension {target_dim}, threshold {pca_sample_threshold:,}")
+
+    if use_random_orthogonal:
+        print(f"Applying random orthogonal projection on {n_samples:,} samples with target dimension {target_dim}")
+    else:
+        print(f"Applying PCA on {n_samples:,} samples with target dimension {target_dim}, threshold {pca_sample_threshold:,}")
     
+    # Use random orthogonal projection if requested (ablation study)
+    if use_random_orthogonal:
+        from .data_utils import apply_random_orthogonal_projection
+        input_dim = data_tensor.shape[1]
+        processed_features = apply_random_orthogonal_projection(
+            data_tensor,
+            input_dim=input_dim,
+            target_dim=target_dim,
+            seed=42,
+            rank=0
+        )
+        return processed_features
+
     # Check for cached results first
     if use_pca_cache and dataset_name:
         cached_result = _load_pca_cache(dataset_name, target_dim, pca_cache_dir)
         if cached_result is not None:
             return cached_result.to(data_tensor.device)
-    
+
     # Cache miss - force CPU computation for accurate caching
     cache_miss = use_pca_cache and dataset_name
     if cache_miss:
         pca_device = 'cpu'
-    
+
     # Handle device for GPU operations - keep data on CPU, only move samples/batches as needed
     original_device = data_tensor.device
     target_device = None
@@ -1636,7 +1654,7 @@ def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pc
         else:
             print(f"WARNING: GPU requested but CUDA not available, falling back to CPU")
             pca_device = 'cpu'
-    
+
     if pca_device == 'cpu':
         # Use CPU Incremental PCA
         from .data_utils import apply_incremental_pca_cpu
@@ -1731,14 +1749,15 @@ def _apply_pca_unified(data_tensor, target_dim, use_full_pca, sign_normalize, pc
     
     return processed_features
 
-def process_graph_features(dataset, hidden_dim, device='cuda', 
+def process_graph_features(dataset, hidden_dim, device='cuda',
                          use_identity_projection=False, projection_small_dim=128, projection_large_dim=256,
                          use_full_pca=False, sign_normalize=False, normalize_data=False,
                          padding_strategy='zero', use_batchnorm=False,
                          use_gpse=False, gpse_path='/home/maweishuo/GPSE/datasets', dataset_name=None,
                          pca_device='gpu', incremental_pca_batch_size=10000, pca_sample_threshold=500000,
                          processed_data=None, pcba_context_only_pca=False,
-                         use_pca_cache=False, pca_cache_dir="./pca_cache"):
+                         use_pca_cache=False, pca_cache_dir="./pca_cache", use_random_orthogonal=False,
+                         plot_tsne=False, tsne_save_dir="./tsne_plots"):
     """
     Process graph features using PCA directly on embedding table for maximum memory efficiency.
     
@@ -1916,7 +1935,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             processed_features = _apply_pca_unified(
                 stacked_features, projection_small_dim, use_full_pca, sign_normalize,
                 pca_device, incremental_pca_batch_size, pca_sample_threshold,
-                use_pca_cache, pca_cache_dir, dataset_name, device
+                use_pca_cache, pca_cache_dir, dataset_name, device, use_random_orthogonal
             )
         else:
             # Not enough samples for full PCA to projection_small_dim, apply PCA to all available dimensions then pad
@@ -1925,7 +1944,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             pca_features = _apply_pca_unified(
                 stacked_features, pca_dim, use_full_pca, sign_normalize,
                 pca_device, incremental_pca_batch_size, pca_sample_threshold,
-                use_pca_cache, pca_cache_dir, dataset_name, device
+                use_pca_cache, pca_cache_dir, dataset_name, device, use_random_orthogonal
             )
             
             # Apply padding to reach projection_small_dim
@@ -1951,7 +1970,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             processed_features = _apply_pca_unified(
                 stacked_features, hidden_dim, use_full_pca, sign_normalize,
                 pca_device, incremental_pca_batch_size, pca_sample_threshold,
-                use_pca_cache, pca_cache_dir, dataset_name, device
+                use_pca_cache, pca_cache_dir, dataset_name, device, use_random_orthogonal
             )
             
         else:
@@ -1961,7 +1980,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
             pca_features = _apply_pca_unified(
                 stacked_features, pca_dim, use_full_pca, sign_normalize,
                 pca_device, incremental_pca_batch_size, pca_sample_threshold,
-                use_pca_cache, pca_cache_dir, dataset_name, device
+                use_pca_cache, pca_cache_dir, dataset_name, device, use_random_orthogonal
             )
             
             # Apply padding to reach target dimension
