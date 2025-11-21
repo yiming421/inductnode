@@ -1214,5 +1214,232 @@ class UnifiedGNN(nn.Module):
 
                 # Apply convolution
                 h = self._apply_conv(self.conv2, adj_t, h, e_feat)
-        
+
         return h
+
+
+# ============================================================================
+# Dynamic Encoder Wrapper
+# ============================================================================
+
+class GNNWithDE(nn.Module):
+    """
+    Wrapper that adds Dynamic Encoder (DE) before GNN for end-to-end feature projection.
+
+    Architecture:
+        Raw Features (N, d_original)
+            ↓
+        [Column Sampling] - sample n_s nodes → (n_s, d_original)
+            ↓
+        [Dynamic Encoder MLP] - learns projection matrix T (d_original, k)
+            ↓
+        [Universal Projection] - X @ T → (N, k)
+            ↓
+        [L2 Normalize] → (N, k)
+            ↓
+        [GNN] - existing GNN model → (N, hidden)
+
+    Key Features:
+    - Learns projection in end-to-end manner (no offline PCA)
+    - Handles variable input dimensions across datasets
+    - Random column sampling during training acts as augmentation
+    - Uniformity loss prevents basis collapse
+    """
+
+    def __init__(self,
+                 gnn_model,
+                 de_sample_size=1024,
+                 de_hidden_dim=512,
+                 de_output_dim=256,
+                 de_activation='prelu',
+                 de_use_layernorm=True,
+                 de_dropout=0.0,
+                 de_norm_affine=True,
+                 lambda_de=0.01,
+                 update_sample_every_n_steps=1):
+        """
+        Initialize GNN with Dynamic Encoder wrapper.
+
+        Args:
+            gnn_model (nn.Module): Base GNN model (PureGCN_v1, GCN, UnifiedGNN, etc.)
+            de_sample_size (int): Number of nodes to sample for DE (n_s)
+            de_hidden_dim (int): Hidden dimension for DE MLP
+            de_output_dim (int): DE projection output dim (should match GNN input_dim)
+            de_activation (str): Activation function for DE
+            de_use_layernorm (bool): Use LayerNorm in DE
+            de_dropout (float): Dropout rate in DE (should match main model dropout)
+            de_norm_affine (bool): Learnable affine in LayerNorm
+            lambda_de (float): Weight for DE uniformity loss
+            update_sample_every_n_steps (int): Update sample every N forward passes
+        """
+        super(GNNWithDE, self).__init__()
+
+        from src.dynamic_encoder import DynamicEncoder
+
+        self.gnn = gnn_model
+
+        # Initialize DE immediately (no lazy init needed - it works for any input dim!)
+        self.de = DynamicEncoder(
+            sample_size=de_sample_size,
+            hidden_dim=de_hidden_dim,
+            output_dim=de_output_dim,
+            activation=de_activation,
+            use_layernorm=de_use_layernorm,
+            dropout=de_dropout,
+            norm_affine=de_norm_affine,
+        )
+
+        self.de_sample_size = de_sample_size
+        self.lambda_de = lambda_de
+        self.update_every_n = update_sample_every_n_steps
+
+        # Learnable LayerNorm for projected features (preserves std≈1.0 for GNN)
+        self.proj_layer_norm = nn.LayerNorm(de_output_dim)
+
+        # Tracking
+        self.step_counter = 0
+        self.cached_sample = None
+        self.current_projection_matrix = None  # For loss computation
+
+        print(f"[DE] Initialized immediately: sample_size={de_sample_size}, output_dim={de_output_dim}")
+        print(f"[DE] Parameters: {sum(p.numel() for p in self.de.parameters()):,}")
+        print(f"[DE] Added learnable LayerNorm for projected features")
+
+    def forward(self, x, adj_t, batch=None):
+        """
+        Forward pass with Dynamic Encoder projection.
+
+        Args:
+            x (torch.Tensor): Node features (N, d_original)
+            adj_t: Adjacency tensor (SparseTensor or edge_index)
+            batch (torch.Tensor, optional): Batch assignment for graph-level tasks
+
+        Returns:
+            h (torch.Tensor): Node embeddings (N, hidden)
+        """
+        # Step 1: Sample features for DE
+        from src.dynamic_encoder import sample_feature_columns
+
+        if self.training:
+            # Training: Update sample periodically OR use cached
+            if self.step_counter % self.update_every_n == 0:
+                sampled_features = sample_feature_columns(
+                    x,
+                    self.de_sample_size,
+                    training=True,
+                    deterministic_eval=False
+                )
+                self.cached_sample = sampled_features
+            else:
+                # Reuse cached sample (reduces randomness)
+                sampled_features = self.cached_sample if self.cached_sample is not None else \
+                                  sample_feature_columns(x, self.de_sample_size, training=True)
+            self.step_counter += 1
+        else:
+            # Evaluation: Deterministic sampling (first n_s nodes)
+            sampled_features = sample_feature_columns(
+                x,
+                self.de_sample_size,
+                training=False,
+                deterministic_eval=True
+            )
+
+        # Step 2: Generate projection matrix via DE
+        projection_matrix = self.de(sampled_features)  # (d_original, k)
+        self.current_projection_matrix = projection_matrix  # Cache for loss
+
+        # Step 3: Project features with learnable LayerNorm
+        from src.dynamic_encoder import apply_dynamic_projection
+        x_proj = apply_dynamic_projection(x, projection_matrix, normalize=True, layer_norm=self.proj_layer_norm)  # (N, k)
+
+        # Always cache x_proj for separability tracking
+        self._debug_x_proj = x_proj
+
+        # DEBUG: Retain gradients on intermediate tensors to trace explosion (first step only)
+        if self.step_counter == 1 and self.training:
+            x_proj.retain_grad()
+            # Store references for gradient inspection
+            self._debug_x = x
+            self._debug_projection_matrix = projection_matrix
+
+        # Step 4: Pass through GNN
+        h = self.gnn(x_proj, adj_t, batch)
+
+        return h
+
+    def get_de_loss(self):
+        """
+        Compute DE uniformity loss.
+
+        Returns:
+            loss (torch.Tensor): Scalar DE loss (0 if not in training)
+        """
+        if not self.training:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        # Use cached uniformity loss from DE
+        return self.de.uniformity_loss() * self.lambda_de
+
+    def get_de_diagnostics(self):
+        """
+        Get diagnostic information about DE for monitoring.
+
+        Returns:
+            dict with diagnostic metrics
+        """
+        if not hasattr(self, 'de') or self.de is None:
+            return {}
+
+        diagnostics = {}
+
+        # Projection matrix statistics
+        if self.current_projection_matrix is not None:
+            proj = self.current_projection_matrix
+            diagnostics['proj_mean'] = proj.mean().item()
+            diagnostics['proj_std'] = proj.std().item()
+            diagnostics['proj_min'] = proj.min().item()
+            diagnostics['proj_max'] = proj.max().item()
+            diagnostics['proj_norm'] = proj.norm().item()
+
+            # Check for NaN or Inf
+            diagnostics['proj_has_nan'] = torch.isnan(proj).any().item()
+            diagnostics['proj_has_inf'] = torch.isinf(proj).any().item()
+
+            # Basis vector norms (should be ~1 after normalization)
+            basis_norms = proj.norm(dim=1)
+            diagnostics['basis_norm_mean'] = basis_norms.mean().item()
+            diagnostics['basis_norm_std'] = basis_norms.std().item()
+            diagnostics['basis_norm_min'] = basis_norms.min().item()
+            diagnostics['basis_norm_max'] = basis_norms.max().item()
+
+            # Column statistics (output dimensions)
+            col_norms = proj.norm(dim=0)
+            diagnostics['col_norm_mean'] = col_norms.mean().item()
+            diagnostics['col_norm_std'] = col_norms.std().item()
+
+        # DE parameter statistics
+        param_norms = []
+        param_grads = []
+        for name, param in self.de.named_parameters():
+            param_norms.append(param.data.norm().item())
+            if param.grad is not None:
+                param_grads.append(param.grad.norm().item())
+
+        if param_norms:
+            diagnostics['de_param_norm_mean'] = sum(param_norms) / len(param_norms)
+            diagnostics['de_param_norm_max'] = max(param_norms)
+
+        if param_grads:
+            diagnostics['de_grad_norm_mean'] = sum(param_grads) / len(param_grads)
+            diagnostics['de_grad_norm_max'] = max(param_grads)
+            diagnostics['de_grad_has_none'] = False
+        else:
+            diagnostics['de_grad_has_none'] = True
+
+        # Uniformity loss components
+        if self.de.cached_projection is not None:
+            mean_vec = self.de.cached_projection.mean(dim=0)
+            diagnostics['mean_vec_norm'] = mean_vec.norm().item()
+            diagnostics['uniformity_loss'] = self.de.uniformity_loss().item()
+
+        return diagnostics

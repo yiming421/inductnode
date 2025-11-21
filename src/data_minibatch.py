@@ -219,7 +219,7 @@ class MiniBatchNCLoader:
 
 
 def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, device,
-                                  identity_projection=None, external_embeddings=None, optimizer=None):
+                                  identity_projection=None, projector=None, external_embeddings=None, optimizer=None):
     """
     Compute node classification loss using MiniBatchNCLoader.
     Performs forward pass, backward pass, and optimizer step for each batch.
@@ -241,6 +241,8 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
     """
     batches = data_loader.get_batches()
     total_loss = 0.0
+    total_nll_loss = 0.0
+    total_de_loss = 0.0
     count = 0
 
     # Track memory at start
@@ -330,7 +332,15 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
             # Call predictor (no MoE)
             score, _ = predictor(batch, context_h, h_seed, context_y, class_h)
             score = F.log_softmax(score, dim=1)
-            loss = F.nll_loss(score, labels)
+            nll_loss = F.nll_loss(score, labels)
+
+            # Extract DE loss if model has DE
+            de_loss = 0.0
+            if hasattr(model, 'get_de_loss'):
+                de_loss_tensor = model.get_de_loss()
+                de_loss = de_loss_tensor.item() if isinstance(de_loss_tensor, torch.Tensor) else de_loss_tensor
+
+            loss = nll_loss + de_loss
 
         else:
             # Full-batch: delegate to original train() function
@@ -346,7 +356,7 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
                 orthogonal_push=args.orthogonal_push if hasattr(args, 'orthogonal_push') else 0.0,
                 normalize_class_h=args.normalize_class_h if hasattr(args, 'normalize_class_h') else False,
                 clip_grad=args.clip_grad if hasattr(args, 'clip_grad') else 1.0,
-                projector=None,
+                projector=projector,
                 rank=0,
                 epoch=0,  # epoch doesn't matter for training
                 identity_projection=identity_projection,
@@ -355,7 +365,15 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
                 external_embeddings=external_embeddings
             )
 
-            total_loss += loss
+            # Handle dict return from train()
+            if isinstance(loss, dict):
+                total_loss += loss['total']
+                total_nll_loss += loss['nll']
+                total_de_loss += loss['de']
+            else:
+                total_loss += loss
+                total_nll_loss += loss
+                total_de_loss += 0.0
             count += 1
             continue  # Skip the common backward/optimizer code below (already done in train())
 
@@ -382,6 +400,8 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
                 data_loader.stats['gpu_memory_mb'].append(mem_peak)
 
         total_loss += loss.item()
+        total_nll_loss += nll_loss.item()
+        total_de_loss += de_loss  # Already a scalar
         count += 1
 
         # Explicitly delete batch to free memory
@@ -417,17 +437,24 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
         print(f"    [DEBUG] Memory right before function returns: {torch.cuda.memory_allocated(device) / 1024**2:.0f} MB")
 
     avg_loss = total_loss / count if count > 0 else 0.0
+    avg_nll_loss = total_nll_loss / count if count > 0 else 0.0
+    avg_de_loss = total_de_loss / count if count > 0 else 0.0
 
     # Final memory check after return value is computed
     if data_loader.is_minibatch() and torch.cuda.is_available():
         print(f"    [DEBUG] Memory at function exit: {torch.cuda.memory_allocated(device) / 1024**2:.0f} MB")
 
-    return avg_loss
+    # Return dict with breakdown for DE loss tracking
+    return {
+        'total': avg_loss,
+        'nll': avg_nll_loss,
+        'de': avg_de_loss
+    }
 
 
 @torch.no_grad()
 def evaluate_with_loader(data_loader, split_idx, model, predictor, args, device,
-                         eval_split='valid', identity_projection=None):
+                         eval_split='valid', identity_projection=None, projector=None):
     """
     Evaluate using mini-batch sampling (Option 3: sample neighborhoods for eval nodes only).
 
@@ -498,7 +525,12 @@ def evaluate_with_loader(data_loader, split_idx, model, predictor, args, device,
             )
 
             x = batch.x
-            if identity_projection is not None:
+
+            # Apply projection strategies (same priority as engine_nc.py)
+            # Priority: FUG embeddings > identity projection > raw features
+            if hasattr(batch, 'uses_fug_embeddings') and batch.uses_fug_embeddings and projector is not None:
+                x = projector(x)
+            elif identity_projection is not None:
                 x = identity_projection(x)
 
             # Forward pass on subgraph

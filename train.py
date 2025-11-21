@@ -1045,7 +1045,44 @@ def create_unified_model(args, input_dim, device):
         )
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
-    
+
+    # Wrap with Dynamic Encoder if enabled
+    if args.use_dynamic_encoder:
+        from src.model import GNNWithDE
+
+        # DE output dim should match GNN input dim (hidden)
+        de_output_dim = hidden
+
+        # DE dropout should match main model dropout
+        de_dropout = args.dp
+
+        # DE activation should match main model activation
+        de_activation = getattr(args, 'activation', 'relu')
+
+        print(f"\n{'='*70}")
+        print(f"Wrapping model with Dynamic Encoder:")
+        print(f"  - Sample size: {args.de_sample_size}")
+        print(f"  - Hidden dim: {args.de_hidden_dim}")
+        print(f"  - Output dim: {de_output_dim} (matches GNN input)")
+        print(f"  - Activation: {de_activation} (matches main model)")
+        print(f"  - Dropout: {de_dropout} (matches main model)")
+        print(f"  - Lambda DE: {args.lambda_de}")
+        print(f"  - Update sample every: {args.de_update_sample_every_n_steps} steps")
+        print(f"{'='*70}\n")
+
+        model = GNNWithDE(
+            gnn_model=model,
+            de_sample_size=args.de_sample_size,
+            de_hidden_dim=args.de_hidden_dim,
+            de_output_dim=de_output_dim,
+            de_activation=de_activation,
+            de_use_layernorm=True,  # Always use LayerNorm
+            de_dropout=de_dropout,
+            de_norm_affine=True,  # Always use affine
+            lambda_de=args.lambda_de,
+            update_sample_every_n_steps=args.de_update_sample_every_n_steps
+        )
+
     # Create unified predictor (same for both tasks)
     if args.predictor == 'PFN':
         predictor = PFNPredictorNodeCls(
@@ -1197,7 +1234,6 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
 
                 external_emb = nc_train_external_embeddings[i] if nc_train_external_embeddings else None
 
-                print(f"DEBUG [train.py BEFORE process_data]: args.plot_tsne={args.plot_tsne}, args.tsne_save_dir={args.tsne_save_dir}")
                 process_data(
                     data, split_idx, args.hidden, args.context_num, False, args.use_full_pca,
                     args.normalize_data, False, 32, 0, args.padding_strategy,
@@ -1205,9 +1241,9 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                     args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
                     args.use_sparse_random, args.sparse_random_density,
                     args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
-                    getattr(args, 'use_external_embeddings_nc', False)
+                    getattr(args, 'use_external_embeddings_nc', False),
+                    args.use_dynamic_encoder
                 )
-                print(f"DEBUG [train.py AFTER process_data]: Done")
 
                 if getattr(args, 'use_kmedoids_sampling', False):
                     new_context_sample = sample_context_with_kmedoids(
@@ -1231,7 +1267,8 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
                 args.use_sparse_random, args.sparse_random_density,
                 args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
-                getattr(args, 'use_external_embeddings_nc', False)
+                getattr(args, 'use_external_embeddings_nc', False),
+                args.use_dynamic_encoder
             )
 
             if getattr(args, 'use_kmedoids_sampling', False):
@@ -1629,7 +1666,7 @@ def get_hierarchical_task_schedule(epoch, args):
 
 
 def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch,
-                       identity_projection=None, nc_loaders=None, optimizer_nc=None, optimizer_lp=None, optimizer_gc=None,
+                       identity_projection=None, projector=None, nc_loaders=None, optimizer_nc=None, optimizer_lp=None, optimizer_gc=None,
                        optimizer_graphcl=None, graphcl_projection_head=None, graphcl_data_loader=None):
     """
     Perform one joint training step combining all three tasks.
@@ -1670,6 +1707,9 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     nc_count = 0
     lp_count = 0
     gc_count = 0
+    # Initialize loss breakdown variables
+    nc_nll_loss = 0.0
+    nc_de_loss = 0.0
 
     # Unpack data
     nc_data_list, nc_split_idx_list, nc_external_embeddings = nc_data
@@ -1693,26 +1733,48 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
         # Use mini-batch loaders if provided, otherwise fallback to train_all
         if nc_loaders is not None and len(nc_loaders) > 0:
             nc_loss_sum = 0.0
+            nc_nll_sum = 0.0
+            nc_de_sum = 0.0
             for i, (data_loader, split_idx) in enumerate(zip(nc_loaders, nc_split_idx_list)):
                 external_emb = nc_external_embeddings[i] if nc_external_embeddings else None
-                nc_loss = compute_nc_loss_with_loader(
+                nc_loss_result = compute_nc_loss_with_loader(
                     data_loader, split_idx, model, predictor, args, device,
                     identity_projection=identity_projection,
+                    projector=projector,
                     external_embeddings=external_emb,
                     optimizer=opt_nc
                 )
-                nc_loss_sum += nc_loss  # nc_loss is already a scalar
-            total_nc_loss = torch.tensor(nc_loss_sum / len(nc_loaders), device=device)  # Average across datasets
+                # Handle dict return
+                if isinstance(nc_loss_result, dict):
+                    nc_loss_sum += nc_loss_result['total']
+                    nc_nll_sum += nc_loss_result['nll']
+                    nc_de_sum += nc_loss_result['de']
+                else:
+                    # Fallback for backward compatibility
+                    nc_loss_sum += nc_loss_result
+                    nc_nll_sum += nc_loss_result
+                    nc_de_sum += 0.0
+            total_nc_loss = torch.tensor(nc_loss_sum / len(nc_loaders), device=device)
+            nc_nll_loss = nc_nll_sum / len(nc_loaders)
+            nc_de_loss = nc_de_sum / len(nc_loaders)
             nc_count = len(nc_loaders)
         else:
             # Fallback to original full-batch training
-            nc_loss = train_all(model, nc_data_list, nc_split_idx_list, optimizer=opt_nc, pred=predictor,
+            nc_loss_result = train_all(model, nc_data_list, nc_split_idx_list, optimizer=opt_nc, pred=predictor,
                               batch_size=args.nc_batch_size, degree=False,
                               orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
                               clip_grad=args.clip_grad, projector=projector, rank=0, epoch=epoch,
                               identity_projection=identity_projection, lambda_=args.lambda_nc, args=args)
-            if nc_loss is not None:
-                total_nc_loss = nc_loss
+            if nc_loss_result is not None:
+                # Handle dict return with DE loss breakdown
+                if isinstance(nc_loss_result, dict):
+                    total_nc_loss = nc_loss_result['total']
+                    nc_nll_loss = nc_loss_result['nll']
+                    nc_de_loss = nc_loss_result['de']
+                else:
+                    total_nc_loss = nc_loss_result
+                    nc_nll_loss = nc_loss_result
+                    nc_de_loss = 0.0
                 nc_count = len(nc_data_list)
     
     # Link Prediction Loss
@@ -1903,6 +1965,8 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
     return {
         'nc_loss': total_nc_loss,
+        'nc_nll_loss': nc_nll_loss,
+        'nc_de_loss': nc_de_loss,
         'lp_loss': total_lp_loss,
         'gc_loss': total_gc_loss,
         'graphcl_loss': total_graphcl_loss,
@@ -1914,7 +1978,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     }
 
 
-def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None, nc_loaders=None):
+def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None, projector=None, nc_loaders=None):
     """
     Evaluate node classification task only.
 
@@ -1967,7 +2031,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                             # Mini-batch evaluation
                             eval_acc = evaluate_with_loader(
                                 loader, split_idx, model, predictor, args, device,
-                                eval_split=split, identity_projection=identity_projection
+                                eval_split=split, identity_projection=identity_projection, projector=projector
                             )
                             eval_accs.append(eval_acc)
                         else:
@@ -1975,7 +2039,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                             from src.engine_nc import test
                             _, eval_acc, _ = test(
                                 model, predictor, loader.data, split_idx['train'], split_idx['valid'], split_idx['test'],
-                                args.test_batch_size, False, None, None, True, None, 0, identity_projection
+                                args.test_batch_size, False, None, None, True, projector, 0, identity_projection
                             )
                             eval_accs.append(eval_acc)
 
@@ -2304,7 +2368,7 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
 
 
 def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='valid',
-                    identity_projection=None, gc_tracker=None, nc_loaders=None):
+                    identity_projection=None, projector=None, gc_tracker=None, nc_loaders=None):
     """
     Evaluate enabled tasks and return metrics.
 
@@ -2319,7 +2383,7 @@ def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='v
 
     # Evaluate node classification
     if hasattr(args, 'enable_nc') and args.enable_nc and nc_data is not None and nc_data[0] is not None:
-            nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection, nc_loaders)
+            nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection, projector, nc_loaders)
             results['nc_metrics'] = nc_results
     
     # Evaluate link prediction  
@@ -2451,10 +2515,36 @@ def run_joint_training(args, device='cuda:0'):
             args.enable_graphcl = False
 
     # Setup optimizer and scheduler
-    parameters = []
-    for module in [model, predictor, identity_projection, graphcl_projection_head]:
-        if module is not None:
-            parameters.extend(list(module.parameters()))
+    # Use parameter groups for DE (lower lr due to ~50x larger gradients)
+    de_lr_scale = getattr(args, 'de_lr_scale', 0.02)  # DE gets 2% of base lr by default
+
+    if args.use_dynamic_encoder and hasattr(model, 'de'):
+        # Separate DE parameters from main model
+        de_params = list(model.de.parameters())
+        if hasattr(model, 'proj_layer_norm'):
+            de_params.extend(list(model.proj_layer_norm.parameters()))
+        de_param_ids = set(id(p) for p in de_params)
+
+        # Collect non-DE parameters
+        other_params = []
+        for module in [model, predictor, identity_projection, projector, graphcl_projection_head]:
+            if module is not None:
+                for p in module.parameters():
+                    if id(p) not in de_param_ids:
+                        other_params.append(p)
+
+        # Parameter groups: DE gets lower lr
+        param_groups = [
+            {'params': other_params, 'lr': args.lr},
+            {'params': de_params, 'lr': args.lr * de_lr_scale},
+        ]
+        parameters = param_groups
+        print(f"DE learning rate: {args.lr * de_lr_scale:.2e} ({de_lr_scale:.0%} of base lr)")
+    else:
+        parameters = []
+        for module in [model, predictor, identity_projection, projector, graphcl_projection_head]:
+            if module is not None:
+                parameters.extend(list(module.parameters()))
 
     if args.use_separate_optimizers:
         # Separate optimizers mode: one optimizer per task
@@ -2519,7 +2609,12 @@ def run_joint_training(args, device='cuda:0'):
         optimizer_nc = optimizer_lp = optimizer_gc = optimizer_graphcl = None
         scheduler_nc = scheduler_lp = scheduler_gc = scheduler_graphcl = None
     
-    print(f"Total parameters: {sum(p.numel() for p in parameters):,}")
+    # Count total parameters (handle both list and param_groups)
+    if isinstance(parameters, list) and len(parameters) > 0 and isinstance(parameters[0], dict):
+        total_params = sum(p.numel() for group in parameters for p in group['params'])
+    else:
+        total_params = sum(p.numel() for p in parameters)
+    print(f"Total parameters: {total_params:,}")
     
     # Load checkpoint states if checkpoint was provided
     if checkpoint is not None:
@@ -2551,7 +2646,7 @@ def run_joint_training(args, device='cuda:0'):
             # Node Classification Test on unseen datasets
             if getattr(args, 'enable_nc', True) and data_dict['nc_test'][0] is not None:
                 nc_test_results = evaluate_node_classification(
-                    model, predictor, data_dict['nc_test'], args, 'test', identity_projection
+                    model, predictor, data_dict['nc_test'], args, 'test', identity_projection, projector
                 )
             
             # Link Prediction Test on unseen datasets
@@ -2630,7 +2725,14 @@ def run_joint_training(args, device='cuda:0'):
     best_valid_score = 0.0
     best_epoch = 0
     best_model_state = None
-    
+
+    # Store initial projector state for monitoring weight changes
+    initial_projector_state = None
+    if projector is not None:
+        initial_projector_state = {name: param.data.clone()
+                                   for name, param in projector.named_parameters()}
+        print("Stored initial projector weights for change monitoring")
+
     for epoch in range(args.epochs):
         start_time = time.time()
 
@@ -2640,7 +2742,7 @@ def run_joint_training(args, device='cuda:0'):
         # Joint training step
         train_results = joint_training_step(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
-            optimizer, args, epoch, identity_projection,
+            optimizer, args, epoch, identity_projection, projector,
             nc_loaders=data_dict.get('nc_train_loaders', None),
             optimizer_nc=optimizer_nc if args.use_separate_optimizers else None,
             optimizer_lp=optimizer_lp if args.use_separate_optimizers else None,
@@ -2649,6 +2751,46 @@ def run_joint_training(args, device='cuda:0'):
             graphcl_projection_head=graphcl_projection_head,
             graphcl_data_loader=graphcl_data_loader
         )
+
+        # Monitor projector gradients and weights (for FUG embeddings debugging)
+        if projector is not None and epoch % 5 == 0:  # Every 5 epochs
+            # Gradient monitoring
+            grad_norms = []
+            for name, param in projector.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    grad_norms.append(grad_norm)
+
+            if grad_norms:
+                avg_grad = sum(grad_norms) / len(grad_norms)
+                max_grad = max(grad_norms)
+                min_grad = min(grad_norms)
+                print(f"[Epoch {epoch}] Projector Gradients - Avg: {avg_grad:.6e}, Max: {max_grad:.6e}, Min: {min_grad:.6e}")
+                if avg_grad < 1e-6:
+                    print(f"  ⚠️  WARNING: Very small projector gradients ({avg_grad:.6e}) - learning may be too slow!")
+                if max_grad > 100:
+                    print(f"  ⚠️  WARNING: Large projector gradients ({max_grad:.6e}) - possible instability!")
+
+            # Weight change monitoring
+            if initial_projector_state is not None:
+                weight_changes = []
+                for name, param in projector.named_parameters():
+                    if name in initial_projector_state:
+                        initial_weight = initial_projector_state[name]
+                        current_weight = param.data
+                        change = (current_weight - initial_weight).abs().mean().item()
+                        weight_changes.append(change)
+
+                if weight_changes:
+                    avg_change = sum(weight_changes) / len(weight_changes)
+                    max_change = max(weight_changes)
+                    print(f"[Epoch {epoch}] Projector Weight Changes - Avg: {avg_change:.6e}, Max: {max_change:.6e}")
+                    if avg_change < 1e-6:
+                        print(f"  ❌ CRITICAL: Weights barely changed ({avg_change:.6e}) - projector NOT learning!")
+                    elif avg_change < 1e-4:
+                        print(f"  ⚠️  WARNING: Very small weight changes ({avg_change:.6e}) - slow learning!")
+                    else:
+                        print(f"  ✓ Weights are changing (learning in progress)")
 
         # Step scheduler(s)
         if args.use_separate_optimizers:
@@ -2667,7 +2809,7 @@ def run_joint_training(args, device='cuda:0'):
         # Every epoch: Validation on seen datasets (training data) for early stopping
         seen_valid_results = joint_evaluation(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
-            args, 'valid', identity_projection, gc_tracker,
+            args, 'valid', identity_projection, projector, gc_tracker,
             nc_loaders=data_dict.get('nc_train_loaders', None)
         )
 
@@ -2697,7 +2839,7 @@ def run_joint_training(args, device='cuda:0'):
             
             if getattr(args, 'enable_nc', True) and data_dict['nc_test'][0] is not None:
                 nc_unseen_results = evaluate_node_classification(
-                    model, predictor, data_dict['nc_test'], args, 'test', identity_projection
+                    model, predictor, data_dict['nc_test'], args, 'test', identity_projection, projector
                 )
             
             if getattr(args, 'enable_lp', True) and data_dict['lp_test'][0] is not None:
@@ -2797,6 +2939,8 @@ def run_joint_training(args, device='cuda:0'):
             wandb_log = {
                 'epoch': epoch,
                 'train/nc_loss': train_results['nc_loss'],
+                'train/nc_nll_loss': train_results.get('nc_nll_loss', train_results['nc_loss']),
+                'train/nc_de_loss': train_results.get('nc_de_loss', 0.0),
                 'train/lp_loss': train_results['lp_loss'],
                 'train/gc_loss': train_results['gc_loss'],
                 'train/combined_loss': train_results['combined_loss'],
@@ -2833,7 +2977,7 @@ def run_joint_training(args, device='cuda:0'):
     # Node Classification Test on unseen datasets
     if getattr(args, 'enable_nc', True) and data_dict['nc_test'][0] is not None:
         nc_test_results = evaluate_node_classification(
-            model, predictor, data_dict['nc_test'], args, 'test', identity_projection
+            model, predictor, data_dict['nc_test'], args, 'test', identity_projection, projector
         )
     
     # Link Prediction Test on unseen datasets
@@ -2915,6 +3059,7 @@ def run_joint_training(args, device='cuda:0'):
         checkpoint_path = save_checkpoint(
             model, predictor, optimizer,  # Include optimizer state
             args, best_metrics, best_epoch,
+            projector=projector,
             identity_projection=identity_projection, rank=0
         )
 

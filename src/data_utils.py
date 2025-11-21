@@ -165,8 +165,7 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
                  incremental_pca_batch_size=10000, external_embeddings=None, use_random_orthogonal=False,
                  use_sparse_random=False, sparse_random_density=0.1,
                  plot_tsne=False, tsne_save_dir='./tsne_plots', use_pca_whitening=False, whitening_epsilon=0.01,
-                 use_fug_embeddings=False):
-    print(f"DEBUG [process_data ENTRY]: plot_tsne={plot_tsne}, rank={rank}, dataset={data.name}")
+                 use_fug_embeddings=False, use_dynamic_encoder=False):
     device = data.x.device
     split_idx['train'] = split_idx['train'].to(device)
     split_idx['valid'] = split_idx['valid'].to(device)
@@ -193,6 +192,20 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         data.x = input_features
         data.needs_projection = False
         data.needs_identity_projection = False
+
+        # Apply normalization to FUG embeddings (same as regular inputs)
+        if normalize_data:
+            if use_batchnorm:
+                batch_mean = data.x.mean(dim=0, keepdim=True)
+                batch_std = data.x.std(dim=0, keepdim=True, unbiased=False)
+                data.x = (data.x - batch_mean) / (batch_std + 1e-5)
+                if rank == 0:
+                    print(f"Dataset {data.name}: Applied BatchNorm-style normalization to FUG embeddings")
+            else:
+                data.x = F.normalize(data.x, p=2, dim=1)
+                if rank == 0:
+                    print(f"Dataset {data.name}: Applied L2 normalization to FUG embeddings")
+
         if rank == 0:
             print(f"Dataset {data.name}: FUG embeddings mode - using features directly ({input_features.size(1)}D)")
             print(f"Dataset {data.name}: Skipping GPSE/LapPE/RWSE concatenation to preserve FUG's uniform dimension")
@@ -202,6 +215,62 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
 
     # Not using FUG embeddings
     data.uses_fug_embeddings = False
+
+    # Dynamic Encoder mode: Skip PCA, keep raw features for end-to-end learning
+    # DE will learn the projection matrix during training
+    if use_dynamic_encoder:
+        if rank == 0:
+            print(f"Dataset {data.name}: Using Dynamic Encoder (skip PCA preprocessing)")
+            print(f"  - Original features: {input_features.shape}")
+
+        # GPSE/LapPE/RWSE Enhancement: Concatenate positional encodings if available
+        # (Apply these BEFORE DE so DE learns on the augmented features)
+        if hasattr(data, 'gpse_embeddings') and data.gpse_embeddings is not None:
+            gpse_emb = data.gpse_embeddings.to(device)
+            original_dim = input_features.size(1)
+            input_features = torch.cat([input_features, gpse_emb], dim=1)
+            if rank == 0:
+                print(f"  - Concatenated GPSE: {original_dim}D + {gpse_emb.size(1)}D = {input_features.size(1)}D")
+
+        if hasattr(data, 'lappe_embeddings') and data.lappe_embeddings is not None:
+            lappe_emb = data.lappe_embeddings.to(device)
+            original_dim = input_features.size(1)
+            input_features = torch.cat([input_features, lappe_emb], dim=1)
+            if rank == 0:
+                print(f"  - Concatenated LapPE: {original_dim}D + {lappe_emb.size(1)}D = {input_features.size(1)}D")
+
+        if hasattr(data, 'rwse_embeddings') and data.rwse_embeddings is not None:
+            rwse_emb = data.rwse_embeddings.to(device)
+            original_dim = input_features.size(1)
+            input_features = torch.cat([input_features, rwse_emb], dim=1)
+            if rank == 0:
+                print(f"  - Concatenated RWSE: {original_dim}D + {rwse_emb.size(1)}D = {input_features.size(1)}D")
+
+        # Store raw features (DE will project them during forward pass)
+        data.x = input_features
+        data.uses_dynamic_encoder = True
+        data.needs_projection = False
+        data.needs_identity_projection = False
+        data.de_original_dim = input_features.size(1)  # Store for DE initialization
+
+        # Optional normalization (standardization helps DE training)
+        if normalize_data:
+            if use_batchnorm:
+                batch_mean = data.x.mean(dim=0, keepdim=True)
+                batch_std = data.x.std(dim=0, keepdim=True, unbiased=False)
+                data.x = (data.x - batch_mean) / (batch_std + 1e-5)
+                if rank == 0:
+                    print(f"  - Applied BatchNorm-style normalization")
+            else:
+                data.x = F.normalize(data.x, p=2, dim=1)
+                if rank == 0:
+                    print(f"  - Applied L2 normalization")
+
+        if rank == 0:
+            print(f"  - Final feature dimension: {data.x.size(1)}D")
+            print(f"  - DE will project to {hidden}D during forward pass")
+            print(f"Data preprocessing time: {time.time()-st:.2f}s", flush=True)
+        return
 
     # GPSE Enhancement: Concatenate GPSE embeddings if available (only when not using FUG)
     if hasattr(data, 'gpse_embeddings') and data.gpse_embeddings is not None:
@@ -328,7 +397,6 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         # Plot t-SNE if requested (identity projection path)
         # Compare BEFORE and AFTER normalization to see BatchNorm's effect
         if plot_tsne and rank == 0:
-            print(f"DEBUG: Creating t-SNE plot for {data.name} (identity projection path)")
             if use_sparse_random:
                 method_name = "Sparse Random Projection"
             elif use_random_orthogonal:
@@ -510,9 +578,7 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
         print(f"PCA time: {time.time()-st:.2f}s", flush=True)
 
     # Plot t-SNE if requested
-    print(f"DEBUG: plot_tsne={plot_tsne}, rank={rank}")
     if plot_tsne and rank == 0:
-        print(f"DEBUG: Creating t-SNE plot for {data.name}")
         method_name = "Random Orthogonal Projection" if use_random_orthogonal else "PCA"
         plot_tsne_features(
             original_features=input_features,
@@ -523,8 +589,6 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
             save_dir=tsne_save_dir,
             rank=rank
         )
-    else:
-        print(f"DEBUG: Skipping t-SNE plot (plot_tsne={plot_tsne}, rank={rank})") 
 
 def prepare_link_data(data, split_idx, negative_ratio=1.0):
     """

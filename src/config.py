@@ -145,6 +145,20 @@ def parse_joint_training_args():
     parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
     parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
 
+    # === Dynamic Encoder (DE) Configuration ===
+    parser.add_argument('--use_dynamic_encoder', type=str2bool, default=False,
+                       help='Use Dynamic Encoder for end-to-end feature projection (replaces PCA)')
+    parser.add_argument('--de_sample_size', type=int, default=1024,
+                       help='Number of nodes to sample for DE column sampling')
+    parser.add_argument('--de_hidden_dim', type=int, default=512,
+                       help='Hidden dimension for DE MLP')
+    parser.add_argument('--lambda_de', type=float, default=0.01,
+                       help='Weight for DE uniformity loss (prevents basis collapse)')
+    parser.add_argument('--de_update_sample_every_n_steps', type=int, default=1,
+                       help='Update DE sample every N forward passes (1=every step, higher=more stable)')
+    parser.add_argument('--de_lr_scale', type=float, default=0.1,
+                       help='Learning rate scale for DE parameters (default: 0.1, i.e., 10%% of base lr)')
+
     # === Edge Dropout Augmentation ===
     parser.add_argument('--edge_dropout_rate', type=float, default=0.0,
                        help='Edge dropout rate for data augmentation (0.0-0.5). Set to 0.0 to disable.')
@@ -331,4 +345,16 @@ def parse_joint_training_args():
     parser.add_argument('--tsne_save_dir', type=str, default='./tsne_plots', help='Directory to save t-SNE plots')
 
     args = parser.parse_args()
+
+    # === Validation: Check for incompatible flag combinations ===
+    if args.use_dynamic_encoder:
+        # When using DE, disable conflicting projection methods
+        if args.use_identity_projection:
+            print("Warning: --use_dynamic_encoder is enabled, disabling --use_identity_projection")
+            args.use_identity_projection = False
+
+        if getattr(args, 'use_external_embeddings_nc', False):
+            print("Warning: --use_dynamic_encoder is enabled, disabling --use_external_embeddings_nc")
+            args.use_external_embeddings_nc = False
+
     return args
