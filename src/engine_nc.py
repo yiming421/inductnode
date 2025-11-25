@@ -11,82 +11,6 @@ from .utils import process_node_features, acc, apply_final_pca
 from .data_utils import select_k_shot_context, edge_dropout_sparse_tensor, feature_dropout
 
 
-def compute_separability_metrics(features, labels, sample_size=2000):
-    """
-    Compute class separability metrics for projected features.
-
-    Metrics:
-    - Fisher's ratio: Between-class variance / Within-class variance
-    - Mean inter-class distance
-    - Mean intra-class distance
-    - Silhouette-like score
-
-    Args:
-        features: (N, d) feature tensor
-        labels: (N,) label tensor
-        sample_size: Max nodes to sample for efficiency
-
-    Returns:
-        dict of metrics
-    """
-    with torch.no_grad():
-        # Sample for efficiency
-        N = features.size(0)
-        if N > sample_size:
-            idx = torch.randperm(N, device=features.device)[:sample_size]
-            features = features[idx]
-            labels = labels[idx]
-
-        labels = labels.squeeze()
-        unique_labels = labels.unique()
-        num_classes = len(unique_labels)
-
-        if num_classes < 2:
-            return {'fisher_ratio': 0.0, 'inter_class_dist': 0.0, 'intra_class_dist': 0.0}
-
-        # Compute class centroids
-        centroids = []
-        intra_dists = []
-        class_counts = []
-
-        for c in unique_labels:
-            mask = labels == c
-            class_features = features[mask]
-            if class_features.size(0) == 0:
-                continue
-            centroid = class_features.mean(dim=0)
-            centroids.append(centroid)
-            class_counts.append(class_features.size(0))
-
-            # Intra-class distance: mean distance to centroid
-            dists_to_centroid = torch.norm(class_features - centroid, dim=1)
-            intra_dists.append(dists_to_centroid.mean().item())
-
-        if len(centroids) < 2:
-            return {'fisher_ratio': 0.0, 'inter_class_dist': 0.0, 'intra_class_dist': 0.0}
-
-        centroids = torch.stack(centroids)
-
-        # Inter-class distance: mean pairwise distance between centroids
-        inter_dists = []
-        for i in range(len(centroids)):
-            for j in range(i + 1, len(centroids)):
-                inter_dists.append(torch.norm(centroids[i] - centroids[j]).item())
-
-        mean_inter = sum(inter_dists) / len(inter_dists) if inter_dists else 0.0
-        mean_intra = sum(intra_dists) / len(intra_dists) if intra_dists else 1e-6
-
-        # Fisher's ratio approximation
-        fisher_ratio = mean_inter / (mean_intra + 1e-6)
-
-        return {
-            'fisher_ratio': fisher_ratio,
-            'inter_class_dist': mean_inter,
-            'intra_class_dist': mean_intra,
-            'num_classes': num_classes
-        }
-
-
 def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
     """
     Apply feature dropout if enabled in args (after projection only).
@@ -231,16 +155,6 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         if hasattr(model, 'get_de_loss'):
             de_loss = model.get_de_loss()
 
-        # Compute separability metrics for DE projected features (periodically)
-        if batch_idx == 0 and epoch % 5 == 0 and hasattr(model, 'de') and hasattr(model, '_debug_x_proj'):
-            x_proj = model._debug_x_proj
-            if x_proj is not None:
-                sep_metrics = compute_separability_metrics(x_proj.detach(), data.y)
-                print(f"    [DE Separability @ Epoch {epoch}] "
-                      f"Fisher: {sep_metrics['fisher_ratio']:.3f}, "
-                      f"Inter: {sep_metrics['inter_class_dist']:.3f}, "
-                      f"Intra: {sep_metrics['intra_class_dist']:.3f}")
-
         # Memory optimization: Extract needed embeddings immediately and delete large tensor
         context_h = h[data.context_sample]
         context_y = data.y[data.context_sample]
@@ -259,11 +173,22 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
         target_y = data.y[train_perm_idx]
         score, class_h = pred(data, context_h, target_h, context_y, class_h)
+
+        # DEBUG: Compute accuracy for different methods if debug info available
+        if hasattr(pred, '_debug_preds') and pred._debug_preds is not None:
+            true_labels = data.y[train_perm_idx].squeeze()
+            print(f"\n=== ACCURACY COMPARISON (batch) ===")
+            for method, preds in pred._debug_preds.items():
+                acc = (preds == true_labels).float().mean().item()
+                print(f"  {method}: {acc:.4f} ({acc*100:.2f}%)")
+            pred._debug_preds = None  # Clear after printing
+            print()
+
         score = F.log_softmax(score, dim=1)
         label = data.y[train_perm_idx].squeeze()
 
         # Compute orthogonal loss with better numerical stability
-        if orthogonal_push > 0:
+        if orthogonal_push > 0 and class_h is not None:
             class_h_norm = F.normalize(class_h, p=2, dim=1)
             class_matrix = class_h_norm @ class_h_norm.T
             # Remove diagonal elements
@@ -280,186 +205,16 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         total_de_loss += de_loss.item() if isinstance(de_loss, torch.Tensor) else de_loss
         total_loss += loss.item()  # Total before scaling
 
-        # DEBUG: Test gradient contribution from NLL vs DE loss separately (first batch only)
-        if batch_idx == 0 and epoch == 0 and hasattr(model, 'de'):
-            print(f"      [Gradient Source Test]")
-            # Store current state
-            de_params_before = [p.grad.clone() if p.grad is not None else None for p in model.de.parameters()]
-
-            # Test 1: Backward with ONLY NLL loss
-            optimizer.zero_grad()
-            (nll_loss * lambda_).backward(retain_graph=True)
-            de_grad_from_nll = model.de.lin_in.weight.grad.norm().item() if model.de.lin_in.weight.grad is not None else 0.0
-            print(f"        DE grad from NLL loss only: {de_grad_from_nll:.6f}")
-
-            # Test 2: Backward with ONLY DE loss
-            optimizer.zero_grad()
-            (de_loss * lambda_).backward(retain_graph=True)
-            de_grad_from_de_loss = model.de.lin_in.weight.grad.norm().item() if model.de.lin_in.weight.grad is not None else 0.0
-            print(f"        DE grad from DE loss only: {de_grad_from_de_loss:.6f}")
-            print(f"        Ratio (DE_loss / NLL_loss): {de_grad_from_de_loss / (de_grad_from_nll + 1e-10):.2f}x")
-
-            # Clear for actual backward
-            optimizer.zero_grad()
-
         # Apply lambda scaling for gradient update
         loss = loss * lambda_
 
-        # DEBUG: Check if x_proj has gradient enabled (only first batch)
-        if batch_idx == 0 and epoch == 0 and hasattr(model, 'de'):
-            print(f"    [Gradient Debug] x_proj requires_grad: {x_proj.requires_grad if 'x_proj' in locals() else 'N/A'}")
-            print(f"    [Gradient Debug] h requires_grad: {h.requires_grad}")
-            print(f"    [Gradient Debug] score requires_grad: {score.requires_grad}")
-            print(f"    [Gradient Debug] nll_loss requires_grad: {nll_loss.requires_grad}")
-            print(f"    [Gradient Debug] de_loss requires_grad: {de_loss.requires_grad if isinstance(de_loss, torch.Tensor) else 'scalar'}")
-
-        # DEBUG: Retain gradients on key tensors to trace flow (only first batch)
-        if batch_idx == 0 and epoch == 0 and hasattr(model, 'de'):
-            h.retain_grad()
-            score.retain_grad()
-            if hasattr(pred, 'class_h'):
-                pred.class_h.retain_grad()
-
-        # Only perform optimization if optimizer is provided (for joint training compatibility)
         optimizer.zero_grad()
         loss.backward()
 
-        # DEBUG: Check gradient magnitudes after backward (first few batches of first epoch)
-        if batch_idx <= 2 and epoch == 0 and hasattr(model, 'de'):
-            print(f"    [Gradient Debug After Backward - Batch {batch_idx}]")
-
-            # Trace gradient flow from loss backwards
-            print(f"      [Gradient Flow Trace]")
-            print(f"        nll_loss: {nll_loss.item():.6f}")
-
-            if score.grad is not None:
-                print(f"        score.grad norm: {score.grad.norm().item():.6f}")
-
-            # Check h gradient (GNN output = Transformer input)
-            if h.grad is not None:
-                print(f"        h.grad norm: {h.grad.norm().item():.6f} ← Gradient FROM predictor TO GNN")
-                print(f"        h.grad mean: {h.grad.mean().item():.6e}, max: {h.grad.abs().max().item():.6e}")
-
-                # Calculate gradient reduction through predictor
-                if score.grad is not None:
-                    reduction_factor = score.grad.norm().item() / (h.grad.norm().item() + 1e-10)
-                    print(f"        Gradient reduction through predictor: {reduction_factor:.2f}x")
-
-                # TRACE GRADIENT EXPLOSION: h → x_proj → projection_matrix → DE
-                if hasattr(model, '_debug_x_proj') and model._debug_x_proj is not None:
-                    print(f"\n      [Gradient Explosion Trace: h → DE]")
-
-                    # Step 1: h → x_proj (through GNN backward)
-                    if model._debug_x_proj.grad is not None:
-                        x_proj_grad_norm = model._debug_x_proj.grad.norm().item()
-                        print(f"        1. h.grad: {h.grad.norm().item():.6f}")
-                        print(f"           ↓ GNN backward")
-                        print(f"           x_proj.grad: {x_proj_grad_norm:.6f}")
-                        gnn_amplification = x_proj_grad_norm / (h.grad.norm().item() + 1e-10)
-                        print(f"           Amplification through GNN: {gnn_amplification:.2f}x")
-
-                        # Check x_proj statistics
-                        print(f"           x_proj norm: {model._debug_x_proj.norm().item():.2f}")
-                        print(f"           x_proj mean: {model._debug_x_proj.mean().item():.6f}, std: {model._debug_x_proj.std().item():.6f}")
-                    else:
-                        print(f"        x_proj has NO gradient!")
-
-                    # Step 2: Check input features x
-                    print(f"\n        2. Input features x:")
-                    print(f"           x.shape: {model._debug_x.shape}")
-                    print(f"           x norm: {model._debug_x.norm().item():.2f}")
-                    print(f"           x mean: {model._debug_x.mean().item():.6f}, std: {model._debug_x.std().item():.6f}")
-
-                    # Step 3: x_proj → projection_matrix → DE
-                    de_grad_norm = model.de.lin_in.weight.grad.norm().item() if model.de.lin_in.weight.grad is not None else 0.0
-                    if model._debug_x_proj.grad is not None:
-                        print(f"\n        3. x_proj.grad: {model._debug_x_proj.grad.norm().item():.6f}")
-                        print(f"           ↓ Projection backward (x.T @ grad_x_proj)")
-                        print(f"           DE param grad: {de_grad_norm:.6f}")
-                        projection_amplification = de_grad_norm / (model._debug_x_proj.grad.norm().item() + 1e-10)
-                        print(f"           Amplification through projection: {projection_amplification:.2f}x")
-
-                        # Total amplification
-                        total_amplification = de_grad_norm / (h.grad.norm().item() + 1e-10)
-                        print(f"\n        TOTAL: h ({h.grad.norm().item():.6f}) → DE ({de_grad_norm:.6f})")
-                        print(f"        Total amplification: {total_amplification:.2f}x")
-            else:
-                print(f"        h has NO grad (retain_grad not called or failed)")
-
-            # Check if we can manually compute gradient on projection matrix
-            if hasattr(model, 'current_projection_matrix') and model.current_projection_matrix is not None:
-                proj = model.current_projection_matrix
-                print(f"      projection_matrix.requires_grad: {proj.requires_grad}")
-                print(f"      projection_matrix.grad_fn: {proj.grad_fn}")
-                print(f"      projection_matrix.is_leaf: {proj.is_leaf}")
-                if proj.grad is not None:
-                    print(f"      projection_matrix.grad norm: {proj.grad.norm().item():.6f}")
-                else:
-                    print(f"      projection_matrix.grad is None")
-                    # If it has grad_fn but no grad, it's a non-leaf tensor (expected)
-                    # Gradients only accumulate on leaf tensors with requires_grad=True
-                    if proj.grad_fn is not None:
-                        print(f"      (This is OK - it's a non-leaf tensor, grad flows through grad_fn)")
-
-            # Check DE parameter gradients (these ARE leaf tensors)
-            print(f"      DE parameter gradients:")
-            for name, param in list(model.de.named_parameters())[:3]:  # First 3 params
-                if param.grad is not None:
-                    print(f"        {name}: grad_norm={param.grad.norm().item():.6f}")
-                else:
-                    print(f"        {name}: NO GRADIENT!")
-
-
-            # Check GNN parameter gradients
-            print(f"      GNN parameter gradients:")
-            for name, param in list(model.gnn.named_parameters())[:3]:  # First 3 params
-                if param.grad is not None:
-                    print(f"        {name}: grad_norm={param.grad.norm().item():.6f}")
-                else:
-                    print(f"        {name}: NO GRADIENT!")
-
-            # Check Predictor (Transformer) parameter gradients
-            print(f"      Predictor (Transformer) parameter gradients:")
-            pred_grad_norms = []
-            for name, param in list(pred.named_parameters())[:5]:  # First 5 params
-                if param.grad is not None:
-                    grad_norm = param.grad.norm().item()
-                    pred_grad_norms.append(grad_norm)
-                    print(f"        {name}: grad_norm={grad_norm:.6f}")
-                else:
-                    print(f"        {name}: NO GRADIENT!")
-            if pred_grad_norms:
-                print(f"        Avg predictor grad norm: {sum(pred_grad_norms)/len(pred_grad_norms):.6f}")
-
-            # Most importantly: check the gradient norm of the SCORE
-            print(f"      Score (predictor output) gradient check:")
-            print(f"        score.requires_grad: {score.requires_grad}")
-            print(f"        score.grad_fn: {score.grad_fn}")
-            print(f"        nll_loss value: {nll_loss.item():.6f}")
-            print(f"        score mean: {score.mean().item():.6f}, std: {score.std().item():.6f}")
-
         # Apply gradient clipping
         if clip_grad > 0:
-            # DEBUG: Check gradient norms before and after clipping (first batch only)
-            if batch_idx == 0 and epoch == 0 and hasattr(model, 'de'):
-                total_norm_before = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
-                pred_norm_before = torch.nn.utils.clip_grad_norm_(pred.parameters(), float('inf'))
-                print(f"      [Gradient Clipping]")
-                print(f"        Model grad norm before clip: {total_norm_before:.6f}")
-                print(f"        Pred grad norm before clip: {pred_norm_before:.6f}")
-                print(f"        Clip threshold: {clip_grad}")
-
-            # Handle DDP wrapped models
-            model_norm_after = nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            pred_norm_after = nn.utils.clip_grad_norm_(pred.parameters(), clip_grad)
-
-            if batch_idx == 0 and epoch == 0 and hasattr(model, 'de'):
-                print(f"        Model grad norm after clip: {model_norm_after:.6f}")
-                print(f"        Pred grad norm after clip: {pred_norm_after:.6f}")
-                if model_norm_after >= clip_grad * 0.99:
-                    print(f"        ⚠️  MODEL GRADIENTS WERE CLIPPED! (reduced from {total_norm_before:.6f})")
-                if pred_norm_after >= clip_grad * 0.99:
-                    print(f"        ⚠️  PREDICTOR GRADIENTS WERE CLIPPED! (reduced from {pred_norm_before:.6f})")
+            nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            nn.utils.clip_grad_norm_(pred.parameters(), clip_grad)
             if att is not None:
                 nn.utils.clip_grad_norm_(att.parameters(), clip_grad)
             if mlp is not None:
@@ -622,6 +377,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     train_score = torch.cat(train_score, dim=0)
 
     test_score = []
+    test_debug_printed = False
     for idx in test_loader:
         target_h = h[test_idx[idx]]
         pred_output = predictor(data, context_h, target_h, context_y, class_h)
@@ -629,6 +385,18 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
             out, _, _ = pred_output  # Discard auxiliary loss during evaluation
         else:  # Standard case
             out, _ = pred_output
+
+        # DEBUG: Compute accuracy for different methods on TEST set (first batch only)
+        if not test_debug_printed and hasattr(predictor, '_debug_preds') and predictor._debug_preds is not None:
+            true_labels = data.y[test_idx[idx]].squeeze()
+            print(f"\n=== TEST SET ACCURACY COMPARISON (first batch) ===")
+            for method, preds in predictor._debug_preds.items():
+                acc_val = (preds == true_labels).float().mean().item()
+                print(f"  {method}: {acc_val:.4f} ({acc_val*100:.2f}%)")
+            predictor._debug_preds = None
+            test_debug_printed = True
+            print()
+
         out = out.argmax(dim=1).flatten()
         test_score.append(out)
     test_score = torch.cat(test_score, dim=0)

@@ -1014,6 +1014,9 @@ def create_unified_model(args, input_dim, device):
     
     # Create GNN backbone
     if args.model == 'PureGCN_v1':
+        print(f"\n[DEBUG] Creating PureGCN_v1:")
+        print(f"  input_dim={hidden}, hidden={hidden}, num_layers={args.num_layers}")
+        print(f"  norm={args.norm}, dp={args.dp}, res={args.res}, relu={args.relu}")
         model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm,
                           args.res, args.relu, args.gnn_norm_affine,
                           activation=getattr(args, 'activation', 'relu'),
@@ -1089,8 +1092,14 @@ def create_unified_model(args, input_dim, device):
             hidden, args.nhead, args.transformer_layers, args.mlp_layers,
             args.dp, args.norm, args.seperate, False, None, None, args.sim,
             args.padding, args.mlp_norm_affine, args.normalize_class_h,
+            use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
+            use_full_embedding=getattr(args, 'use_full_embedding', False),
             norm_type=getattr(args, 'transformer_norm_type', 'post'),
-            ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4)
+            ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4),
+            use_matching_network=getattr(args, 'use_matching_network', False),
+            matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
+            matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
+            matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True)
         )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
@@ -2551,7 +2560,7 @@ def run_joint_training(args, device='cuda:0'):
         lr_nc = args.lr_nc if args.lr_nc is not None else args.lr
         lr_lp = args.lr_lp if args.lr_lp is not None else args.lr
         lr_gc = args.lr_gc if args.lr_gc is not None else args.lr
-        lr_graphcl = getattr(args, 'lr_graphcl', None) if hasattr(args, 'lr_graphcl') else args.lr
+        lr_graphcl = getattr(args, 'lr_graphcl', None) or args.lr
 
         print(f"Using separate optimizers - NC LR: {lr_nc:.2e}, LP LR: {lr_lp:.2e}, GC LR: {lr_gc:.2e}, GraphCL LR: {lr_graphcl:.2e}")
 

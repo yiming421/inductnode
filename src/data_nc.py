@@ -1,4 +1,4 @@
-from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit2, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
+from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
 from src.dataset_twitch import TwitchFixed
 from src.dataset_heterophilous import HeterophilousGraphDataset
 from torch_geometric.data import Data
@@ -315,9 +315,9 @@ def load_data_train(dataset_name: str):
         dataset = Coauthor(root=os.path.join(root, 'Coauthor'), name=dataset_name)
     elif dataset_name in ['Computers', 'Photo']:
         dataset = Amazon(root=os.path.join(root, 'Amazon'), name=dataset_name)
-    elif dataset_name == 'Reddit2':
-        print('[DEBUG]: Using Reddit2 dataset loader')
-        dataset = Reddit2(root=os.path.join(root, 'Reddit2'))
+    elif dataset_name == 'Reddit':
+        print('[DEBUG]: Using Reddit dataset loader')
+        dataset = Reddit(root=os.path.join(root, 'Reddit'))
     elif dataset_name == 'Flickr':
         flickr_root = os.path.join(root, 'Flickr')
         
@@ -436,15 +436,58 @@ def load_data_train(dataset_name: str):
 
 def load_data(dataset):
     name = dataset
-    
+
+    # Dataset name aliases for compatibility
+    dataset_aliases = {
+        'AmzComp': 'Computers',
+        'AmzPhoto': 'Photo',
+        'AmzRatings': 'Amazon-ratings',
+        'CoCS': 'CS',
+        'CoPhysics': 'Physics',
+        'Roman': 'Roman-empire',
+        'Deezer': 'DeezerEurope',
+        'AirBrazil': 'Brazil',
+        'AirEU': 'Europe',
+        'AirUS': 'USA',
+        'FullCora': 'Cora-ML',
+    }
+
+    # Apply alias if exists
+    if dataset in dataset_aliases:
+        dataset = dataset_aliases[dataset]
+
     # Check if this is a text-enhanced dataset (including LLaMA variants)
     if dataset in ['cora', 'wikics', 'pubmed', 'cora_llama_8b', 'cora_llama_13b']:
         data = load_text_enhanced_dataset(dataset)
         dataset = [data]
     elif dataset in ['Cora', 'Citeseer', 'Pubmed']:
         dataset = Planetoid(root=os.path.join(get_project_root(), 'dataset'), name=dataset)
+    elif dataset in ['Cora-ML']:
+        dataset = CitationFull(root=os.path.join(get_project_root(), 'dataset', 'CitationFull'), name='cora_ml')
     elif dataset == 'WikiCS':
         dataset = WikiCS(root=os.path.join(get_project_root(), 'dataset', 'WikiCS'))
+    elif dataset in ['CS', 'Physics']:
+        dataset = Coauthor(root=os.path.join(get_project_root(), 'dataset', 'Coauthor'), name=dataset)
+    elif dataset in ['Computers', 'Photo']:
+        dataset = Amazon(root=os.path.join(get_project_root(), 'dataset', 'Amazon'), name=dataset)
+    elif dataset == 'Reddit':
+        dataset = Reddit(root=os.path.join(get_project_root(), 'dataset', 'Reddit'))
+    elif dataset in ['USA', 'Brazil', 'Europe']:
+        dataset = Airports(root=os.path.join(get_project_root(), 'dataset', 'Airports'), name=dataset)
+    elif dataset in ['Cornell', 'Texas', 'Wisconsin']:
+        dataset = WebKB(root=os.path.join(get_project_root(), 'dataset', 'WebKB'), name=dataset)
+    elif dataset in ['Chameleon', 'Squirrel']:
+        dataset = WikipediaNetwork(root=os.path.join(get_project_root(), 'dataset', 'WikipediaNetwork'), name=dataset, geom_gcn_preprocess=True)
+    elif dataset == 'Actor':
+        dataset = Actor(root=os.path.join(get_project_root(), 'dataset', 'Actor'))
+    elif dataset == 'DeezerEurope':
+        dataset = DeezerEurope(root=os.path.join(get_project_root(), 'dataset', 'DeezerEurope'))
+    elif dataset == 'LastFMAsia':
+        dataset = LastFMAsia(root=os.path.join(get_project_root(), 'dataset', 'LastFMAsia'))
+    elif dataset in ['Wiki', 'BlogCatalog', 'Facebook', 'TWeibo']:
+        dataset = AttributedGraphDataset(root=os.path.join(get_project_root(), 'dataset', 'AttributedGraph'), name=dataset)
+    elif dataset in ['DBLP']:
+        dataset = CitationFull(root=os.path.join(get_project_root(), 'dataset', 'CitationFull'), name=dataset)
     elif dataset == 'Products':
         # Load Products subset directly
         data, split_idx = load_products_subset()
@@ -466,10 +509,55 @@ def load_data(dataset):
     data = dataset[0]
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce()
-    split_idx = dict()
-    split_idx['train'] = data.train_mask.nonzero(as_tuple=False).reshape(-1)
-    split_idx['valid'] = data.val_mask.nonzero(as_tuple=False).reshape(-1)
-    split_idx['test'] = data.test_mask.nonzero(as_tuple=False).reshape(-1)
+
+    # Check if dataset has predefined splits
+    if hasattr(data, 'train_mask') and data.train_mask is not None:
+        split_idx = dict()
+        split_idx['train'] = data.train_mask.nonzero(as_tuple=False).reshape(-1)
+        split_idx['valid'] = data.val_mask.nonzero(as_tuple=False).reshape(-1)
+        split_idx['test'] = data.test_mask.nonzero(as_tuple=False).reshape(-1)
+    else:
+        # Create standard 20 per class train split for datasets without predefined splits
+        from collections import defaultdict
+        num_nodes = data.num_nodes
+        labels = data.y
+        nodes_by_class = defaultdict(list)
+        for node_idx, label in enumerate(labels):
+            nodes_by_class[label.item()].append(node_idx)
+
+        train_idx = []
+        valid_idx = []
+        test_idx = []
+
+        for class_label, indices in nodes_by_class.items():
+            class_indices = torch.tensor(indices)
+            num_class_nodes = len(class_indices)
+
+            # Shuffle
+            perm = torch.randperm(num_class_nodes)
+            class_indices = class_indices[perm]
+
+            # Use 20 per class for train (like Planetoid)
+            train_size = min(20, num_class_nodes // 2)
+            valid_size = min(30, (num_class_nodes - train_size) // 2)
+
+            train_idx.extend(class_indices[:train_size].tolist())
+            valid_idx.extend(class_indices[train_size:train_size+valid_size].tolist())
+            test_idx.extend(class_indices[train_size+valid_size:].tolist())
+
+        split_idx = dict()
+        split_idx['train'] = torch.tensor(train_idx)
+        split_idx['valid'] = torch.tensor(valid_idx)
+        split_idx['test'] = torch.tensor(test_idx)
+
+        # Also create masks on data object
+        data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        data.train_mask[split_idx['train']] = True
+        data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        data.val_mask[split_idx['valid']] = True
+        data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        data.test_mask[split_idx['test']] = True
+
     data.name = name
     return data, split_idx
 

@@ -689,18 +689,216 @@ class PFNTransformerLayer(nn.Module):
 
         return x_context, x_target
 
+class NodeClassificationHead(nn.Module):
+    """Task-specific head for node classification."""
+    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot'):
+        super(NodeClassificationHead, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.sim = sim
+
+        # Task-specific projection MLP (2 layers)
+        self.proj = MLP(
+            in_channels=hidden_dim,
+            hidden_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_layers=2,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+
+        # Optional MLP for similarity computation
+        if sim == 'mlp':
+            self.sim_mlp = MLP(
+                in_channels=hidden_dim,
+                hidden_channels=hidden_dim,
+                out_channels=hidden_dim,
+                num_layers=2,
+                dropout=dropout,
+                norm=norm,
+                tailact=False,
+                norm_affine=norm_affine
+            )
+
+    def forward(self, target_label_emb, context_label_emb, context_y, data,
+                degree_normalize=False, attention_pool_module=None, mlp_module=None, normalize=False):
+        """
+        Args:
+            target_label_emb: [num_target, hidden_dim]
+            context_label_emb: [num_context, hidden_dim]
+            context_y: [num_context] - labels for context nodes
+            data: PyG Data object with .y and .context_sample
+            degree_normalize: Whether to apply degree normalization
+            attention_pool_module: Optional attention pooling module
+            mlp_module: Optional MLP for prototype transformation
+            normalize: Whether to normalize embeddings
+
+        Returns:
+            logits: [num_target, num_classes]
+            class_emb: [num_classes, hidden_dim] - class prototypes
+        """
+        from .utils import process_node_features
+
+        # Project embeddings through task-specific head
+        target_label_emb = self.proj(target_label_emb)
+        context_label_emb = self.proj(context_label_emb)
+
+        # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
+        if target_label_emb.dim() == 1:
+            target_label_emb = target_label_emb.unsqueeze(0)
+        if context_label_emb.dim() == 1:
+            context_label_emb = context_label_emb.unsqueeze(0)
+
+        # Compute class prototypes using shared pooling logic
+        class_emb = process_node_features(
+            context_label_emb,
+            data,
+            degree_normalize=degree_normalize,
+            attention_pool_module=attention_pool_module,
+            mlp_module=mlp_module,
+            normalize=normalize
+        )
+
+        # Compute logits using similarity
+        if self.sim == 'dot':
+            logits = torch.matmul(target_label_emb, class_emb.t())
+        elif self.sim == 'cos':
+            target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
+            class_emb = F.normalize(class_emb, p=2, dim=-1)
+            logits = torch.matmul(target_label_emb, class_emb.t())
+        elif self.sim == 'euclidean':
+            distances = torch.cdist(target_label_emb, class_emb, p=2)
+            logits = -distances
+        elif self.sim == 'mlp':
+            target_label_emb = self.sim_mlp(target_label_emb)
+            class_emb = self.sim_mlp(class_emb)
+            logits = torch.matmul(target_label_emb, class_emb.t())
+        else:
+            raise ValueError(f"Invalid similarity type: {self.sim}")
+
+        return logits, class_emb
+
+
+class LinkPredictionHead(nn.Module):
+    """Task-specific head for link prediction."""
+    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot'):
+        super(LinkPredictionHead, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.sim = sim
+
+        # Task-specific projection MLP (2 layers)
+        self.proj = MLP(
+            in_channels=hidden_dim,
+            hidden_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_layers=2,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+
+        # Optional MLP for similarity computation
+        if sim == 'mlp':
+            self.sim_mlp = MLP(
+                in_channels=hidden_dim,
+                hidden_channels=hidden_dim,
+                out_channels=hidden_dim,
+                num_layers=2,
+                dropout=dropout,
+                norm=norm,
+                tailact=False,
+                norm_affine=norm_affine
+            )
+
+    def forward(self, target_label_emb, context_label_emb, context_y, class_x,
+                attention_pool_module=None, mlp_module=None, normalize=False):
+        """
+        Args:
+            target_label_emb: [num_target, hidden_dim]
+            context_label_emb: [num_context, hidden_dim]
+            context_y: [num_context] - labels (0: no-link, 1: link)
+            class_x: [2, hidden_dim] - link prototypes
+            attention_pool_module: Optional attention pooling module
+            mlp_module: Optional MLP for prototype transformation
+            normalize: Whether to normalize embeddings
+
+        Returns:
+            logits: [num_target, 2] - scores for no-link and link
+            class_emb: [2, hidden_dim] - link prototypes
+        """
+        # Project embeddings through task-specific head
+        target_label_emb = self.proj(target_label_emb)
+        context_label_emb = self.proj(context_label_emb)
+
+        # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
+        if target_label_emb.dim() == 1:
+            target_label_emb = target_label_emb.unsqueeze(0)
+        if context_label_emb.dim() == 1:
+            context_label_emb = context_label_emb.unsqueeze(0)
+
+        # Compute link prototypes (custom pooling for link prediction)
+        device = target_label_emb.device
+        num_classes = class_x.size(0)  # Should be 2 for link prediction
+        actual_hidden_dim = target_label_emb.size(-1)
+        class_emb = torch.zeros(num_classes, actual_hidden_dim, device=device, dtype=target_label_emb.dtype)
+
+        # Pool refined embeddings for each class
+        for class_idx in range(num_classes):
+            class_mask = (context_y == class_idx)
+            if class_mask.any():
+                if attention_pool_module is not None:
+                    # Use attention pooling if available
+                    class_embeddings = context_label_emb[class_mask]
+                    class_labels = torch.zeros(class_embeddings.size(0), dtype=torch.long, device=device)
+                    class_emb[class_idx] = attention_pool_module(class_embeddings, class_labels, num_classes=1).squeeze(0)
+                else:
+                    # Use mean pooling as fallback
+                    class_emb[class_idx] = context_label_emb[class_mask].mean(dim=0)
+
+        # Apply MLP if specified
+        if mlp_module is not None:
+            class_emb = mlp_module(class_emb)
+
+        # Normalize if specified
+        if normalize:
+            class_emb = F.normalize(class_emb, p=2, dim=-1)
+
+        # Compute logits using similarity
+        if self.sim == 'dot':
+            logits = torch.matmul(target_label_emb, class_emb.t())
+        elif self.sim == 'cos':
+            target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
+            class_emb = F.normalize(class_emb, p=2, dim=-1)
+            logits = torch.matmul(target_label_emb, class_emb.t())
+        elif self.sim == 'euclidean':
+            distances = torch.cdist(target_label_emb, class_emb, p=2)
+            logits = -distances
+        elif self.sim == 'mlp':
+            target_label_emb = self.sim_mlp(target_label_emb)
+            class_emb = self.sim_mlp(class_emb)
+            logits = torch.matmul(target_label_emb, class_emb.t())
+        else:
+            raise ValueError(f"Invalid similarity type: {self.sim}")
+
+        return logits, class_emb
+
+
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2,
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
                  padding='zero', norm_affine=True, normalize=False,
                  use_first_half_embedding=False, use_full_embedding=False, norm_type='post',
-                 ffn_expansion_ratio=4):
+                 ffn_expansion_ratio=4, use_matching_network=False, matching_network_projection='linear',
+                 matching_network_temperature=1.0, matching_network_learnable_temp=True):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
         self.embed_dim = hidden_dim + self.d_label  # Token dimension after concatenation
         self.sim = sim
         self.padding = padding
+        self.use_matching_network = use_matching_network
 
         if self.padding == 'mlp':
             self.pad_mlp = MLP(
@@ -747,6 +945,48 @@ class PFNPredictorNodeCls(nn.Module):
         # Validate embedding options (only one should be True)
         if sum([use_first_half_embedding, use_full_embedding]) > 1:
             raise ValueError("Only one of use_first_half_embedding or use_full_embedding can be True")
+
+        # Initialize matching network if enabled
+        if use_matching_network:
+            # Determine input dim based on embedding option
+            if use_full_embedding:
+                mn_hidden_dim = self.embed_dim  # 2 * hidden_dim
+            else:
+                mn_hidden_dim = hidden_dim
+            self.matching_network = MatchingNetworkPredictor(
+                hidden_dim=mn_hidden_dim,
+                projection_type=matching_network_projection,
+                normalize=True,
+                temperature=matching_network_temperature,
+                dropout=dropout,
+                norm=norm,
+                mlp_layers=mlp_layers,
+                norm_affine=norm_affine,
+                learnable_temperature=matching_network_learnable_temp
+            )
+
+        # Task-specific heads
+        # Determine embedding dimension for heads based on embedding option
+        if use_full_embedding:
+            head_hidden_dim = self.embed_dim  # 2 * hidden_dim
+        else:
+            head_hidden_dim = hidden_dim
+
+        self.nc_head = NodeClassificationHead(
+            hidden_dim=head_hidden_dim,
+            dropout=dropout,
+            norm=norm,
+            norm_affine=norm_affine,
+            sim=sim
+        )
+
+        self.lp_head = LinkPredictionHead(
+            hidden_dim=head_hidden_dim,
+            dropout=dropout,
+            norm=norm,
+            norm_affine=norm_affine,
+            sim=sim
+        )
     
     def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification'):
         """
@@ -805,67 +1045,123 @@ class PFNPredictorNodeCls(nn.Module):
             # Use second half (label embedding part) - default behavior
             context_label_emb = context_tokens[:, self.hidden_dim:]  # [num_context, hidden_dim]
             target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
-        
-        # Step 6: Compute refined class embeddings (different approaches for different tasks)
+
+        # Step 6 & 7: Route through task-specific heads
         if task_type == 'node_classification':
-            # Use process_node_features for node classification
-            class_emb = process_node_features(
-                context_label_emb,
-                data,
+            logits, class_emb = self.nc_head(
+                target_label_emb=target_label_emb,
+                context_label_emb=context_label_emb,
+                context_y=context_y,
+                data=data,
                 degree_normalize=self.degree,
                 attention_pool_module=self.att,
                 mlp_module=self.mlp_pool,
                 normalize=self.normalize
             )
         elif task_type == 'link_prediction':
-            # Use custom pooling for link prediction (no dependency on data.y or data.context_sample)
-            device = target_label_emb.device
-            num_classes = class_x.size(0)  # Should be 2 for link prediction
-            # Use the actual dimension of target_label_emb instead of self.hidden_dim
-            actual_hidden_dim = target_label_emb.size(-1)
-            class_emb = torch.zeros(num_classes, actual_hidden_dim, device=device, dtype=target_label_emb.dtype)
-            
-            # Pool refined embeddings for each class
-            for class_idx in range(num_classes):
-                class_mask = (context_y == class_idx)
-                if class_mask.any():
-                    if self.att is not None:
-                        # Use attention pooling if available
-                        class_embeddings = context_label_emb[class_mask]
-                        class_labels = torch.zeros(class_embeddings.size(0), dtype=torch.long, device=device)
-                        class_emb[class_idx] = self.att(class_embeddings, class_labels, num_classes=1).squeeze(0)
-                    else:
-                        # Use mean pooling as fallback
-                        class_emb[class_idx] = context_label_emb[class_mask].mean(dim=0)
-            
-            # Apply MLP if specified
-            if self.mlp_pool is not None:
-                class_emb = self.mlp_pool(class_emb)
-            
-            # Normalize if specified
-            if self.normalize:
-                class_emb = F.normalize(class_emb, p=2, dim=-1)
+            logits, class_emb = self.lp_head(
+                target_label_emb=target_label_emb,
+                context_label_emb=context_label_emb,
+                context_y=context_y,
+                class_x=class_x,
+                attention_pool_module=self.att,
+                mlp_module=self.mlp_pool,
+                normalize=self.normalize
+            )
         else:
-            raise ValueError(f"Unknown task_type: {self.task_type}. Choose 'node_classification' or 'link_prediction'.")
+            raise ValueError(f"Unknown task_type: {task_type}. Choose 'node_classification' or 'link_prediction'.")
 
-        # Step 7: Compute logits using similarity
-        if self.sim == 'dot':
-            logits = torch.matmul(target_label_emb, class_emb.t())
-        elif self.sim == 'cos':
-            target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
-            class_emb = F.normalize(class_emb, p=2, dim=-1)
-            logits = torch.matmul(target_label_emb, class_emb.t())
-        elif self.sim == 'euclidean':
-            # Euclidean distance: smaller distance = higher similarity
-            # Use negative distance as logits (closer = higher score)
-            distances = torch.cdist(target_label_emb, class_emb, p=2)
-            logits = -distances
-        elif self.sim == 'mlp':
-            target_label_emb = self.sim_mlp(target_label_emb)
-            class_emb = self.sim_mlp(class_emb)
-            logits = torch.matmul(target_label_emb, class_emb.t())
-        else:
-            raise ValueError("Invalid similarity type. Choose 'dot', 'cos', 'euclidean', or 'mlp'.")
+        # Legacy matching network support (kept for backward compatibility)
+        if self.use_matching_network:
+            # Use matching network: attention over support samples with one-hot labels as values
+            num_classes = class_x.size(0)
+
+            # DEBUG: Compare matching network vs mean pooling
+            _debug_compare = True  # TEMPORARY DEBUG FLAG
+            if _debug_compare:
+                # Get true labels for target samples (from the batch being processed)
+                # target_label_emb corresponds to the current batch targets
+                # We need to get the true labels from outside - pass via data or infer
+
+                print(f"\n{'='*60}")
+                print("DEBUG: Comparing Matching Network vs Mean Pooling")
+                print(f"{'='*60}")
+
+                # Mean pooling prototypes
+                prototypes = torch.zeros(num_classes, context_label_emb.size(-1), device=context_label_emb.device)
+                for c in range(num_classes):
+                    mask = context_y == c
+                    if mask.any():
+                        prototypes[c] = context_label_emb[mask].mean(dim=0)
+
+                # Different similarity methods for mean pooling
+                logits_mp_dot = target_label_emb @ prototypes.t()  # DOT
+                target_norm = F.normalize(target_label_emb, p=2, dim=-1)
+                proto_norm = F.normalize(prototypes, p=2, dim=-1)
+                logits_mp_cos = target_norm @ proto_norm.t()  # COS
+
+                # Matching network variants
+                mn = self.matching_network
+                Q = mn.q_proj(target_label_emb)
+                K = mn.k_proj(context_label_emb)
+                V = F.one_hot(context_y.long(), num_classes=num_classes).float()
+
+                # MN without norm
+                attn_raw = (Q @ K.t()) / mn.temperature
+                logits_mn_raw = attn_raw @ V
+
+                # MN with norm
+                Q_norm = F.normalize(Q, p=2, dim=-1)
+                K_norm = F.normalize(K, p=2, dim=-1)
+                attn_norm = (Q_norm @ K_norm.t()) / mn.temperature
+                logits_mn_norm = attn_norm @ V
+
+                # Store predictions
+                preds = {
+                    'MP_DOT': logits_mp_dot.argmax(dim=1),
+                    'MP_COS': logits_mp_cos.argmax(dim=1),
+                    'MN_RAW': logits_mn_raw.argmax(dim=1),
+                    'MN_NORM': logits_mn_norm.argmax(dim=1),
+                }
+
+                print(f"Embeddings: context={context_label_emb.shape}, target={target_label_emb.shape}")
+                print(f"Prototype norms: min={prototypes.norm(dim=1).min():.4f}, max={prototypes.norm(dim=1).max():.4f}")
+                print(f"Target norms: min={target_label_emb.norm(dim=1).min():.4f}, max={target_label_emb.norm(dim=1).max():.4f}")
+
+                # Compute what the ACTUAL non-matching path does (with process_node_features)
+                actual_class_emb = process_node_features(
+                    context_label_emb, data,
+                    degree_normalize=self.degree,
+                    attention_pool_module=self.att,
+                    mlp_module=self.mlp_pool,
+                    normalize=self.normalize
+                )
+                logits_actual = target_label_emb @ actual_class_emb.t()  # Always dot
+                preds['ACTUAL_PATH'] = logits_actual.argmax(dim=1)
+
+                print(f"\nLogits ranges:")
+                print(f"  MP_DOT: [{logits_mp_dot.min():.4f}, {logits_mp_dot.max():.4f}]")
+                print(f"  MP_COS: [{logits_mp_cos.min():.4f}, {logits_mp_cos.max():.4f}]")
+                print(f"  MN_RAW: [{logits_mn_raw.min():.4f}, {logits_mn_raw.max():.4f}]")
+                print(f"  MN_NORM: [{logits_mn_norm.min():.4f}, {logits_mn_norm.max():.4f}]")
+                print(f"  ACTUAL_PATH: [{logits_actual.min():.4f}, {logits_actual.max():.4f}]")
+                print(f"  (degree={self.degree}, att={self.att is not None}, mlp={self.mlp_pool is not None}, norm={self.normalize})")
+
+                # Store debug info for accuracy computation in engine
+                self._debug_preds = preds
+                self._debug_logits = {
+                    'MP_DOT': logits_mp_dot,
+                    'MP_COS': logits_mp_cos,
+                    'MN_RAW': logits_mn_raw,
+                    'MN_NORM': logits_mn_norm,
+                    'ACTUAL_PATH': logits_actual,
+                }
+                print(f"(Accuracy will be computed in engine with true labels)")
+                print(f"{'='*60}\n")
+
+            # Override logits with matching network output (for backward compatibility)
+            logits = self.matching_network(target_label_emb, context_label_emb, context_y, num_classes=num_classes)
+            # class_emb from task heads is still returned
 
         return logits, class_emb
     
@@ -950,6 +1246,101 @@ class PFNPredictorBinaryCls(nn.Module):
         else:
             return self.head(target_x.squeeze(1)).squeeze(-1)
         
+class MatchingNetworkPredictor(nn.Module):
+    """
+    Matching Network with Label-Value Attention for few-shot classification.
+
+    Query attends to support samples, using one-hot labels as values:
+        logits = softmax(Q·K^T / tau) · one_hot(labels)
+
+    Args:
+        hidden_dim: Embedding dimension
+        projection_type: 'linear' or 'mlp' for Q/K projections
+        normalize: Whether to normalize Q/K before dot product (cosine attention)
+        temperature: Initial temperature for scaling
+        dropout: Dropout rate for MLP projections
+        mlp_layers: Number of layers if using MLP projection
+        learnable_temperature: Whether temperature is learnable
+    """
+    def __init__(self, hidden_dim, projection_type='linear', normalize=True,
+                 temperature=1.0, dropout=0.2, norm=False, mlp_layers=2,
+                 norm_affine=True, learnable_temperature=True):
+        """
+        Args:
+            temperature: Scaling for attention (attn = scores / temp).
+                        With normalized Q/K (cosine sim in [-1,1]), temp=1.0 is reasonable.
+                        Lower temp = sharper attention. Default 1.0.
+        """
+        super(MatchingNetworkPredictor, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.normalize = normalize
+        self.projection_type = projection_type
+
+        # Q/K projections
+        if projection_type == 'linear':
+            self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        elif projection_type == 'mlp':
+            self.q_proj = MLP(hidden_dim, hidden_dim, hidden_dim, mlp_layers, dropout, norm,
+                              tailact=False, norm_affine=norm_affine)
+            self.k_proj = MLP(hidden_dim, hidden_dim, hidden_dim, mlp_layers, dropout, norm,
+                              tailact=False, norm_affine=norm_affine)
+        else:
+            raise ValueError(f"Unknown projection_type: {projection_type}. Use 'linear' or 'mlp'.")
+
+        # Learnable temperature for attention scaling
+        if learnable_temperature:
+            self.temperature = nn.Parameter(torch.tensor(temperature))
+        else:
+            self.register_buffer('temperature', torch.tensor(temperature))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        if self.projection_type == 'linear':
+            # Initialize as identity so early behavior mimics direct similarity (like mean pooling)
+            nn.init.eye_(self.q_proj.weight)
+            nn.init.eye_(self.k_proj.weight)
+            nn.init.zeros_(self.q_proj.bias)
+            nn.init.zeros_(self.k_proj.bias)
+
+    def forward(self, target_emb, support_emb, support_labels, num_classes=None):
+        """
+        Args:
+            target_emb: Target/query embeddings [num_target, hidden_dim]
+            support_emb: Support set embeddings [num_support, hidden_dim]
+            support_labels: Labels for support samples [num_support]
+            num_classes: Number of classes (inferred from labels if None)
+
+        Returns:
+            logits: Classification logits [num_target, num_classes]
+        """
+        # Infer num_classes if not provided
+        if num_classes is None:
+            num_classes = support_labels.max().item() + 1
+
+        # Project Q and K
+        Q = self.q_proj(target_emb)    # [num_target, hidden_dim]
+        K = self.k_proj(support_emb)   # [num_support, hidden_dim]
+
+        # Normalize for cosine attention
+        if self.normalize:
+            Q = F.normalize(Q, p=2, dim=-1)
+            K = F.normalize(K, p=2, dim=-1)
+
+        # Compute attention scores and aggregate by class
+        attn_scores = torch.matmul(Q, K.t()) / self.temperature  # [num_target, num_support]
+
+        # One-hot labels as values
+        V = F.one_hot(support_labels.long(), num_classes=num_classes).float()  # [num_support, num_classes]
+
+        # Aggregate attention scores by class (sum pooling per class)
+        # This gives unnormalized logits that can be passed to log_softmax
+        logits = torch.matmul(attn_scores, V)  # [num_target, num_classes]
+
+        return logits
+
+
 class AttentionPool(nn.Module):
     def __init__(self, in_channels, out_channels, nhead=1, dp=0.2):
         super(AttentionPool, self).__init__()
@@ -1322,7 +1713,11 @@ class GNNWithDE(nn.Module):
 
         if self.training:
             # Training: Update sample periodically OR use cached
-            if self.step_counter % self.update_every_n == 0:
+            # BUT: Always recompute if feature dimension changed (different dataset)
+            feat_dim_changed = (self.cached_sample is not None and
+                               self.cached_sample.size(1) != x.size(1))
+
+            if self.step_counter % self.update_every_n == 0 or feat_dim_changed:
                 sampled_features = sample_feature_columns(
                     x,
                     self.de_sample_size,
@@ -1330,6 +1725,7 @@ class GNNWithDE(nn.Module):
                     deterministic_eval=False
                 )
                 self.cached_sample = sampled_features
+                self.cached_projection = None  # Invalidate projection cache too
             else:
                 # Reuse cached sample (reduces randomness)
                 sampled_features = self.cached_sample if self.cached_sample is not None else \
@@ -1351,16 +1747,6 @@ class GNNWithDE(nn.Module):
         # Step 3: Project features with learnable LayerNorm
         from src.dynamic_encoder import apply_dynamic_projection
         x_proj = apply_dynamic_projection(x, projection_matrix, normalize=True, layer_norm=self.proj_layer_norm)  # (N, k)
-
-        # Always cache x_proj for separability tracking
-        self._debug_x_proj = x_proj
-
-        # DEBUG: Retain gradients on intermediate tensors to trace explosion (first step only)
-        if self.step_counter == 1 and self.training:
-            x_proj.retain_grad()
-            # Store references for gradient inspection
-            self._debug_x = x
-            self._debug_projection_matrix = projection_matrix
 
         # Step 4: Pass through GNN
         h = self.gnn(x_proj, adj_t, batch)

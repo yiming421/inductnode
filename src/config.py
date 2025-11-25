@@ -126,6 +126,12 @@ def parse_joint_training_args():
     parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp'], help='Similarity function')
     parser.add_argument('--orthogonal_push', type=float, default=0, help='Orthogonal push regularization weight')
     parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize class embeddings')
+
+    # === Matching Network Configuration ===
+    parser.add_argument('--use_matching_network', type=str2bool, default=False, help='Use matching network instead of prototype-based prediction')
+    parser.add_argument('--matching_network_projection', type=str, default='linear', choices=['linear', 'mlp'], help='Projection type for Q/K in matching network')
+    parser.add_argument('--matching_network_temperature', type=float, default=1.0, help='Temperature for matching network attention (attn = scores / temp, so lower = sharper)')
+    parser.add_argument('--matching_network_learnable_temp', type=str2bool, default=True, help='Make temperature learnable')
     
     # === Data Processing ===
     parser.add_argument('--use_full_pca', type=str2bool, default=False, help='Use full PCA decomposition')
