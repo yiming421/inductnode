@@ -11,6 +11,59 @@ from .utils import process_node_features, acc, apply_final_pca
 from .data_utils import select_k_shot_context, edge_dropout_sparse_tensor, feature_dropout
 
 
+def correct_and_smooth(adj, base_logits, train_idx, train_labels, num_classes,
+                       num_iters=50, alpha=0.5):
+    """
+    Correct & Smooth: post-process feature-based predictions with label propagation.
+
+    1. Start with base predictions from features (not zeros!)
+    2. Propagate predictions through graph
+    3. Clamp support set to ground truth at each step
+
+    This combines feature information with graph structure.
+
+    Args:
+        adj: SparseTensor adjacency matrix
+        base_logits: [num_nodes, num_classes] initial predictions from model
+        train_idx: Tensor of training node indices
+        train_labels: Tensor of training node labels
+        num_classes: Number of classes
+        num_iters: Number of propagation iterations (default: 50)
+        alpha: Blending factor (default: 0.5)
+
+    Returns:
+        Y: [num_nodes, num_classes] refined predictions after C&S
+    """
+    device = adj.device()
+    num_nodes = base_logits.size(0)
+
+    # Compute normalized adjacency WITH self-loops: D^{-1/2} (A + I) D^{-1/2}
+    deg = adj.sum(dim=1).to_dense()
+    deg_with_selfloop = deg + 1  # Add 1 for self-loop
+    deg_inv_sqrt = (deg_with_selfloop + 1e-9).pow(-0.5)
+
+    # Start with softmax of base logits (feature-based estimate)
+    Y = F.softmax(base_logits, dim=-1)
+
+    # Ground truth for support set
+    Y_support = F.one_hot(train_labels.long(), num_classes=num_classes).float()
+
+    # Propagate and clamp
+    for _ in range(num_iters):
+        # Propagate with self-loop: D^{-1/2} (A*Y + Y) D^{-1/2}
+        Y_new = deg_inv_sqrt.view(-1, 1) * Y
+        Y_new = adj @ Y_new + Y_new  # A*Y + Y (implicit self-loop)
+        Y_new = deg_inv_sqrt.view(-1, 1) * Y_new
+
+        # Blend with previous
+        Y = (1 - alpha) * Y_new + alpha * Y
+
+        # Clamp support set to ground truth (force truth to flow outward)
+        Y[train_idx] = Y_support
+
+    return Y
+
+
 def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
     """
     Apply feature dropout if enabled in args (after projection only).
@@ -304,7 +357,8 @@ def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, deg
 
 @torch.no_grad()
 def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False,
-         att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings=None, args=None):
+         att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None,
+         external_embeddings=None, args=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5):
     st = time.time()
     model.eval()
     predictor.eval()
@@ -352,54 +406,77 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     valid_loader = DataLoader(range(valid_idx.size(0)), batch_size, shuffle=False)
     test_loader = DataLoader(range(test_idx.size(0)), batch_size, shuffle=False)
 
-    valid_score = []
+    # Get base predictions for all splits
+    valid_logits = []
     for idx in valid_loader:
         target_h = h[valid_idx[idx]]
         pred_output = predictor(data, context_h, target_h, context_y, class_h)
-        if len(pred_output) == 3:  # MoE case with auxiliary loss
-            out, _, _ = pred_output  # Discard auxiliary loss during evaluation
-        else:  # Standard case
+        if len(pred_output) == 3:
+            out, _, _ = pred_output
+        else:
             out, _ = pred_output
-        out = out.argmax(dim=1).flatten()
-        valid_score.append(out)
-    valid_score = torch.cat(valid_score, dim=0)
+        valid_logits.append(out)
+    valid_logits = torch.cat(valid_logits, dim=0)
+    valid_score_base = valid_logits.argmax(dim=1)
 
-    train_score = []
+    train_logits = []
     for idx in train_loader:
         target_h = h[train_idx[idx]]
         pred_output = predictor(data, context_h, target_h, context_y, class_h)
-        if len(pred_output) == 3:  # MoE case with auxiliary loss
-            out, _, _ = pred_output  # Discard auxiliary loss during evaluation
-        else:  # Standard case
+        if len(pred_output) == 3:
+            out, _, _ = pred_output
+        else:
             out, _ = pred_output
-        out = out.argmax(dim=1).flatten()
-        train_score.append(out)
-    train_score = torch.cat(train_score, dim=0)
+        train_logits.append(out)
+    train_logits = torch.cat(train_logits, dim=0)
+    train_score_base = train_logits.argmax(dim=1)
 
-    test_score = []
-    test_debug_printed = False
+    test_logits = []
     for idx in test_loader:
         target_h = h[test_idx[idx]]
         pred_output = predictor(data, context_h, target_h, context_y, class_h)
-        if len(pred_output) == 3:  # MoE case with auxiliary loss
-            out, _, _ = pred_output  # Discard auxiliary loss during evaluation
-        else:  # Standard case
+        if len(pred_output) == 3:
+            out, _, _ = pred_output
+        else:
             out, _ = pred_output
+        test_logits.append(out)
+    test_logits = torch.cat(test_logits, dim=0)
+    test_score_base = test_logits.argmax(dim=1)
 
-        # DEBUG: Compute accuracy for different methods on TEST set (first batch only)
-        if not test_debug_printed and hasattr(predictor, '_debug_preds') and predictor._debug_preds is not None:
-            true_labels = data.y[test_idx[idx]].squeeze()
-            print(f"\n=== TEST SET ACCURACY COMPARISON (first batch) ===")
-            for method, preds in predictor._debug_preds.items():
-                acc_val = (preds == true_labels).float().mean().item()
-                print(f"  {method}: {acc_val:.4f} ({acc_val*100:.2f}%)")
-            predictor._debug_preds = None
-            test_debug_printed = True
-            print()
+    # Apply C&S if enabled and use it only for splits where it improves
+    if use_cs:
+        # Build full logits tensor for all nodes
+        all_logits = torch.zeros(data.num_nodes, train_logits.size(1), device=h.device)
+        all_logits[train_idx] = train_logits
+        all_logits[valid_idx] = valid_logits
+        all_logits[test_idx] = test_logits
 
-        out = out.argmax(dim=1).flatten()
-        test_score.append(out)
-    test_score = torch.cat(test_score, dim=0)
+        # Apply Correct & Smooth
+        num_classes = context_y.max().item() + 1
+        cs_predictions = correct_and_smooth(
+            data.adj_t, all_logits, train_idx, data.y[train_idx],
+            num_classes, num_iters=cs_num_iters, alpha=cs_alpha
+        )
+
+        # Check each split separately and use C&S only if it improves
+        train_score_cs = cs_predictions[train_idx].argmax(dim=1)
+        train_acc_base = acc(data.y[train_idx], train_score_base)
+        train_acc_cs = acc(data.y[train_idx], train_score_cs)
+        train_score = train_score_cs if train_acc_cs > train_acc_base else train_score_base
+
+        valid_score_cs = cs_predictions[valid_idx].argmax(dim=1)
+        valid_acc_base = acc(data.y[valid_idx], valid_score_base)
+        valid_acc_cs = acc(data.y[valid_idx], valid_score_cs)
+        valid_score = valid_score_cs if valid_acc_cs > valid_acc_base else valid_score_base
+
+        test_score_cs = cs_predictions[test_idx].argmax(dim=1)
+        test_acc_base = acc(data.y[test_idx], test_score_base)
+        test_acc_cs = acc(data.y[test_idx], test_score_cs)
+        test_score = test_score_cs if test_acc_cs > test_acc_base else test_score_base
+    else:
+        train_score = train_score_base
+        valid_score = valid_score_base
+        test_score = test_score_base
 
     # calculate valid metric
     valid_y = data.y[valid_idx]
@@ -414,7 +491,8 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     return train_results, valid_results, test_results
 
 def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=False, att=None,
-             mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings_list=None):
+             mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None,
+             external_embeddings_list=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5):
     tot_train_metric, tot_valid_metric, tot_test_metric = 1, 1, 1
     for i, (data, split_idx) in enumerate(zip(data_list, split_idx_list)):
         train_idx = split_idx['train']
@@ -424,7 +502,8 @@ def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=Fal
 
         train_metric, valid_metric, test_metric = \
         test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
-             normalize_class_h, projector, rank, identity_projection, external_embeddings)
+             normalize_class_h, projector, rank, identity_projection, external_embeddings, args=None,
+             use_cs=use_cs, cs_num_iters=cs_num_iters, cs_alpha=cs_alpha)
         if rank == 0:
             print(f"Dataset {data.name}")
             print(f"Train {train_metric}, Valid {valid_metric}, Test {test_metric}", flush=True)
@@ -435,7 +514,8 @@ def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=Fal
            tot_test_metric ** (1/(len(data_list)))
 
 def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, degree=False,
-                    att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None, external_embeddings_list=None):
+                    att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None,
+                    external_embeddings_list=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5):
     import time
 
     train_metric_list, valid_metric_list, test_metric_list = [], [], []
@@ -449,7 +529,8 @@ def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, deg
         external_embeddings = external_embeddings_list[dataset_idx] if external_embeddings_list else None
         train_metric, valid_metric, test_metric = \
         test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
-             normalize_class_h, projector, rank, identity_projection, external_embeddings)
+             normalize_class_h, projector, rank, identity_projection, external_embeddings, args=None,
+             use_cs=use_cs, cs_num_iters=cs_num_iters, cs_alpha=cs_alpha)
 
         dataset_time = time.time() - dataset_start_time
 

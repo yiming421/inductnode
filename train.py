@@ -1099,7 +1099,13 @@ def create_unified_model(args, input_dim, device):
             use_matching_network=getattr(args, 'use_matching_network', False),
             matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
             matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
-            matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True)
+            matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
+            # Task-specific ridge regression configuration
+            nc_sim=args.nc_sim,  # Use explicit config values (have proper defaults)
+            nc_ridge_alpha=args.nc_ridge_alpha,
+            lp_sim=args.lp_sim,
+            lp_ridge_alpha=args.lp_ridge_alpha,
+            head_num_layers=getattr(args, 'head_num_layers', 2)
         )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
@@ -2014,7 +2020,8 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                 # Use inductive evaluation for unseen datasets
                 train_metrics, valid_metrics, test_metrics = test_all_induct(
                     model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                    False, None, None, True, projector, 0, identity_projection
+                    False, None, None, True, projector, 0, identity_projection, None,
+                    use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha
                 )
 
                 datasets_time = time.time() - datasets_start_time
@@ -2060,7 +2067,8 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     # Use transductive evaluation for seen datasets (original approach)
                     train_metrics, valid_metrics, test_metrics = test_all(
                         model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                        False, None, None, True, projector, 0, identity_projection
+                        False, None, None, True, projector, 0, identity_projection, None,
+                        use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha
                     )
                     results = {
                         'train': train_metrics if isinstance(train_metrics, (int, float)) else sum(train_metrics) / len(train_metrics),

@@ -553,6 +553,48 @@ class Prodigy_Predictor_mlp(nn.Module):
         x = torch.matmul(x, class_x.t())
         return x
 
+class RidgeRegressionPredictor(nn.Module):
+    """
+    Ridge Regression Predictor for node classification.
+
+    Uses closed-form ridge regression solution: W = (X^T X + λI)^{-1} X^T Y
+    """
+    def __init__(self, ridge_alpha=1.0):
+        super().__init__()
+        self.ridge_alpha = ridge_alpha
+        self._debug_preds = None
+
+    def forward(self, data, context_h, target_h, context_y, class_h=None):
+        """
+        Args:
+            data: Data object (for compatibility)
+            context_h: Context node embeddings [n_support, dim]
+            target_h: Target node embeddings [n_target, dim]
+            context_y: Context labels [n_support]
+            class_h: Class prototypes (unused for ridge regression)
+
+        Returns:
+            logits: [n_target, n_classes] prediction logits
+            class_h: Unchanged class prototypes (for compatibility)
+        """
+        num_classes = context_y.max().item() + 1
+
+        # One-hot encode labels
+        support_y = F.one_hot(context_y.long(), num_classes=num_classes).float()  # [n_support, n_classes]
+
+        # Solve ridge regression: W = (X^T X + λI)^{-1} X^T Y
+        XtX = context_h.t() @ context_h  # [dim, dim]
+        XtY = context_h.t() @ support_y  # [dim, n_classes]
+
+        # Add regularization
+        I = torch.eye(context_h.size(1), device=context_h.device)
+        W = torch.linalg.solve(XtX + self.ridge_alpha * I, XtY)  # [dim, n_classes]
+
+        # Predict
+        logits = target_h @ W  # [n_target, n_classes]
+
+        return logits, class_h
+
 class PFNTransformerLayer(nn.Module):
     def __init__(self, hidden_dim, n_head=1, mlp_layers=2, dropout=0.2, norm=False,
                  separate_att=False, unsqueeze=False, norm_affine=True, norm_type='post',
@@ -691,17 +733,18 @@ class PFNTransformerLayer(nn.Module):
 
 class NodeClassificationHead(nn.Module):
     """Task-specific head for node classification."""
-    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot'):
+    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot', ridge_alpha=1.0, head_num_layers=2):
         super(NodeClassificationHead, self).__init__()
         self.hidden_dim = hidden_dim
         self.sim = sim
+        self.ridge_alpha = ridge_alpha
 
-        # Task-specific projection MLP (2 layers)
+        # Task-specific projection MLP
         self.proj = MLP(
             in_channels=hidden_dim,
             hidden_channels=hidden_dim,
             out_channels=hidden_dim,
-            num_layers=2,
+            num_layers=head_num_layers,
             dropout=dropout,
             norm=norm,
             tailact=False,
@@ -714,7 +757,7 @@ class NodeClassificationHead(nn.Module):
                 in_channels=hidden_dim,
                 hidden_channels=hidden_dim,
                 out_channels=hidden_dim,
-                num_layers=2,
+                num_layers=head_num_layers,
                 dropout=dropout,
                 norm=norm,
                 tailact=False,
@@ -750,49 +793,81 @@ class NodeClassificationHead(nn.Module):
         if context_label_emb.dim() == 1:
             context_label_emb = context_label_emb.unsqueeze(0)
 
-        # Compute class prototypes using shared pooling logic
-        class_emb = process_node_features(
-            context_label_emb,
-            data,
-            degree_normalize=degree_normalize,
-            attention_pool_module=attention_pool_module,
-            mlp_module=mlp_module,
-            normalize=normalize
-        )
+        # Compute logits using similarity or ridge regression
+        if self.sim == 'ridge':
+            # Ridge Regression: W = (X^T X + λI)^{-1} X^T Y
+            num_classes = context_y.max().item() + 1
 
-        # Compute logits using similarity
-        if self.sim == 'dot':
-            logits = torch.matmul(target_label_emb, class_emb.t())
-        elif self.sim == 'cos':
-            target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
-            class_emb = F.normalize(class_emb, p=2, dim=-1)
-            logits = torch.matmul(target_label_emb, class_emb.t())
-        elif self.sim == 'euclidean':
-            distances = torch.cdist(target_label_emb, class_emb, p=2)
-            logits = -distances
-        elif self.sim == 'mlp':
-            target_label_emb = self.sim_mlp(target_label_emb)
-            class_emb = self.sim_mlp(class_emb)
-            logits = torch.matmul(target_label_emb, class_emb.t())
+            # Input validation
+            if context_y.numel() == 0:
+                raise ValueError("Context labels cannot be empty for ridge regression")
+            if self.ridge_alpha <= 0:
+                raise ValueError("Ridge alpha must be positive for numerical stability")
+            if context_label_emb.size(0) < 2:
+                raise ValueError("Ridge regression requires at least 2 support samples")
+
+            # One-hot encode labels
+            support_y = F.one_hot(context_y.long(), num_classes=num_classes).float()
+
+            # Solve ridge regression
+            XtX = context_label_emb.t() @ context_label_emb
+            XtY = context_label_emb.t() @ support_y
+
+            # Add regularization
+            I = torch.eye(context_label_emb.size(1), device=context_label_emb.device)
+            try:
+                W = torch.linalg.solve(XtX + self.ridge_alpha * I, XtY)
+            except torch.linalg.LinAlgError as e:
+                raise RuntimeError(f"Ridge regression solver failed - try increasing ridge_alpha. Error: {e}")
+
+            # Predict
+            logits = target_label_emb @ W
+            class_emb = None  # Not used in ridge regression
         else:
-            raise ValueError(f"Invalid similarity type: {self.sim}")
+            # Compute class prototypes using shared pooling logic (for non-ridge methods)
+            class_emb = process_node_features(
+                context_label_emb,
+                data,
+                degree_normalize=degree_normalize,
+                attention_pool_module=attention_pool_module,
+                mlp_module=mlp_module,
+                normalize=normalize
+            )
+
+            # Compute logits using similarity
+            if self.sim == 'dot':
+                logits = torch.matmul(target_label_emb, class_emb.t())
+            elif self.sim == 'cos':
+                target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
+                class_emb = F.normalize(class_emb, p=2, dim=-1)
+                logits = torch.matmul(target_label_emb, class_emb.t())
+            elif self.sim == 'euclidean':
+                distances = torch.cdist(target_label_emb, class_emb, p=2)
+                logits = -distances
+            elif self.sim == 'mlp':
+                target_label_emb = self.sim_mlp(target_label_emb)
+                class_emb = self.sim_mlp(class_emb)
+                logits = torch.matmul(target_label_emb, class_emb.t())
+            else:
+                raise ValueError(f"Invalid similarity type: {self.sim}")
 
         return logits, class_emb
 
 
 class LinkPredictionHead(nn.Module):
     """Task-specific head for link prediction."""
-    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot'):
+    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot', ridge_alpha=1.0, head_num_layers=2):
         super(LinkPredictionHead, self).__init__()
         self.hidden_dim = hidden_dim
         self.sim = sim
+        self.ridge_alpha = ridge_alpha
 
-        # Task-specific projection MLP (2 layers)
+        # Task-specific projection MLP
         self.proj = MLP(
             in_channels=hidden_dim,
             hidden_channels=hidden_dim,
             out_channels=hidden_dim,
-            num_layers=2,
+            num_layers=head_num_layers,
             dropout=dropout,
             norm=norm,
             tailact=False,
@@ -805,7 +880,7 @@ class LinkPredictionHead(nn.Module):
                 in_channels=hidden_dim,
                 hidden_channels=hidden_dim,
                 out_channels=hidden_dim,
-                num_layers=2,
+                num_layers=head_num_layers,
                 dropout=dropout,
                 norm=norm,
                 tailact=False,
@@ -865,8 +940,37 @@ class LinkPredictionHead(nn.Module):
         if normalize:
             class_emb = F.normalize(class_emb, p=2, dim=-1)
 
-        # Compute logits using similarity
-        if self.sim == 'dot':
+        # Compute logits using similarity or ridge regression
+        if self.sim == 'ridge':
+            # Ridge Regression: W = (X^T X + λI)^{-1} X^T Y
+            num_classes = 2  # Always 2 for link prediction (no-link, link)
+            
+            # Input validation
+            if context_y.numel() == 0:
+                raise ValueError("Context labels cannot be empty for ridge regression")
+            if self.ridge_alpha <= 0:
+                raise ValueError("Ridge alpha must be positive for numerical stability")
+            if context_label_emb.size(0) < 2:
+                raise ValueError("Ridge regression requires at least 2 support samples")
+            
+            # One-hot encode labels
+            support_y = F.one_hot(context_y.long(), num_classes=num_classes).float()
+            
+            # Solve ridge regression
+            XtX = context_label_emb.t() @ context_label_emb
+            XtY = context_label_emb.t() @ support_y
+            
+            # Add regularization
+            I = torch.eye(context_label_emb.size(1), device=context_label_emb.device)
+            try:
+                W = torch.linalg.solve(XtX + self.ridge_alpha * I, XtY)
+            except torch.linalg.LinAlgError as e:
+                raise RuntimeError(f"Ridge regression solver failed - try increasing ridge_alpha. Error: {e}")
+            
+            # Predict
+            logits = target_label_emb @ W
+            class_emb = None  # Not used in ridge regression
+        elif self.sim == 'dot':
             logits = torch.matmul(target_label_emb, class_emb.t())
         elif self.sim == 'cos':
             target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
@@ -891,14 +995,27 @@ class PFNPredictorNodeCls(nn.Module):
                  padding='zero', norm_affine=True, normalize=False,
                  use_first_half_embedding=False, use_full_embedding=False, norm_type='post',
                  ffn_expansion_ratio=4, use_matching_network=False, matching_network_projection='linear',
-                 matching_network_temperature=1.0, matching_network_learnable_temp=True):
+                 matching_network_temperature=1.0, matching_network_learnable_temp=True, 
+                 # Node classification ridge regression
+                 nc_sim='dot', nc_ridge_alpha=1.0,
+                 # Link prediction ridge regression  
+                 lp_sim='dot', lp_ridge_alpha=1.0,
+                 head_num_layers=2):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
         self.embed_dim = hidden_dim + self.d_label  # Token dimension after concatenation
-        self.sim = sim
+        self.sim = sim  # Legacy parameter for backward compatibility
         self.padding = padding
         self.use_matching_network = use_matching_network
+        
+        # Separate ridge regression configurations
+        # Use explicit task-specific parameters - they have proper defaults from config
+        self.nc_sim = nc_sim
+        self.nc_ridge_alpha = nc_ridge_alpha
+        self.lp_sim = lp_sim  
+        self.lp_ridge_alpha = lp_ridge_alpha
+        self.head_num_layers = head_num_layers
 
         if self.padding == 'mlp':
             self.pad_mlp = MLP(
@@ -977,7 +1094,9 @@ class PFNPredictorNodeCls(nn.Module):
             dropout=dropout,
             norm=norm,
             norm_affine=norm_affine,
-            sim=sim
+            sim=self.nc_sim,
+            ridge_alpha=self.nc_ridge_alpha,
+            head_num_layers=self.head_num_layers
         )
 
         self.lp_head = LinkPredictionHead(
@@ -985,7 +1104,9 @@ class PFNPredictorNodeCls(nn.Module):
             dropout=dropout,
             norm=norm,
             norm_affine=norm_affine,
-            sim=sim
+            sim=self.lp_sim,
+            ridge_alpha=self.lp_ridge_alpha,
+            head_num_layers=self.head_num_layers
         )
     
     def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification'):

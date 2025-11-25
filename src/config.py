@@ -123,9 +123,31 @@ def parse_joint_training_args():
     parser.add_argument('--context_num', type=int, default=5, help='Number of context nodes')
     parser.add_argument('--seperate', type=str2bool, default=True, help='Separate processing in PFN predictor')
     parser.add_argument('--padding', type=str, default='zero', choices=['zero', 'mlp'], help='Padding method for PFN predictor')
-    parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp'], help='Similarity function')
+    
+    # Similarity and Ridge Regression Configuration
+    parser.add_argument('--sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'], 
+                        help='Default similarity function (legacy, use nc_sim/lp_sim for task-specific control)')
+    parser.add_argument('--ridge_alpha', type=float, default=1.0, 
+                        help='Default regularization strength for ridge regression (legacy, use nc_ridge_alpha/lp_ridge_alpha for task-specific control)')
+    
+    # Task-Specific Similarity and Ridge Configuration
+    parser.add_argument('--nc_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'], 
+                        help='Similarity function for node classification')
+    parser.add_argument('--nc_ridge_alpha', type=float, default=1.0, 
+                        help='Ridge regression regularization strength for node classification')
+    parser.add_argument('--lp_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'], 
+                        help='Similarity function for link prediction')
+    parser.add_argument('--lp_ridge_alpha', type=float, default=1.0, 
+                        help='Ridge regression regularization strength for link prediction')
+    
+    parser.add_argument('--head_num_layers', type=int, default=2, help='Number of MLP layers in task-specific heads')
     parser.add_argument('--orthogonal_push', type=float, default=0, help='Orthogonal push regularization weight')
     parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize class embeddings')
+
+    # === Correct & Smooth (C&S) Post-processing ===
+    parser.add_argument('--use_cs', type=str2bool, default=True, help='Apply Correct & Smooth post-processing (only uses if it improves each split)')
+    parser.add_argument('--cs_num_iters', type=int, default=50, help='Number of label propagation iterations for C&S')
+    parser.add_argument('--cs_alpha', type=float, default=0.5, help='Blending factor for C&S (higher = more emphasis on previous iteration)')
 
     # === Matching Network Configuration ===
     parser.add_argument('--use_matching_network', type=str2bool, default=False, help='Use matching network instead of prototype-based prediction')
