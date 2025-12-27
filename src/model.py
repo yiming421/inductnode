@@ -122,6 +122,10 @@ class PureGCN_v1(nn.Module):
                     x = F.dropout(x, p=self.dp, training=self.training)  # Safe dropout
             x = self.conv(x, adj_t)  # Apply GCN convolution
 
+        # Add final residual connection after all layers
+        if self.res:
+            x = x + ori
+
         # Remove virtual node from output if present
         if self.use_virtual_node and batch is not None:
             virtualnode_out = x[:num_graphs]  # Extract virtual nodes
@@ -135,26 +139,84 @@ class MLP(nn.Module):
                  norm=False, tailact=False, norm_affine=True):
         super(MLP, self).__init__()
         self.lins = torch.nn.Sequential()
-        self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
-        if norm:
-            self.lins.append(nn.LayerNorm(hidden_channels, elementwise_affine=norm_affine))
-        self.lins.append(nn.ReLU())
-        if dropout > 0:
-            self.lins.append(nn.Dropout(dropout))
-        for _ in range(num_layers - 2):
-            self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
+        self.num_layers = num_layers
+
+        # Handle num_layers=0: Identity mapping
+        if num_layers == 0:
+            assert in_channels == out_channels, \
+                f"num_layers=0 requires in_channels==out_channels, got {in_channels}!={out_channels}"
+            # Empty sequential acts as identity
+            pass
+        # Handle num_layers=1: Single linear layer
+        elif num_layers == 1:
+            self.lins.append(torch.nn.Linear(in_channels, out_channels))
+            if tailact:
+                if norm:
+                    self.lins.append(nn.LayerNorm(out_channels, elementwise_affine=norm_affine))
+                self.lins.append(nn.ReLU())
+                if dropout > 0:
+                    self.lins.append(nn.Dropout(dropout))
+        # Handle num_layers>=2: Standard MLP with hidden layers
+        else:
+            self.lins.append(torch.nn.Linear(in_channels, hidden_channels))
             if norm:
                 self.lins.append(nn.LayerNorm(hidden_channels, elementwise_affine=norm_affine))
             self.lins.append(nn.ReLU())
             if dropout > 0:
                 self.lins.append(nn.Dropout(dropout))
-        self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
-        if tailact:
-            self.lins.append(nn.LayerNorm(out_channels, elementwise_affine=norm_affine))
-            self.lins.append(nn.ReLU())
-            self.lins.append(nn.Dropout(dropout))
+            for _ in range(num_layers - 2):
+                self.lins.append(torch.nn.Linear(hidden_channels, hidden_channels))
+                if norm:
+                    self.lins.append(nn.LayerNorm(hidden_channels, elementwise_affine=norm_affine))
+                self.lins.append(nn.ReLU())
+                if dropout > 0:
+                    self.lins.append(nn.Dropout(dropout))
+            self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
+            if tailact:
+                self.lins.append(nn.LayerNorm(out_channels, elementwise_affine=norm_affine))
+                self.lins.append(nn.ReLU())
+                self.lins.append(nn.Dropout(dropout))
+
+    def _init_identity_like(self):
+        """
+        Initialize MLP to approximate identity transformation.
+        This prevents the head from disrupting well-calibrated embeddings at initialization.
+
+        Strategy:
+        - Single layer (num_layers=1): Perfect identity (W=I, b=0)
+        - Multi-layer: All layers initialized very small, last layer identity-like
+        """
+        import torch.nn.init as init
+
+        if self.num_layers == 0:
+            return  # No layers to initialize
+
+        # Find all linear layers
+        linear_layers = [m for m in self.lins if isinstance(m, nn.Linear)]
+
+        if len(linear_layers) == 0:
+            return
+
+        # Initialize ALL layers with very small weights
+        for i, linear in enumerate(linear_layers):
+            in_feat = linear.in_features
+            out_feat = linear.out_features
+
+            if i == len(linear_layers) - 1 and in_feat == out_feat:
+                # Final layer with matching dims: Perfect identity
+                init.eye_(linear.weight)
+            else:
+                # All other layers: Very small random init (gain=0.01)
+                # This ensures the network is close to identity even with ReLU
+                init.xavier_uniform_(linear.weight, gain=0.01)
+
+            if linear.bias is not None:
+                init.zeros_(linear.bias)
 
     def forward(self, x):
+        if self.num_layers == 0:
+            # Identity mapping - return input as-is
+            return x.squeeze()
         x = self.lins(x)
         return x.squeeze()
     
@@ -630,16 +692,37 @@ class PFNTransformerLayer(nn.Module):
             norm_affine=norm_affine
         )
 
-        self.context_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
-        self.context_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
-        self.tar_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
-        self.tar_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
+        self.context_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)  # For context self-attention
+        self.context_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)  # For context FFN
+        self.context_norm3 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)  # For context as key/value in cross-attention
+        self.tar_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)      # For target cross-attention
+        self.tar_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)      # For target FFN
         self.separate_att = separate_att
         self.unsqueeze = unsqueeze
         self.norm_type = norm_type
 
     def forward(self, x_context, x_target):
+        # DEBUG: Track anisotropy collapse through the layer
+        debug_collapse = False
+        if hasattr(self, '_debug_collapse_step') and self._debug_collapse_step:
+            debug_collapse = True
+            import torch.nn.functional as F
+
+            def compute_mean_dominance(x, name):
+                """Compute how much each sample points toward the mean"""
+                x_squeezed = x.squeeze(1) if x.dim() == 3 else x
+                mean_vec = x_squeezed.mean(dim=0, keepdim=True)
+                sims = F.cosine_similarity(x_squeezed, mean_vec.expand_as(x_squeezed), dim=-1)
+                mean_dom = sims.mean().item()
+                norm = x_squeezed.norm(dim=-1).mean().item()
+                print(f"    {name}: mean_dom={mean_dom:.4f}, avg_norm={norm:.4f}")
+                return mean_dom
+
         if self.norm_type == 'pre':
+            if debug_collapse:
+                print(f"\n  [TRANSFORMER LAYER DEBUG - Pre-Norm]")
+                x_target_in_dom = compute_mean_dominance(x_target, "Input x_target")
+
             # Pre-norm: LayerNorm before sublayers
             # Context self-attention
             x_context_norm = self.context_norm1(x_context)
@@ -658,15 +741,33 @@ class PFNTransformerLayer(nn.Module):
 
             x_context = x_context_fnn + x_context
 
-            # Target cross/self-attention (context should now be 3D)
+            # Target cross/self-attention
+            # In pre-norm: normalize both query (target) and key/value (context)
             x_target_norm = self.tar_norm1(x_target)
-            context_for_att = x_context
+
+            if debug_collapse:
+                after_norm_dom = compute_mean_dominance(x_target_norm, "After LayerNorm")
+
+            context_for_att = self.context_norm3(x_context)  # Normalize context for use as key/value
 
             if self.separate_att:
-                x_target_att, _ = self.cross_att(x_target_norm, context_for_att, context_for_att)
+                x_target_att, attn_weights = self.cross_att(x_target_norm, context_for_att, context_for_att)
             else:
-                x_target_att, _ = self.self_att(x_target_norm, context_for_att, context_for_att)
+                x_target_att, attn_weights = self.self_att(x_target_norm, context_for_att, context_for_att)
+
+            if debug_collapse:
+                att_out_dom = compute_mean_dominance(x_target_att, "After Cross-Att")
+                # Check attention weight uniformity
+                if attn_weights is not None:
+                    attn_entropy = -(attn_weights * torch.log(attn_weights + 1e-10)).sum(dim=-1).mean().item()
+                    max_entropy = torch.log(torch.tensor(attn_weights.size(-1), dtype=torch.float))
+                    normalized_entropy = attn_entropy / max_entropy
+                    print(f"    Attention entropy: {normalized_entropy:.4f} (1.0=uniform, 0.0=peaked)")
+
             x_target = x_target_att + x_target
+
+            if debug_collapse:
+                after_residual_dom = compute_mean_dominance(x_target, "After residual (att+input)")
 
             # Target FFN
             x_target_norm = self.tar_norm2(x_target)
@@ -678,7 +779,14 @@ class PFNTransformerLayer(nn.Module):
             if x_target_fnn.shape != orig_shape:
                 x_target_fnn = x_target_fnn.view(orig_shape)
 
+            if debug_collapse:
+                ffn_out_dom = compute_mean_dominance(x_target_fnn, "After FFN")
+
             x_target = x_target_fnn + x_target
+
+            if debug_collapse:
+                final_dom = compute_mean_dominance(x_target, "Final output (ffn+input)")
+                print(f"    Anisotropy increase: {x_target_in_dom:.4f} → {final_dom:.4f} (+{final_dom-x_target_in_dom:.4f})")
 
         else:  # post-norm (original behavior)
             # Post-norm: LayerNorm after sublayers
@@ -739,6 +847,18 @@ class NodeClassificationHead(nn.Module):
         self.sim = sim
         self.ridge_alpha = ridge_alpha
 
+        # Input normalization layers to stabilize features from transformer
+        # Separate norms for target and context since they may have different statistics
+        self.target_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
+        self.context_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
+
+        # Initialize LayerNorms to identity-like (weight=1, bias=0) to avoid disrupting embeddings
+        if norm_affine:
+            nn.init.ones_(self.target_input_norm.weight)
+            nn.init.zeros_(self.target_input_norm.bias)
+            nn.init.ones_(self.context_input_norm.weight)
+            nn.init.zeros_(self.context_input_norm.bias)
+
         # Task-specific projection MLP
         self.proj = MLP(
             in_channels=hidden_dim,
@@ -750,6 +870,8 @@ class NodeClassificationHead(nn.Module):
             tailact=False,
             norm_affine=norm_affine
         )
+        # Initialize to approximate identity to avoid disrupting embeddings
+        self.proj._init_identity_like()
 
         # Optional MLP for similarity computation
         if sim == 'mlp':
@@ -763,6 +885,8 @@ class NodeClassificationHead(nn.Module):
                 tailact=False,
                 norm_affine=norm_affine
             )
+            # Initialize to approximate identity
+            self.sim_mlp._init_identity_like()
 
     def forward(self, target_label_emb, context_label_emb, context_y, data,
                 degree_normalize=False, attention_pool_module=None, mlp_module=None, normalize=False):
@@ -783,9 +907,14 @@ class NodeClassificationHead(nn.Module):
         """
         from .utils import process_node_features
 
-        # Project embeddings through task-specific head
-        target_label_emb = self.proj(target_label_emb)
-        context_label_emb = self.proj(context_label_emb)
+        # TEMPORARY: Completely disable head to test
+        # # Normalize inputs before projection (separate norms for target and context)
+        # target_label_emb = self.target_input_norm(target_label_emb)
+        # context_label_emb = self.context_input_norm(context_label_emb)
+
+        # # Project embeddings through task-specific head
+        # target_label_emb = self.proj(target_label_emb)
+        # context_label_emb = self.proj(context_label_emb)
 
         # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
         if target_label_emb.dim() == 1:
@@ -862,6 +991,18 @@ class LinkPredictionHead(nn.Module):
         self.sim = sim
         self.ridge_alpha = ridge_alpha
 
+        # Input normalization layers to stabilize features from transformer
+        # Separate norms for target and context since they may have different statistics
+        self.target_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
+        self.context_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
+
+        # Initialize LayerNorms to identity-like (weight=1, bias=0) to avoid disrupting embeddings
+        if norm_affine:
+            nn.init.ones_(self.target_input_norm.weight)
+            nn.init.zeros_(self.target_input_norm.bias)
+            nn.init.ones_(self.context_input_norm.weight)
+            nn.init.zeros_(self.context_input_norm.bias)
+
         # Task-specific projection MLP
         self.proj = MLP(
             in_channels=hidden_dim,
@@ -873,6 +1014,8 @@ class LinkPredictionHead(nn.Module):
             tailact=False,
             norm_affine=norm_affine
         )
+        # Initialize to approximate identity to avoid disrupting embeddings
+        self.proj._init_identity_like()
 
         # Optional MLP for similarity computation
         if sim == 'mlp':
@@ -886,6 +1029,8 @@ class LinkPredictionHead(nn.Module):
                 tailact=False,
                 norm_affine=norm_affine
             )
+            # Initialize to approximate identity
+            self.sim_mlp._init_identity_like()
 
     def forward(self, target_label_emb, context_label_emb, context_y, class_x,
                 attention_pool_module=None, mlp_module=None, normalize=False):
@@ -903,9 +1048,14 @@ class LinkPredictionHead(nn.Module):
             logits: [num_target, 2] - scores for no-link and link
             class_emb: [2, hidden_dim] - link prototypes
         """
-        # Project embeddings through task-specific head
-        target_label_emb = self.proj(target_label_emb)
-        context_label_emb = self.proj(context_label_emb)
+        # TEMPORARY: Completely disable head to test
+        # # Normalize inputs before projection (separate norms for target and context)
+        # target_label_emb = self.target_input_norm(target_label_emb)
+        # context_label_emb = self.context_input_norm(context_label_emb)
+
+        # # Project embeddings through task-specific head
+        # target_label_emb = self.proj(target_label_emb)
+        # context_label_emb = self.proj(context_label_emb)
 
         # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
         if target_label_emb.dim() == 1:
@@ -989,18 +1139,180 @@ class LinkPredictionHead(nn.Module):
         return logits, class_emb
 
 
+class GraphClassificationHead(nn.Module):
+    """Task-specific head for graph classification."""
+    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot', ridge_alpha=1.0, head_num_layers=2):
+        super(GraphClassificationHead, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.sim = sim
+        self.ridge_alpha = ridge_alpha
+
+        # Input normalization layers to stabilize features from transformer
+        # Separate norms for target and context since they may have different statistics
+        self.target_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
+        self.context_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
+
+        # Initialize LayerNorms to identity-like (weight=1, bias=0) to avoid disrupting embeddings
+        if norm_affine:
+            nn.init.ones_(self.target_input_norm.weight)
+            nn.init.zeros_(self.target_input_norm.bias)
+            nn.init.ones_(self.context_input_norm.weight)
+            nn.init.zeros_(self.context_input_norm.bias)
+
+        # Task-specific projection MLP
+        self.proj = MLP(
+            in_channels=hidden_dim,
+            hidden_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_layers=head_num_layers,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+        # Initialize to approximate identity to avoid disrupting embeddings
+        self.proj._init_identity_like()
+
+        # Optional MLP for similarity computation
+        if sim == 'mlp':
+            self.sim_mlp = MLP(
+                in_channels=hidden_dim,
+                hidden_channels=hidden_dim,
+                out_channels=hidden_dim,
+                num_layers=head_num_layers,
+                dropout=dropout,
+                norm=norm,
+                tailact=False,
+                norm_affine=norm_affine
+            )
+            # Initialize to approximate identity
+            self.sim_mlp._init_identity_like()
+
+    def forward(self, target_label_emb, context_label_emb, context_y, class_x,
+                attention_pool_module=None, mlp_module=None, normalize=False):
+        """
+        Args:
+            target_label_emb: [num_target_graphs, hidden_dim] - target graph embeddings
+            context_label_emb: [num_context_graphs, hidden_dim] - context graph embeddings
+            context_y: [num_context_graphs] - labels for context graphs
+            class_x: [num_classes, hidden_dim] - class prototypes
+            attention_pool_module: Optional attention pooling module
+            mlp_module: Optional MLP for prototype transformation
+            normalize: Whether to normalize embeddings
+
+        Returns:
+            logits: [num_target_graphs, num_classes]
+            class_emb: [num_classes, hidden_dim] - class prototypes
+        """
+        # TEMPORARY: Completely disable head to test
+        # # Normalize inputs before projection (separate norms for target and context)
+        # target_label_emb = self.target_input_norm(target_label_emb)
+        # context_label_emb = self.context_input_norm(context_label_emb)
+
+        # # Project embeddings through task-specific head
+        # target_label_emb = self.proj(target_label_emb)
+        # context_label_emb = self.proj(context_label_emb)
+
+        # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
+        if target_label_emb.dim() == 1:
+            target_label_emb = target_label_emb.unsqueeze(0)
+        if context_label_emb.dim() == 1:
+            context_label_emb = context_label_emb.unsqueeze(0)
+
+        # Compute logits using similarity or ridge regression
+        if self.sim == 'ridge':
+            # Ridge Regression: W = (X^T X + λI)^{-1} X^T Y
+            num_classes = context_y.max().item() + 1
+
+            # Input validation
+            if context_y.numel() == 0:
+                raise ValueError("Context labels cannot be empty for ridge regression")
+            if self.ridge_alpha <= 0:
+                raise ValueError("Ridge alpha must be positive for numerical stability")
+            if context_label_emb.size(0) < 2:
+                raise ValueError("Ridge regression requires at least 2 support samples")
+
+            # One-hot encode labels
+            support_y = F.one_hot(context_y.long(), num_classes=num_classes).float()
+
+            # Solve ridge regression
+            XtX = context_label_emb.t() @ context_label_emb
+            XtY = context_label_emb.t() @ support_y
+
+            # Add regularization
+            I = torch.eye(context_label_emb.size(1), device=context_label_emb.device)
+            try:
+                W = torch.linalg.solve(XtX + self.ridge_alpha * I, XtY)
+            except torch.linalg.LinAlgError as e:
+                raise RuntimeError(f"Ridge regression solver failed - try increasing ridge_alpha. Error: {e}")
+
+            # Predict
+            logits = target_label_emb @ W
+            class_emb = None  # Not used in ridge regression
+        else:
+            # Compute class prototypes
+            device = target_label_emb.device
+            num_classes = context_y.max().item() + 1
+            actual_hidden_dim = target_label_emb.size(-1)
+            class_emb = torch.zeros(num_classes, actual_hidden_dim, device=device, dtype=target_label_emb.dtype)
+
+            # Pool refined embeddings for each class
+            for class_idx in range(num_classes):
+                class_mask = (context_y == class_idx)
+                if class_mask.any():
+                    if attention_pool_module is not None:
+                        # Use attention pooling if available
+                        class_embeddings = context_label_emb[class_mask]
+                        class_labels = torch.zeros(class_embeddings.size(0), dtype=torch.long, device=device)
+                        class_emb[class_idx] = attention_pool_module(class_embeddings, class_labels, num_classes=1).squeeze(0)
+                    else:
+                        # Use mean pooling as fallback
+                        class_emb[class_idx] = context_label_emb[class_mask].mean(dim=0)
+
+            # Apply MLP if specified
+            if mlp_module is not None:
+                class_emb = mlp_module(class_emb)
+
+            # Normalize if specified
+            if normalize:
+                class_emb = F.normalize(class_emb, p=2, dim=-1)
+
+            # Compute logits using similarity
+            if self.sim == 'dot':
+                logits = torch.matmul(target_label_emb, class_emb.t())
+            elif self.sim == 'cos':
+                target_label_emb = F.normalize(target_label_emb, p=2, dim=-1)
+                class_emb = F.normalize(class_emb, p=2, dim=-1)
+                logits = torch.matmul(target_label_emb, class_emb.t())
+            elif self.sim == 'euclidean':
+                distances = torch.cdist(target_label_emb, class_emb, p=2)
+                logits = -distances
+            elif self.sim == 'mlp':
+                target_label_emb = self.sim_mlp(target_label_emb)
+                class_emb = self.sim_mlp(class_emb)
+                logits = torch.matmul(target_label_emb, class_emb.t())
+            else:
+                raise ValueError(f"Invalid similarity type: {self.sim}")
+
+        return logits, class_emb
+
+
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2,
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
                  padding='zero', norm_affine=True, normalize=False,
                  use_first_half_embedding=False, use_full_embedding=False, norm_type='post',
                  ffn_expansion_ratio=4, use_matching_network=False, matching_network_projection='linear',
-                 matching_network_temperature=1.0, matching_network_learnable_temp=True, 
+                 matching_network_temperature=1.0, matching_network_learnable_temp=True,
                  # Node classification ridge regression
                  nc_sim='dot', nc_ridge_alpha=1.0,
-                 # Link prediction ridge regression  
+                 # Link prediction ridge regression
                  lp_sim='dot', lp_ridge_alpha=1.0,
-                 head_num_layers=2):
+                 # Graph classification ridge regression
+                 gc_sim='dot', gc_ridge_alpha=1.0,
+                 head_num_layers=2,
+                 # NEW: Option to skip token formulation
+                 skip_token_formulation=False):
         super(PFNPredictorNodeCls, self).__init__()
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
@@ -1008,13 +1320,16 @@ class PFNPredictorNodeCls(nn.Module):
         self.sim = sim  # Legacy parameter for backward compatibility
         self.padding = padding
         self.use_matching_network = use_matching_network
-        
+        self.skip_token_formulation = skip_token_formulation
+
         # Separate ridge regression configurations
         # Use explicit task-specific parameters - they have proper defaults from config
         self.nc_sim = nc_sim
         self.nc_ridge_alpha = nc_ridge_alpha
-        self.lp_sim = lp_sim  
+        self.lp_sim = lp_sim
         self.lp_ridge_alpha = lp_ridge_alpha
+        self.gc_sim = gc_sim
+        self.gc_ridge_alpha = gc_ridge_alpha
         self.head_num_layers = head_num_layers
 
         if self.padding == 'mlp':
@@ -1039,9 +1354,11 @@ class PFNPredictorNodeCls(nn.Module):
             )
 
         # Transformer layers, similar to the original PFNPredictor
+        # Use hidden_dim directly if skipping token formulation, otherwise use embed_dim
+        transformer_dim = self.hidden_dim if self.skip_token_formulation else self.embed_dim
         self.transformer_row = nn.ModuleList([
             PFNTransformerLayer(
-                hidden_dim=self.embed_dim,
+                hidden_dim=transformer_dim,
                 n_head=nhead,
                 mlp_layers=mlp_layers,
                 dropout=dropout,
@@ -1108,64 +1425,96 @@ class PFNPredictorNodeCls(nn.Module):
             ridge_alpha=self.lp_ridge_alpha,
             head_num_layers=self.head_num_layers
         )
+
+        self.gc_head = GraphClassificationHead(
+            hidden_dim=head_hidden_dim,
+            dropout=dropout,
+            norm=norm,
+            norm_affine=norm_affine,
+            sim=self.gc_sim,
+            ridge_alpha=self.gc_ridge_alpha,
+            head_num_layers=self.head_num_layers
+        )
     
     def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification'):
         """
-        Unified forward pass supporting both node classification and link prediction.
-        
+        Unified forward pass supporting node classification, link prediction, and graph classification.
+
         For node classification:
         - data: Graph data with .y and .context_sample attributes
         - context_x: Context node embeddings
-        - target_x: Target node embeddings  
+        - target_x: Target node embeddings
         - context_y: Context node labels
         - class_x: Class prototypes
-        
+
         For link prediction:
         - data: Graph data (may not have .y and .context_sample)
         - context_x: Context edge embeddings
         - target_x: Target edge embeddings
         - context_y: Context edge labels (0: no-link, 1: link)
         - class_x: Link prototypes [2, hidden_dim]
+
+        For graph classification:
+        - data: PFN data structure (prepared for graph classification)
+        - context_x: Context graph embeddings
+        - target_x: Target graph embeddings
+        - context_y: Context graph labels
+        - class_x: Class prototypes [num_classes, hidden_dim]
         """
-        # Step 1: Create context tokens
+        if self.skip_token_formulation:
+            # NEW PATH: Skip token formulation, use GNN embeddings directly
+            # Step 1: Prepare for transformer (add sequence dimension)
+            context_tokens = context_x.unsqueeze(1)  # [num_context, 1, hidden_dim]
+            target_tokens = target_x.unsqueeze(1)    # [num_target, 1, hidden_dim]
 
-        class_x_y = class_x[context_y]  # [num_context, hidden_dim]
-        context_tokens = torch.cat([context_x, class_x_y], dim=1)  # [num_context, 2*hidden_dim]
+            # Step 2: Process through transformer layers
+            for layer in self.transformer_row:
+                context_tokens, target_tokens = layer(context_tokens, target_tokens)
 
-        # Step 2: Create target tokens
-        if self.padding == 'zero':
-            padding = torch.zeros_like(target_x)  # [num_target, hidden_dim]
-        elif self.padding == 'mlp':
-            padding = self.pad_mlp(target_x)
+            # Step 3: Extract refined embeddings
+            context_label_emb = context_tokens.squeeze(1)  # [num_context, hidden_dim]
+            target_label_emb = target_tokens.squeeze(1)    # [num_target, hidden_dim]
         else:
-            raise ValueError("Invalid padding type. Choose 'zero' or 'mlp'.")
-        target_tokens = torch.cat([target_x, padding], dim=1)
-        
-        # Step 3: Prepare for transformer (add sequence dimension)
-        context_tokens = context_tokens.unsqueeze(1)  # [num_context, 1, 2*hidden_dim]
-        target_tokens = target_tokens.unsqueeze(1)    # [num_target, 1, 2*hidden_dim]
-        
-        # Step 4: Process through transformer layers
-        for layer in self.transformer_row:
-            context_tokens, target_tokens = layer(context_tokens, target_tokens)
-        
-        # Step 5: Extract refined label embeddings
-        context_tokens = context_tokens.squeeze(1)  # [num_context, 2*hidden_dim]
-        target_tokens = target_tokens.squeeze(1)    # [num_target, 2*hidden_dim]
+            # ORIGINAL PATH: Use token formulation with label concatenation
+            # Step 1: Create context tokens
+            class_x_y = class_x[context_y]  # [num_context, hidden_dim]
+            context_tokens = torch.cat([context_x, class_x_y], dim=1)  # [num_context, 2*hidden_dim]
 
-        # Choose which part of the embedding to use for prototype calculation
-        if self.use_full_embedding:
-            # Use full embedding (both halves) - will be [num_context/target, 2*hidden_dim]
-            context_label_emb = context_tokens  # [num_context, 2*hidden_dim]
-            target_label_emb = target_tokens    # [num_target, 2*hidden_dim]
-        elif self.use_first_half_embedding:
-            # Use first half (node features part)
-            context_label_emb = context_tokens[:, :self.hidden_dim]  # [num_context, hidden_dim]
-            target_label_emb = target_tokens[:, :self.hidden_dim]    # [num_target, hidden_dim]
-        else:
-            # Use second half (label embedding part) - default behavior
-            context_label_emb = context_tokens[:, self.hidden_dim:]  # [num_context, hidden_dim]
-            target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
+            # Step 2: Create target tokens
+            if self.padding == 'zero':
+                padding = torch.zeros_like(target_x)  # [num_target, hidden_dim]
+            elif self.padding == 'mlp':
+                padding = self.pad_mlp(target_x)
+            else:
+                raise ValueError("Invalid padding type. Choose 'zero' or 'mlp'.")
+            target_tokens = torch.cat([target_x, padding], dim=1)
+
+            # Step 3: Prepare for transformer (add sequence dimension)
+            context_tokens = context_tokens.unsqueeze(1)  # [num_context, 1, 2*hidden_dim]
+            target_tokens = target_tokens.unsqueeze(1)    # [num_target, 1, 2*hidden_dim]
+
+            # Step 4: Process through transformer layers
+            for layer in self.transformer_row:
+                context_tokens, target_tokens = layer(context_tokens, target_tokens)
+
+            # Step 5: Extract refined label embeddings
+            context_tokens = context_tokens.squeeze(1)  # [num_context, 2*hidden_dim]
+            target_tokens = target_tokens.squeeze(1)    # [num_target, 2*hidden_dim]
+
+            # Choose which part of the embedding to use for prototype calculation
+            if self.use_full_embedding:
+                # Use full embedding (both halves) - will be [num_context/target, 2*hidden_dim]
+                context_label_emb = context_tokens  # [num_context, 2*hidden_dim]
+                target_label_emb = target_tokens    # [num_target, 2*hidden_dim]
+            elif self.use_first_half_embedding:
+                # Use first half (node features part)
+                context_label_emb = context_tokens[:, :self.hidden_dim]  # [num_context, hidden_dim]
+                target_label_emb = target_tokens[:, :self.hidden_dim]    # [num_target, hidden_dim]
+            else:
+                # Use second half (label embedding part) - default behavior
+                context_label_emb = context_tokens[:, self.hidden_dim:]  # [num_context, hidden_dim]
+                target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
+
 
         # Step 6 & 7: Route through task-specific heads
         if task_type == 'node_classification':
@@ -1189,8 +1538,18 @@ class PFNPredictorNodeCls(nn.Module):
                 mlp_module=self.mlp_pool,
                 normalize=self.normalize
             )
+        elif task_type == 'graph_classification':
+            logits, class_emb = self.gc_head(
+                target_label_emb=target_label_emb,
+                context_label_emb=context_label_emb,
+                context_y=context_y,
+                class_x=class_x,
+                attention_pool_module=self.att,
+                mlp_module=self.mlp_pool,
+                normalize=self.normalize
+            )
         else:
-            raise ValueError(f"Unknown task_type: {task_type}. Choose 'node_classification' or 'link_prediction'.")
+            raise ValueError(f"Unknown task_type: {task_type}. Choose 'node_classification', 'link_prediction', or 'graph_classification'.")
 
         # Legacy matching network support (kept for backward compatibility)
         if self.use_matching_network:
@@ -1285,7 +1644,67 @@ class PFNPredictorNodeCls(nn.Module):
             # class_emb from task heads is still returned
 
         return logits, class_emb
-    
+
+    def get_target_embeddings(self, context_x, target_x, context_y, class_x):
+        """
+        Extract Transformer-generated target embeddings without computing final predictions.
+        Used for contrastive augmentation loss.
+
+        Args:
+            context_x: Context node embeddings [num_context, hidden_dim]
+            target_x: Target node embeddings [num_target, hidden_dim]
+            context_y: Context node labels [num_context]
+            class_x: Class prototypes [num_classes, hidden_dim]
+
+        Returns:
+            target_label_emb: Transformer-processed target embeddings [num_target, hidden_dim or 2*hidden_dim]
+        """
+        if self.skip_token_formulation:
+            # Skip token formulation path
+            context_tokens = context_x.unsqueeze(1)  # [num_context, 1, hidden_dim]
+            target_tokens = target_x.unsqueeze(1)    # [num_target, 1, hidden_dim]
+
+            # Process through transformer layers
+            for layer in self.transformer_row:
+                context_tokens, target_tokens = layer(context_tokens, target_tokens)
+
+            # Extract refined embeddings
+            target_label_emb = target_tokens.squeeze(1)  # [num_target, hidden_dim]
+        else:
+            # Token formulation path
+            class_x_y = class_x[context_y]  # [num_context, hidden_dim]
+            context_tokens = torch.cat([context_x, class_x_y], dim=1)  # [num_context, 2*hidden_dim]
+
+            # Create target tokens
+            if self.padding == 'zero':
+                padding = torch.zeros_like(target_x)  # [num_target, hidden_dim]
+            elif self.padding == 'mlp':
+                padding = self.pad_mlp(target_x)
+            else:
+                raise ValueError("Invalid padding type. Choose 'zero' or 'mlp'.")
+            target_tokens = torch.cat([target_x, padding], dim=1)
+
+            # Prepare for transformer
+            context_tokens = context_tokens.unsqueeze(1)  # [num_context, 1, 2*hidden_dim]
+            target_tokens = target_tokens.unsqueeze(1)    # [num_target, 1, 2*hidden_dim]
+
+            # Process through transformer layers
+            for layer in self.transformer_row:
+                context_tokens, target_tokens = layer(context_tokens, target_tokens)
+
+            # Extract refined embeddings
+            target_tokens = target_tokens.squeeze(1)  # [num_target, 2*hidden_dim]
+
+            # Choose which part of the embedding to use
+            if self.use_full_embedding:
+                target_label_emb = target_tokens
+            elif self.use_first_half_embedding:
+                target_label_emb = target_tokens[:, :self.hidden_dim]
+            else:
+                target_label_emb = target_tokens[:, self.hidden_dim:]
+
+        return target_label_emb
+
 class PFNPredictorBinaryCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2, norm=False, scale=False,
                 padding='zeros', output_target=False, norm_affine=True, norm_type='post'):
@@ -1507,32 +1926,40 @@ class IdentityProjection(nn.Module):
     """
     Simple identity-preserving projection layer
     Maps from small_dim to large_dim by keeping original features + learning extra features
+    Includes LayerNorm at the end to stabilize features going into GNN
     """
     def __init__(self, small_dim, large_dim):
         super().__init__()
         assert large_dim >= small_dim, f"large_dim ({large_dim}) must be >= small_dim ({small_dim})"
-        
+
         self.small_dim = small_dim
         self.large_dim = large_dim
-        
+
         if large_dim > small_dim:
             # Project only the "extra" dimensions
             extra_dim = large_dim - small_dim
             self.extra_proj = nn.Linear(small_dim, extra_dim)
-            
+
             # Small initialization to start close to identity behavior
             nn.init.xavier_uniform_(self.extra_proj.weight, gain=0.1)
             nn.init.zeros_(self.extra_proj.bias)
         else:
             self.extra_proj = None
-    
+
+        # Add LayerNorm at the end to normalize output
+        self.norm = nn.LayerNorm(large_dim)
+
     def forward(self, x):
         if self.extra_proj is None:
-            return x  # No projection needed
-        
-        # Keep original dimensions + add projected dimensions
-        extra_dims = self.extra_proj(x)
-        return torch.cat([x, extra_dims], dim=1)
+            out = x  # No projection needed
+        else:
+            # Keep original dimensions + add projected dimensions
+            extra_dims = self.extra_proj(x)
+            out = torch.cat([x, extra_dims], dim=1)
+
+        # Normalize output to stabilize features going into GNN
+        out = self.norm(out)
+        return out
     
 class UnifiedGNN(nn.Module):
     """

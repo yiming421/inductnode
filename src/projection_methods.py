@@ -4,12 +4,65 @@ Projection Methods Module
 This module contains different dimensionality reduction/projection methods:
 - Random Orthogonal Projection (dense)
 - Sparse Random Projection
+- Orthogonal Noise Features
 
 These are used for ablation studies comparing against PCA.
 """
 
 import torch
 import time
+
+
+def generate_orthogonal_noise_features(num_nodes, target_dim, seed=42, device='cpu', dtype=torch.float32, rank=0):
+    """
+    Generate pure orthogonal noise features for ablation study.
+    This creates random features using torch.nn.init.orthogonal_ to ensure orthogonality.
+
+    Unlike random projection which projects existing features,
+    this generates completely new features that are independent of input data.
+
+    Args:
+        num_nodes (int): Number of nodes/samples
+        target_dim (int): Target dimension for features
+        seed (int): Random seed for reproducibility
+        device (str or torch.device): Device to create tensor on
+        dtype (torch.dtype): Data type for the tensor
+        rank (int): Process rank for logging
+
+    Returns:
+        torch.Tensor: Orthogonal noise features [num_nodes, target_dim]
+    """
+    if rank == 0:
+        print(f"[Orthogonal Noise] Generating {num_nodes} x {target_dim} orthogonal noise features")
+
+    start_time = time.time()
+
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
+    # Create empty tensor and initialize with orthogonal matrix
+    if num_nodes >= target_dim:
+        # Standard case: more samples than dimensions
+        # Create [target_dim, num_nodes] and transpose to get [num_nodes, target_dim]
+        orthogonal_features = torch.empty(target_dim, num_nodes, device=device, dtype=dtype)
+        torch.nn.init.orthogonal_(orthogonal_features)
+        orthogonal_features = orthogonal_features.t()  # Now [num_nodes, target_dim]
+    else:
+        # Edge case: fewer samples than dimensions
+        # Create [num_nodes, target_dim] directly
+        orthogonal_features = torch.empty(num_nodes, target_dim, device=device, dtype=dtype)
+        torch.nn.init.orthogonal_(orthogonal_features)
+
+    total_time = time.time() - start_time
+
+    if rank == 0:
+        print(f"[Orthogonal Noise] Generation completed in {total_time:.2f}s")
+        print(f"  - Result shape: {orthogonal_features.shape}")
+        print(f"  - Features are orthogonal (no input data dependency)")
+
+    return orthogonal_features
 
 
 def apply_random_orthogonal_projection(data_tensor, input_dim, target_dim, seed=42, rank=0):

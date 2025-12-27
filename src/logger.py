@@ -77,7 +77,7 @@ class TrainingLogger:
     def debug(self, message: str):
         """Debug message."""
         if self._should_print(LogLevel.DEBUG):
-            print(f"🔧 [DEBUG] {message}")
+            print(f"🔧 {message}")
     
     def verbose(self, message: str):
         """Verbose message."""

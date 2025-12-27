@@ -24,12 +24,16 @@ if project_root not in sys.path:
 
 # Core imports - reuse from existing scripts
 from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN
+from src.model_graphpfn import ParameterFreeGCN
+from src.graphpfn import GraphPFNConfig, GraphPFNPredictor
 from src.data_nc import load_all_data, load_all_data_train
 from src.data_lp import load_all_data_link
 from src.data_gc import load_all_graph_datasets, process_graph_features, create_data_loaders, create_task_filtered_datasets
 from src.data_utils import process_data, prepare_link_data, select_link_context, process_link_data
+from src.data_utils_graphpfn import process_data_graphpfn
 from src.data_minibatch import MiniBatchNCLoader, compute_nc_loss_with_loader
 from src.engine_nc import train_all, test_all, test_all_induct  # Node classification engines
+from src.engine_nc_graphpfn import train_all_graphpfn, test_all_graphpfn  # GraphPFN engines
 from src.engine_lp import train_link_prediction, evaluate_link_prediction  # Link prediction engines
 from src.engine_gc import (
     train_graph_classification_single_task,
@@ -672,12 +676,25 @@ def resolve_context_shots(dataset_name, task_type, args, epoch=None):
         return defaults[task_type]
         
     elif sampling_plan == 'random':
-        # Random sampling within bounds
+        # Random sampling within bounds (only during training)
+        # During evaluation/test, use fixed default to ensure reproducibility
+        if epoch is None:
+            # During evaluation, fall back to original fixed behavior
+            defaults = {
+                'nc': args.context_num,
+                'lp': args.context_k,
+                'gc': args.context_graph_num
+            }
+            context_shots = defaults[task_type]
+            print(f"[Context Evaluation] {task_type.upper()} dataset '{dataset_name}': using {context_shots} TRAINING context shots (evaluation mode, fixed)")
+            return context_shots
+
+        # During training, sample randomly
         import random
         bounds = parse_context_bounds(getattr(args, 'context_bounds', None))
         lower, upper = bounds[task_type]
         context_shots = random.randint(lower, upper)
-        print(f"[Context Random] {task_type.upper()} dataset '{dataset_name}': using {context_shots} context shots (range: {lower}-{upper})")
+        print(f"[Context Random] {task_type.upper()} dataset '{dataset_name}': using {context_shots} TRAINING context shots (range: {lower}-{upper})")
         return context_shots
         
     elif sampling_plan == 'decay':
@@ -755,6 +772,23 @@ def refresh_nc_contexts(nc_data, args=None, epoch=None):
             data.context_sample = new_context_sample.to(data.context_sample.device)
             sampling_method = "K-Medoids clustering" if use_kmedoids else "random sampling"
             print(f"    ✓ Refreshed {data.name}: {len(new_context_sample)} context samples ({current_context_size} per class, {sampling_method})")
+
+            # Reprocess data with GraphPFN if enabled
+            if args is not None and getattr(args, 'use_graphpfn', False):
+                process_data_graphpfn(
+                    data,
+                    split_idx,
+                    context_num=current_context_size,
+                    pca_target_dim=args.hidden,
+                    normalize_data=args.normalize_data,
+                    use_full_pca=args.use_full_pca,
+                    pca_device=args.pca_device,
+                    incremental_pca_batch_size=args.incremental_pca_batch_size,
+                    rank=0,
+                    process_test_only=False,
+                    use_orthogonal_noise=args.use_orthogonal_noise,
+                )
+                print(f"    ✓ Reprocessed {data.name} with GraphPFN (PCA to dim {args.hidden})")
 
 
 def refresh_lp_contexts(lp_data, args, epoch=None):
@@ -955,7 +989,9 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 use_pca_cache=use_pca_cache_for_dataset, pca_cache_dir=args.pca_cache_dir,
                 dataset_name=getattr(dataset, 'name', None),
                 use_random_orthogonal=args.use_random_orthogonal,
-                plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir
+                plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir,
+                use_quantile_normalization=args.use_quantile_normalization,
+                quantile_norm_before_padding=args.quantile_norm_before_padding
             )
         else:
             processing_info = process_graph_features(
@@ -970,9 +1006,11 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 use_pca_cache=use_pca_cache_for_dataset, pca_cache_dir=args.pca_cache_dir,
                 dataset_name=getattr(dataset, 'name', None),
                 use_random_orthogonal=args.use_random_orthogonal,
-                plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir
+                plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir,
+                use_quantile_normalization=args.use_quantile_normalization,
+                quantile_norm_before_padding=args.quantile_norm_before_padding
             )
-        
+
         processed_datasets.append(dataset)
 
         # Update dataset info with processing information
@@ -988,6 +1026,11 @@ def create_unified_model(args, input_dim, device):
     # Initialize optional components
     identity_projection = None
     projector = None
+
+    # GraphPFN is incompatible with identity projection - override if both are enabled
+    if getattr(args, 'use_graphpfn', False) and args.use_identity_projection:
+        print("⚠️  WARNING: Disabling identity_projection (incompatible with GraphPFN)")
+        args.use_identity_projection = False
 
     # Determine the actual hidden dimension for GNN input
     # Priority: FUG embeddings > identity projection > raw features
@@ -1013,10 +1056,18 @@ def create_unified_model(args, input_dim, device):
         hidden = args.hidden
     
     # Create GNN backbone
-    if args.model == 'PureGCN_v1':
-        print(f"\n[DEBUG] Creating PureGCN_v1:")
-        print(f"  input_dim={hidden}, hidden={hidden}, num_layers={args.num_layers}")
-        print(f"  norm={args.norm}, dp={args.dp}, res={args.res}, relu={args.relu}")
+    # Use ParameterFreeGCN when using GraphPFN (handles arbitrary dimensions)
+    if getattr(args, 'use_graphpfn', False):
+        print("\n=== Using ParameterFreeGCN for GraphPFN ===")
+        model = ParameterFreeGCN(
+            num_layers=args.num_layers,
+            dropout=args.dp,
+            use_norm=args.norm,
+            use_residual=args.res,
+        )
+        print(f"ParameterFreeGCN: num_layers={args.num_layers}, dropout={args.dp}, "
+              f"norm={args.norm}, residual={args.res}")
+    elif args.model == 'PureGCN_v1':
         model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm,
                           args.res, args.relu, args.gnn_norm_affine,
                           activation=getattr(args, 'activation', 'relu'),
@@ -1087,26 +1138,93 @@ def create_unified_model(args, input_dim, device):
         )
 
     # Create unified predictor (same for both tasks)
-    if args.predictor == 'PFN':
-        predictor = PFNPredictorNodeCls(
-            hidden, args.nhead, args.transformer_layers, args.mlp_layers,
-            args.dp, args.norm, args.seperate, False, None, None, args.sim,
-            args.padding, args.mlp_norm_affine, args.normalize_class_h,
-            use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
-            use_full_embedding=getattr(args, 'use_full_embedding', False),
-            norm_type=getattr(args, 'transformer_norm_type', 'post'),
-            ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4),
-            use_matching_network=getattr(args, 'use_matching_network', False),
-            matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
-            matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
-            matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
-            # Task-specific ridge regression configuration
-            nc_sim=args.nc_sim,  # Use explicit config values (have proper defaults)
-            nc_ridge_alpha=args.nc_ridge_alpha,
-            lp_sim=args.lp_sim,
-            lp_ridge_alpha=args.lp_ridge_alpha,
-            head_num_layers=getattr(args, 'head_num_layers', 2)
+    if getattr(args, 'use_graphpfn', False):
+        # Use GraphPFN (TabPFN-style dual attention transformer)
+        print("\n=== Using GraphPFN Predictor ===")
+
+        # Convert string 'none' to Python None for feature_positional_embedding
+        feature_pos_emb = args.graphpfn_feature_positional_embedding
+        if feature_pos_emb == 'none':
+            feature_pos_emb = None
+
+        graphpfn_config = GraphPFNConfig(
+            emsize=args.graphpfn_emsize,
+            nhead=args.graphpfn_nhead,
+            nlayers=args.graphpfn_nlayers,
+            nhid_factor=args.graphpfn_nhid_factor,
+            features_per_group=args.graphpfn_features_per_group,
+            dropout=args.graphpfn_dropout,
+            attention_between_features=args.graphpfn_attention_between_features,
+            feature_positional_embedding=feature_pos_emb,
+            seed=args.graphpfn_seed,
+            normalize_x=args.graphpfn_normalize_x,
+            n_out=10,  # Fixed for foundational model (TabPFN default)
+            fourier_feature_scale=args.graphpfn_fourier_scale,
         )
+        # Foundational model: no task-specific parameters
+        # Accepts arbitrary GNN output dimension (determined at forward time)
+        # num_classes is passed at forward() time for logit slicing
+        predictor = GraphPFNPredictor(
+            config=graphpfn_config,
+            cache_trainset_representation=args.graphpfn_cache_trainset,
+        )
+        print(f"GraphPFN Config: emsize={graphpfn_config.emsize}, nhead={graphpfn_config.nhead}, "
+              f"nlayers={graphpfn_config.nlayers}, features_per_group={graphpfn_config.features_per_group}")
+        print(f"GraphPFN PE mode: {graphpfn_config.feature_positional_embedding}")
+    elif args.predictor == 'PFN':
+        # Check if we should use Llama-based transformer
+        if getattr(args, 'use_llama_transformer', False):
+            from src.model_llama import LlamaPFNPredictorNodeCls
+            predictor = LlamaPFNPredictorNodeCls(
+                hidden_dim=hidden,
+                nhead=args.nhead,  # Legacy parameter (not used, llama_num_heads used instead)
+                num_layers=args.transformer_layers,
+                mlp_layers=args.mlp_layers,  # Legacy parameter (not used in Llama)
+                dropout=args.dp,
+                norm=args.norm,
+                degree=args.seperate,
+                att=None,  # Will be set later if needed
+                mlp=None,  # Will be set later if needed
+                sim=args.sim,  # Legacy parameter
+                norm_affine=args.mlp_norm_affine,
+                normalize=args.normalize_class_h,
+                # Node classification ridge regression
+                nc_sim=args.nc_sim,
+                nc_ridge_alpha=args.nc_ridge_alpha,
+                head_num_layers=getattr(args, 'head_num_layers', 2),
+                # Llama-specific parameters (reuse existing args)
+                llama_num_heads=args.nhead,
+                llama_intermediate_size=hidden * getattr(args, 'ffn_expansion_ratio', 4),
+                # Token formulation parameters
+                skip_token_formulation=getattr(args, 'skip_token_formulation', False),
+                use_full_embedding=getattr(args, 'use_full_embedding', False),
+                use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
+            )
+        else:
+            # Original PFN predictor
+            predictor = PFNPredictorNodeCls(
+                hidden, args.nhead, args.transformer_layers, args.mlp_layers,
+                args.dp, args.norm, args.seperate, False, None, None, args.sim,
+                args.padding, args.mlp_norm_affine, args.normalize_class_h,
+                use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
+                use_full_embedding=getattr(args, 'use_full_embedding', False),
+                norm_type=getattr(args, 'transformer_norm_type', 'post'),
+                ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4),
+                use_matching_network=getattr(args, 'use_matching_network', False),
+                matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
+                matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
+                matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
+                # Task-specific ridge regression configuration
+                nc_sim=args.nc_sim,  # Use explicit config values (have proper defaults)
+                nc_ridge_alpha=args.nc_ridge_alpha,
+                lp_sim=args.lp_sim,
+                lp_ridge_alpha=args.lp_ridge_alpha,
+                gc_sim=args.gc_sim,
+                gc_ridge_alpha=args.gc_ridge_alpha,
+                head_num_layers=getattr(args, 'head_num_layers', 2),
+                # NEW: Skip token formulation option
+                skip_token_formulation=getattr(args, 'skip_token_formulation', False)
+            )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
     
@@ -1127,6 +1245,24 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
     global lp_tracker
     
     print("\n=== Loading and Preprocessing Data ===")
+
+    def move_nc_tensors_to_cpu(data_obj, split_idx):
+        """Move NC data tensors and split indices to CPU to keep GPU memory free until use."""
+        if hasattr(data_obj, 'x'):
+            data_obj.x = data_obj.x.cpu()
+        if hasattr(data_obj, 'adj_t'):
+            data_obj.adj_t = data_obj.adj_t.cpu()
+        if hasattr(data_obj, 'y'):
+            data_obj.y = data_obj.y.cpu()
+        if hasattr(data_obj, 'context_sample'):
+            data_obj.context_sample = data_obj.context_sample.cpu()
+        if hasattr(data_obj, 'x_pca'):
+            data_obj.x_pca = data_obj.x_pca.cpu()
+        if hasattr(data_obj, 'x_original'):
+            data_obj.x_original = data_obj.x_original.cpu()
+        split_idx['train'] = split_idx['train'].cpu()
+        split_idx['valid'] = split_idx['valid'].cpu()
+        split_idx['test'] = split_idx['test'].cpu()
     
     # === Node Classification Data ===
     nc_train_data_list, nc_train_split_idx_list = None, None
@@ -1152,7 +1288,18 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         if not skip_training_data:
             nc_train_data_list, nc_train_split_idx_list = load_all_data_train(
                 nc_train_datasets,
-                split_strategy=args.split_rebalance_strategy
+                split_strategy=args.split_rebalance_strategy,
+                use_augmentation=args.use_random_projection_augmentation,
+                num_augmentations=args.num_augmentations,
+                augmentation_mode=args.augmentation_mode,
+                augmentation_activation=args.augmentation_activation,
+                augmentation_max_depth=args.augmentation_max_depth,
+                augmentation_verbose=args.augmentation_verbose,
+                augmentation_use_random_noise=args.augmentation_use_random_noise,
+                augmentation_dropout_rate=args.augmentation_dropout_rate,
+                augmentation_use_feature_mixing=args.augmentation_use_feature_mixing,
+                augmentation_mix_ratio=args.augmentation_mix_ratio,
+                augmentation_mix_alpha=args.augmentation_mix_alpha
             )
         else:
             print("  Skipping NC training data loading (using pretrained model)")
@@ -1249,22 +1396,45 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
 
                 external_emb = nc_train_external_embeddings[i] if nc_train_external_embeddings else None
 
-                process_data(
-                    data, split_idx, args.hidden, args.context_num, False, args.use_full_pca,
-                    args.normalize_data, False, 32, 0, args.padding_strategy,
-                    args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
-                    args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
-                    args.use_sparse_random, args.sparse_random_density,
-                    args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
-                    getattr(args, 'use_external_embeddings_nc', False),
-                    args.use_dynamic_encoder
-                )
+                # Use GraphPFN processing if enabled, otherwise use standard processing
+                if getattr(args, 'use_graphpfn', False):
+                    process_data_graphpfn(
+                        data,
+                        split_idx,
+                        context_num=args.context_num,
+                        pca_target_dim=args.hidden,
+                        normalize_data=args.normalize_data,
+                        use_full_pca=args.use_full_pca,
+                        pca_device=args.pca_device,
+                        incremental_pca_batch_size=args.incremental_pca_batch_size,
+                        rank=0,
+                        process_test_only=False,
+                        use_orthogonal_noise=args.use_orthogonal_noise,
+                    )
+                else:
+                    process_data(
+                        data, split_idx, args.hidden, args.context_num, False, args.use_full_pca,
+                        args.normalize_data, False, 32, 0, args.padding_strategy,
+                        args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                        args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
+                        args.use_sparse_random, args.sparse_random_density,
+                        args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
+                        args.use_quantile_normalization, args.quantile_norm_before_padding,
+                        getattr(args, 'use_external_embeddings_nc', False),
+                        args.use_dynamic_encoder,
+                        process_test_only=False,  # Training datasets: process all nodes
+                        use_orthogonal_noise=args.use_orthogonal_noise,
+                        args=args
+                    )
 
                 if getattr(args, 'use_kmedoids_sampling', False):
                     new_context_sample = sample_context_with_kmedoids(
                         data, args.context_num, split_idx['train'], use_kmedoids=True, random_state=args.seed
                     )
                     data.context_sample = new_context_sample.to(data.context_sample.device)
+
+                # Move processed tensors back to CPU to free GPU memory until training uses them
+                move_nc_tensors_to_cpu(data, split_idx)
 
         # 4) Process test data
         for i, (data, split_idx) in enumerate(zip(nc_test_data_list, nc_test_split_idx_list)):
@@ -1275,22 +1445,46 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
             external_emb = nc_test_external_embeddings[i] if nc_test_external_embeddings else None
 
             context_shots = resolve_context_shots(data.name, 'nc', args, epoch=None)
-            process_data(
-                data, split_idx, args.hidden, context_shots, False, args.use_full_pca,
-                args.normalize_data, False, 32, 0, args.padding_strategy,
-                args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
-                args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
-                args.use_sparse_random, args.sparse_random_density,
-                args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
-                getattr(args, 'use_external_embeddings_nc', False),
-                args.use_dynamic_encoder
-            )
+
+            # Use GraphPFN processing if enabled, otherwise use standard processing
+            if getattr(args, 'use_graphpfn', False):
+                process_data_graphpfn(
+                    data,
+                    split_idx,
+                    context_num=context_shots,
+                    pca_target_dim=args.hidden,
+                    normalize_data=args.normalize_data,
+                    use_full_pca=args.use_full_pca,
+                    pca_device=args.pca_device,
+                    incremental_pca_batch_size=args.incremental_pca_batch_size,
+                    rank=0,
+                    process_test_only=False,  # Node classification: always process all nodes
+                    use_orthogonal_noise=args.use_orthogonal_noise,
+                )
+            else:
+                process_data(
+                    data, split_idx, args.hidden, context_shots, False, args.use_full_pca,
+                    args.normalize_data, False, 32, 0, args.padding_strategy,
+                    args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                    args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
+                    args.use_sparse_random, args.sparse_random_density,
+                    args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
+                    args.use_quantile_normalization, args.quantile_norm_before_padding,
+                    getattr(args, 'use_external_embeddings_nc', False),
+                    args.use_dynamic_encoder,
+                    process_test_only=False,  # Node classification: always process all nodes
+                    use_orthogonal_noise=args.use_orthogonal_noise,
+                    args=args
+                )
 
             if getattr(args, 'use_kmedoids_sampling', False):
                 new_context_sample = sample_context_with_kmedoids(
                     data, context_shots, split_idx['train'], use_kmedoids=True, random_state=args.seed
                 )
                 data.context_sample = new_context_sample.to(data.context_sample.device)
+
+            # Move processed tensors back to CPU to free GPU memory until evaluation
+            move_nc_tensors_to_cpu(data, split_idx)
     else:
         print("Node classification task disabled, skipping dataset loading...")
 
@@ -1725,6 +1919,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     # Initialize loss breakdown variables
     nc_nll_loss = 0.0
     nc_de_loss = 0.0
+    nc_contrastive_loss = 0.0
 
     # Unpack data
     nc_data_list, nc_split_idx_list, nc_external_embeddings = nc_data
@@ -1750,6 +1945,155 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
             nc_loss_sum = 0.0
             nc_nll_sum = 0.0
             nc_de_sum = 0.0
+            nc_contrastive_sum = 0.0
+
+            # Track augmentation statistics for mini-batch path
+            # Determine if augmentation was used by checking data_list size
+            use_augmentation = args.use_random_projection_augmentation if hasattr(args, 'use_random_projection_augmentation') else False
+            num_augmentations = args.num_augmentations if hasattr(args, 'num_augmentations') else 1
+            include_original = args.augmentation_include_original if hasattr(args, 'augmentation_include_original') else True
+            augmentation_mode = args.augmentation_mode if hasattr(args, 'augmentation_mode') else 'preprocessing'
+
+            print(f"[DEBUG MINIBATCH] use_augmentation: {use_augmentation}, num_augmentations: {num_augmentations}, "
+                  f"include_original: {include_original}, total_loaders: {len(nc_loaders)}")
+
+            # Regenerate augmented data and recreate loaders at specified intervals
+            augmentation_interval = getattr(args, 'augmentation_regenerate_interval', 1)
+            should_regenerate = (epoch >= 0 and epoch % augmentation_interval == 0)  # Changed to >= 0 to force at epoch 0
+
+            if use_augmentation and augmentation_mode in ('per_epoch', 'preprocessing') and should_regenerate:
+                print(f"\n{'='*80}")
+                print(f"[Augmentation Regeneration] Epoch {epoch}: Regenerating augmentations (interval={augmentation_interval})")
+                print(f"{'='*80}\n")
+
+                from src.data_utils import apply_random_projection_augmentation, process_data
+                import gc
+
+                # Extract original data (loaders start as originals; after first regen len may double if include_original)
+                if include_original and len(nc_loaders) % 2 == 0 and epoch > 0:
+                    num_original_graphs = len(nc_loaders) // 2
+                else:
+                    num_original_graphs = len(nc_loaders)
+                original_loaders = nc_loaders[:num_original_graphs]
+
+                # Get original data from loaders
+                original_data_list = []
+                original_split_idx_list = []
+                for loader in original_loaders:
+                    original_data_list.append(loader.data)
+                    original_split_idx_list.append(loader.split_idx)
+
+                # Get augmentation settings
+                augmentation_activation = getattr(args, 'augmentation_activation', 'random')
+                augmentation_max_depth = getattr(args, 'augmentation_max_depth', 1)
+                augmentation_use_random_noise = getattr(args, 'augmentation_use_random_noise', False)
+                augmentation_dropout_rate = getattr(args, 'augmentation_dropout_rate', 0.0)
+                augmentation_use_feature_mixing = getattr(args, 'augmentation_use_feature_mixing', False)
+                augmentation_mix_ratio = getattr(args, 'augmentation_mix_ratio', 0.3)
+                augmentation_mix_alpha = getattr(args, 'augmentation_mix_alpha', 0.5)
+
+                if augmentation_activation == 'random':
+                    activation_pool_to_use = None
+                else:
+                    activation_pool_to_use = [augmentation_activation]
+
+                # Create new augmented data (one augmentation per graph per refresh)
+                new_augmented_data_list = []
+                new_augmented_split_idx_list = []
+
+                # Fixed seed pool (size = num_augmentations) for preprocessing mode
+                seed_pool = list(range(1, num_augmentations + 1)) if num_augmentations > 0 else [1]
+
+                for graph_idx, (data, split_idx) in enumerate(zip(original_data_list, original_split_idx_list)):
+                    if augmentation_mode == 'preprocessing':
+                        seed = seed_pool[epoch % len(seed_pool)] + graph_idx * 100
+                    else:  # per_epoch
+                        seed = epoch * 100000 + graph_idx * 100 + 42
+
+                    # Clone data and restore x_original
+                    data_for_aug = data.clone()
+                    if hasattr(data, 'x_original'):
+                        data_for_aug.x = data.x_original.clone()
+                        if graph_idx == 0:
+                            print(f"\n  [Aug] Graph 0: using x_original, mean={data_for_aug.x.mean().item():.6f}")
+                    else:
+                        if graph_idx == 0:
+                            print(f"\n  [WARNING] x_original not available, using current data.x")
+
+                    # Apply augmentation to RAW features
+                    data_aug = apply_random_projection_augmentation(
+                        data_for_aug,
+                        hidden_dim_range=None,
+                        activation_pool=activation_pool_to_use,
+                        seed=seed,
+                        verbose=False,
+                        rank=0,
+                        use_random_noise=augmentation_use_random_noise,
+                        max_depth=augmentation_max_depth,
+                        dropout_rate=augmentation_dropout_rate,
+                        use_feature_mixing=augmentation_use_feature_mixing,
+                        mix_ratio=augmentation_mix_ratio,
+                        mix_alpha=augmentation_mix_alpha
+                    )
+
+                    # Apply process_data to do PCA/padding
+                    external_emb = nc_external_embeddings[graph_idx] if nc_external_embeddings else None
+
+                    process_data(
+                        data_aug, split_idx, args.hidden, args.context_num, False, args.use_full_pca,
+                        args.normalize_data, False, 32, 0, args.padding_strategy,
+                        args.use_batchnorm, args.use_identity_projection,
+                        args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                        args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
+                        args.use_sparse_random, args.sparse_random_density,
+                        False, './tsne_plots', args.use_pca_whitening, args.whitening_epsilon,
+                        args.use_quantile_normalization, args.quantile_norm_before_padding,
+                        getattr(args, 'use_external_embeddings_nc', False),
+                        args.use_dynamic_encoder, False, args.use_orthogonal_noise,
+                        args=args, is_augmented_data=True
+                    )
+
+                    # Attach original data's x_pca_original to augmented data for contrastive loss
+                    if hasattr(data, 'x_pca_original') and data.x_pca_original is not None:
+                        data_aug.x_pca_original = data.x_pca_original
+
+                    new_augmented_data_list.append(data_aug)
+                    new_augmented_split_idx_list.append(split_idx)
+
+                # Recreate loaders for augmented data
+                new_augmented_loaders = []
+                for i, (data_aug, split_idx) in enumerate(zip(new_augmented_data_list, new_augmented_split_idx_list)):
+                    loader = MiniBatchNCLoader(data_aug, split_idx, args, device)
+                    new_augmented_loaders.append(loader)
+
+                # Replace nc_loaders with original + new augmented (mutate in-place so caller's list updates across epochs)
+                if include_original:
+                    nc_loaders.clear()
+                    nc_loaders.extend(list(original_loaders) + new_augmented_loaders)
+                    nc_split_idx_list = original_split_idx_list * (1 + num_augmentations)
+                else:
+                    nc_loaders.clear()
+                    nc_loaders.extend(new_augmented_loaders)
+                    nc_split_idx_list = new_augmented_split_idx_list
+
+            if use_augmentation and include_original:
+                # In preprocessing mode with original graphs included
+                num_original_graphs = len(nc_loaders) // (1 + num_augmentations)
+                num_augmented_graphs = len(nc_loaders) - num_original_graphs
+            elif use_augmentation and not include_original:
+                # Only augmented graphs
+                num_original_graphs = 0
+                num_augmented_graphs = len(nc_loaders)
+            else:
+                num_original_graphs = len(nc_loaders)
+                num_augmented_graphs = 0
+
+            original_loss_sum = 0.0
+            augmented_loss_sum = 0.0
+
+            # Track per-dataset metrics
+            nc_dataset_losses = {}  # {dataset_name: loss_value}
+
             for i, (data_loader, split_idx) in enumerate(zip(nc_loaders, nc_split_idx_list)):
                 external_emb = nc_external_embeddings[i] if nc_external_embeddings else None
                 nc_loss_result = compute_nc_loss_with_loader(
@@ -1761,21 +2105,62 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                 )
                 # Handle dict return
                 if isinstance(nc_loss_result, dict):
-                    nc_loss_sum += nc_loss_result['total']
+                    loss_val = nc_loss_result['total']
+                    nc_loss_sum += loss_val
                     nc_nll_sum += nc_loss_result['nll']
                     nc_de_sum += nc_loss_result['de']
+                    nc_contrastive_sum += nc_loss_result.get('contrastive', 0)
+
+                    # Track per-dataset loss
+                    dataset_name = nc_loss_result.get('dataset_name', f'dataset_{i}')
+                    nc_dataset_losses[dataset_name] = loss_val
+
+                    # Track augmented vs original
+                    is_augmented = i >= num_original_graphs
+                    if is_augmented:
+                        augmented_loss_sum += loss_val
+                    else:
+                        original_loss_sum += loss_val
                 else:
                     # Fallback for backward compatibility
                     nc_loss_sum += nc_loss_result
                     nc_nll_sum += nc_loss_result
                     nc_de_sum += 0.0
+
+                    is_augmented = i >= num_original_graphs
+                    if is_augmented:
+                        augmented_loss_sum += nc_loss_result
+                    else:
+                        original_loss_sum += nc_loss_result
+
             total_nc_loss = torch.tensor(nc_loss_sum / len(nc_loaders), device=device)
             nc_nll_loss = nc_nll_sum / len(nc_loaders)
             nc_de_loss = nc_de_sum / len(nc_loaders)
+            nc_contrastive_loss = nc_contrastive_sum / len(nc_loaders)
             nc_count = len(nc_loaders)
+
+            # Store augmentation statistics
+            nc_original_loss = original_loss_sum / num_original_graphs if num_original_graphs > 0 else 0
+            nc_augmented_loss = augmented_loss_sum / num_augmented_graphs if num_augmented_graphs > 0 else 0
+            nc_num_original = num_original_graphs
+            nc_num_augmented = num_augmented_graphs
+
+            # Debug print to verify augmentation statistics
+            if use_augmentation:
+                print(f"[DEBUG MINIBATCH] Augmentation stats - num_original: {nc_num_original}, num_augmented: {nc_num_augmented}, "
+                      f"original_loss: {nc_original_loss:.4f}, augmented_loss: {nc_augmented_loss:.4f}")
         else:
             # Fallback to original full-batch training
-            nc_loss_result = train_all(model, nc_data_list, nc_split_idx_list, optimizer=opt_nc, pred=predictor,
+            # Use GraphPFN engine if enabled
+            if getattr(args, 'use_graphpfn', False):
+                nc_loss_result = train_all_graphpfn(
+                    model, nc_data_list, nc_split_idx_list, optimizer=opt_nc,
+                    graphpfn_predictor=predictor,
+                    batch_size=args.nc_batch_size, projector=projector, rank=0, epoch=epoch,
+                    identity_projection=identity_projection, lambda_=args.lambda_, args=args,
+                    external_embeddings_list=None)
+            else:
+                nc_loss_result = train_all(model, nc_data_list, nc_split_idx_list, optimizer=opt_nc, pred=predictor,
                               batch_size=args.nc_batch_size, degree=False,
                               orthogonal_push=args.orthogonal_push, normalize_class_h=args.normalize_class_h,
                               clip_grad=args.clip_grad, projector=projector, rank=0, epoch=epoch,
@@ -1786,10 +2171,21 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     total_nc_loss = nc_loss_result['total']
                     nc_nll_loss = nc_loss_result['nll']
                     nc_de_loss = nc_loss_result['de']
+                    nc_contrastive_loss = nc_loss_result.get('contrastive', 0)
+                    # Store augmentation statistics
+                    nc_original_loss = nc_loss_result.get('original_total', 0)
+                    nc_augmented_loss = nc_loss_result.get('augmented_total', 0)
+                    nc_num_original = nc_loss_result.get('num_original', 0)
+                    nc_num_augmented = nc_loss_result.get('num_augmented', 0)
                 else:
                     total_nc_loss = nc_loss_result
                     nc_nll_loss = nc_loss_result
                     nc_de_loss = 0.0
+                    nc_contrastive_loss = 0.0
+                    nc_original_loss = 0
+                    nc_augmented_loss = 0
+                    nc_num_original = 0
+                    nc_num_augmented = 0
                 nc_count = len(nc_data_list)
     
     # Link Prediction Loss
@@ -1978,10 +2374,11 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
         args.lambda_lp = original_lambda_lp
         args.lambda_gc = original_lambda_gc
 
-    return {
+    result_dict = {
         'nc_loss': total_nc_loss,
         'nc_nll_loss': nc_nll_loss,
         'nc_de_loss': nc_de_loss,
+        'nc_contrastive_loss': nc_contrastive_loss,
         'lp_loss': total_lp_loss,
         'gc_loss': total_gc_loss,
         'graphcl_loss': total_graphcl_loss,
@@ -1989,8 +2386,21 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
         'nc_count': nc_count,
         'lp_count': lp_count,
         'gc_count': gc_count,
-        'graphcl_count': graphcl_count
+        'graphcl_count': graphcl_count,
+        # Augmentation statistics
+        'nc_original_loss': nc_original_loss if 'nc_original_loss' in locals() else 0,
+        'nc_augmented_loss': nc_augmented_loss if 'nc_augmented_loss' in locals() else 0,
+        'nc_num_original': nc_num_original if 'nc_num_original' in locals() else 0,
+        'nc_num_augmented': nc_num_augmented if 'nc_num_augmented' in locals() else 0,
+        # Per-dataset metrics
+        'nc_dataset_losses': nc_dataset_losses if 'nc_dataset_losses' in locals() else {}
     }
+
+    # Debug print to verify return values
+    print(f"[DEBUG RETURN] Returning from joint_training_step: nc_num_augmented={result_dict['nc_num_augmented']}, "
+          f"nc_original_loss={result_dict['nc_original_loss']:.4f}, nc_augmented_loss={result_dict['nc_augmented_loss']:.4f}")
+
+    return result_dict
 
 
 def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None, projector=None, nc_loaders=None):
@@ -2017,15 +2427,37 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                 print(f"  Processing {len(nc_data_list)} unseen test datasets...")
                 datasets_start_time = time.time()
 
+                # Check if TTA is enabled for final test evaluation
+                use_tta = getattr(args, 'use_test_time_augmentation', False)
+
                 # Use inductive evaluation for unseen datasets
-                train_metrics, valid_metrics, test_metrics = test_all_induct(
-                    model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                    False, None, None, True, projector, 0, identity_projection, None,
-                    use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha
-                )
+                # Use GraphPFN engine if enabled
+                if getattr(args, 'use_graphpfn', False):
+                    from src.engine_nc_graphpfn import test_all_induct_graphpfn
+                    train_metrics, valid_metrics, test_metrics = test_all_induct_graphpfn(
+                        model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                        projector, 0, identity_projection, None, args=args
+                    )
+                elif use_tta:
+                    # Use TTA for final test evaluation
+                    from src.engine_nc import test_all_induct_with_tta
+                    train_metrics, valid_metrics, test_metrics = test_all_induct_with_tta(
+                        model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                        False, None, None, True, projector, 0, identity_projection, None,
+                        use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha,
+                        args=args
+                    )
+                else:
+                    # Standard evaluation without TTA
+                    train_metrics, valid_metrics, test_metrics = test_all_induct(
+                        model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                        False, None, None, True, projector, 0, identity_projection, None,
+                        use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha
+                    )
 
                 datasets_time = time.time() - datasets_start_time
-                print(f"  All {len(nc_data_list)} datasets completed in {datasets_time:.2f}s")
+                tta_suffix = " (with TTA)" if use_tta else ""
+                print(f"  All {len(nc_data_list)} datasets completed in {datasets_time:.2f}s{tta_suffix}")
 
                 results = {
                     'train': sum(train_metrics) / len(train_metrics) if train_metrics else 0.0,
@@ -2039,37 +2471,68 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                 if nc_loaders is not None and len(nc_loaders) > 0:
                     # Use mini-batch evaluation
                     from src.data_minibatch import evaluate_with_loader
-                    device = next(model.parameters()).device
+                    # Get device from model parameters, or predictor if model has no parameters (e.g., ParameterFreeGCN)
+                    try:
+                        device = next(model.parameters()).device
+                    except StopIteration:
+                        device = next(predictor.parameters()).device
                     eval_accs = []
+                    dataset_accs = {}  # {dataset_name: accuracy}
 
                     for i, (loader, split_idx) in enumerate(zip(nc_loaders, nc_split_idx_list)):
                         if loader.is_minibatch():
                             # Mini-batch evaluation
-                            eval_acc = evaluate_with_loader(
+                            eval_result = evaluate_with_loader(
                                 loader, split_idx, model, predictor, args, device,
                                 eval_split=split, identity_projection=identity_projection, projector=projector
                             )
+                            # Handle dict return from updated evaluate_with_loader
+                            if isinstance(eval_result, dict):
+                                eval_acc = eval_result['accuracy']
+                                dataset_name = eval_result.get('dataset_name', f'dataset_{i}')
+                                dataset_accs[dataset_name] = eval_acc
+                            else:
+                                eval_acc = eval_result
                             eval_accs.append(eval_acc)
                         else:
+                            data_obj = nc_data_list[i] if nc_data_list is not None and i < len(nc_data_list) else None
+                            if data_obj is None and hasattr(loader, 'data'):
+                                data_obj = loader.data
                             # Fall back to full-batch for small datasets
-                            from src.engine_nc import test
-                            _, eval_acc, _ = test(
-                                model, predictor, loader.data, split_idx['train'], split_idx['valid'], split_idx['test'],
-                                args.test_batch_size, False, None, None, True, projector, 0, identity_projection
-                            )
+                            # Use GraphPFN engine if enabled
+                            if getattr(args, 'use_graphpfn', False):
+                                from src.engine_nc_graphpfn import test_graphpfn
+                                _, eval_acc, _, _ = test_graphpfn(
+                                    model, predictor, data_obj, split_idx['train'], split_idx['valid'], split_idx['test'],
+                                    args.test_batch_size, projector, 0, identity_projection, None, args=args
+                                )
+                            else:
+                                from src.engine_nc import test
+                                _, eval_acc, _ = test(
+                                    model, predictor, data_obj, split_idx['train'], split_idx['valid'], split_idx['test'],
+                                    args.test_batch_size, False, None, None, True, projector, 0, identity_projection
+                                )
                             eval_accs.append(eval_acc)
 
                     results = {
                         split: sum(eval_accs) / len(eval_accs) if eval_accs else 0.0,
-                        'individual_test_metrics': eval_accs
+                        'individual_test_metrics': eval_accs,
+                        'dataset_accs': dataset_accs if 'dataset_accs' in locals() else {}
                     }
                 else:
                     # Use transductive evaluation for seen datasets (original approach)
-                    train_metrics, valid_metrics, test_metrics = test_all(
-                        model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                        False, None, None, True, projector, 0, identity_projection, None,
-                        use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha
-                    )
+                    # Use GraphPFN engine if enabled
+                    if getattr(args, 'use_graphpfn', False):
+                        train_metrics, valid_metrics, test_metrics = test_all_graphpfn(
+                            model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                            projector, 0, identity_projection, None, args=args
+                        )
+                    else:
+                        train_metrics, valid_metrics, test_metrics = test_all(
+                            model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                            False, None, None, True, projector, 0, identity_projection, None,
+                            use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha
+                        )
                     results = {
                         'train': train_metrics if isinstance(train_metrics, (int, float)) else sum(train_metrics) / len(train_metrics),
                         'valid': valid_metrics if isinstance(valid_metrics, (int, float)) else sum(valid_metrics) / len(valid_metrics),
@@ -2465,7 +2928,10 @@ def run_joint_training(args, device='cuda:0'):
     )
     
     # Initialize wandb
-    wandb.init(project='inductnode-joint', config=args)
+    wandb_kwargs = {'project': 'inductnode-joint', 'config': args}
+    if args.wandb_run_name is not None:
+        wandb_kwargs['name'] = args.wandb_run_name
+    wandb.init(**wandb_kwargs)
     
     # Check for checkpoint loading and override args if needed
     checkpoint = None
@@ -2958,6 +3424,7 @@ def run_joint_training(args, device='cuda:0'):
                 'train/nc_loss': train_results['nc_loss'],
                 'train/nc_nll_loss': train_results.get('nc_nll_loss', train_results['nc_loss']),
                 'train/nc_de_loss': train_results.get('nc_de_loss', 0.0),
+                'train/nc_contrastive_loss': train_results.get('nc_contrastive_loss', 0.0),
                 'train/lp_loss': train_results['lp_loss'],
                 'train/gc_loss': train_results['gc_loss'],
                 'train/combined_loss': train_results['combined_loss'],
@@ -2967,11 +3434,36 @@ def run_joint_training(args, device='cuda:0'):
                 'valid_seen/combined_score': combined_valid_seen,
                 'lr': optimizer.param_groups[0]['lr']
             }
-            
+
+            # Optionally add per-dataset training loss and validation accuracy metrics
+            if getattr(args, 'log_individual_datasets', False):
+                # Add per-dataset training loss metrics
+                nc_dataset_losses = train_results.get('nc_dataset_losses', {})
+                for dataset_name, loss_val in nc_dataset_losses.items():
+                    wandb_log[f'train/nc_loss_{dataset_name}'] = loss_val
+
+                # Add per-dataset validation accuracy metrics
+                nc_dataset_accs = seen_valid_results['nc_metrics'].get('dataset_accs', {})
+                for dataset_name, acc_val in nc_dataset_accs.items():
+                    wandb_log[f'valid_seen/nc_acc_{dataset_name}'] = acc_val
+
+            # Add augmentation loss statistics if available
+            if train_results.get('nc_num_augmented', 0) > 0:
+                aug_original = train_results.get('nc_original_loss', 0)
+                aug_augmented = train_results.get('nc_augmented_loss', 0)
+                print(f"[DEBUG] Adding augmentation metrics to wandb: original={aug_original:.4f}, augmented={aug_augmented:.4f}")
+                wandb_log.update({
+                    'aug/train_loss_original': aug_original,
+                    'aug/train_loss_augmented': aug_augmented,
+                    'aug/train_loss_diff': aug_augmented - aug_original
+                })
+            else:
+                print(f"[DEBUG] No augmentation metrics: nc_num_augmented={train_results.get('nc_num_augmented', 0)}")
+
             # Add unseen test metrics if available
             if unseen_metrics:
                 wandb_log.update(unseen_metrics)
-            
+
             wandb.log(wandb_log)
     
     # Load best model for final evaluation
@@ -3329,7 +3821,10 @@ def main():
     gc_test_datasets = args.gc_test_dataset.split(',') if getattr(args, 'enable_gc', True) and hasattr(args, 'gc_test_dataset') else []
     
     # Log final aggregated results
-    wandb.init(project='inductnode-joint-summary')
+    wandb_summary_kwargs = {'project': 'inductnode-joint-summary'}
+    if args.wandb_run_name is not None:
+        wandb_summary_kwargs['name'] = f"{args.wandb_run_name}-summary"
+    wandb.init(**wandb_summary_kwargs)
     final_log = {
         'final/avg_nc_metric': avg_nc,
         'final/avg_lp_metric': avg_lp,

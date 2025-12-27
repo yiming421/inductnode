@@ -243,6 +243,7 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
     total_loss = 0.0
     total_nll_loss = 0.0
     total_de_loss = 0.0
+    total_contrastive_loss = 0.0
     count = 0
 
     # Track memory at start
@@ -343,38 +344,78 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
             loss = nll_loss + de_loss
 
         else:
-            # Full-batch: delegate to original train() function
-            from src.engine_nc import train
+            # Full-batch: delegate to appropriate train() function
             data = batch  # batch is actually full data
+
+            moved_to_device = False
+            if data.x.device != device:
+                data = data.to(device)
+                split_idx = {k: v.to(device) for k, v in split_idx.items()}
+                if hasattr(data, 'context_sample') and data.context_sample is not None:
+                    data.context_sample = data.context_sample.to(device)
+                moved_to_device = True
+
             train_idx = split_idx['train']
 
-            loss = train(
-                model, data, train_idx, optimizer, predictor,
-                batch_size=args.nc_batch_size if hasattr(args, 'nc_batch_size') else 1024,
-                degree=False,
-                att=None, mlp=None,
-                orthogonal_push=args.orthogonal_push if hasattr(args, 'orthogonal_push') else 0.0,
-                normalize_class_h=args.normalize_class_h if hasattr(args, 'normalize_class_h') else False,
-                clip_grad=args.clip_grad if hasattr(args, 'clip_grad') else 1.0,
-                projector=projector,
-                rank=0,
-                epoch=0,  # epoch doesn't matter for training
-                identity_projection=identity_projection,
-                lambda_=args.lambda_nc if hasattr(args, 'lambda_nc') else 1.0,
-                args=args,
-                external_embeddings=external_embeddings
-            )
+            # Use GraphPFN engine if enabled
+            if getattr(args, 'use_graphpfn', False):
+                from src.engine_nc_graphpfn import train_graphpfn
+                loss = train_graphpfn(
+                    model, data, train_idx, optimizer, predictor,
+                    batch_size=args.nc_batch_size if hasattr(args, 'nc_batch_size') else 1024,
+                    projector=projector,
+                    rank=0,
+                    epoch=0,  # Only used for distributed sampler, batch refresh removed
+                    identity_projection=identity_projection,
+                    lambda_=args.lambda_nc if hasattr(args, 'lambda_nc') else 1.0,
+                    args=args,
+                    external_embeddings=external_embeddings
+                )
+            else:
+                from src.engine_nc import train
+                loss = train(
+                    model, data, train_idx, optimizer, predictor,
+                    batch_size=args.nc_batch_size if hasattr(args, 'nc_batch_size') else 1024,
+                    degree=False,
+                    att=None, mlp=None,
+                    orthogonal_push=args.orthogonal_push if hasattr(args, 'orthogonal_push') else 0.0,
+                    normalize_class_h=args.normalize_class_h if hasattr(args, 'normalize_class_h') else False,
+                    clip_grad=args.clip_grad if hasattr(args, 'clip_grad') else 1.0,
+                    projector=projector,
+                    rank=0,
+                    epoch=0,  # Only used for distributed sampler
+                    identity_projection=identity_projection,
+                    lambda_=args.lambda_nc if hasattr(args, 'lambda_nc') else 1.0,
+                    args=args,
+                    external_embeddings=external_embeddings
+                )
 
             # Handle dict return from train()
             if isinstance(loss, dict):
                 total_loss += loss['total']
                 total_nll_loss += loss['nll']
                 total_de_loss += loss['de']
+                total_contrastive_loss += loss.get('contrastive', 0.0)
             else:
                 total_loss += loss
                 total_nll_loss += loss
                 total_de_loss += 0.0
+                total_contrastive_loss += 0.0
             count += 1
+
+            # Move data back to CPU to release GPU memory between datasets
+            if moved_to_device:
+                data = data.cpu()
+                split_idx = {k: v.cpu() for k, v in split_idx.items()}
+                if hasattr(data, 'context_sample') and data.context_sample is not None:
+                    data.context_sample = data.context_sample.cpu()
+                if hasattr(data, 'x_pca'):
+                    data.x_pca = data.x_pca.cpu()
+                if hasattr(data, 'x_original'):
+                    data.x_original = data.x_original.cpu()
+                if hasattr(data, 'x_pca_original') and data.x_pca_original is not None:
+                    data.x_pca_original = data.x_pca_original.cpu()
+
             continue  # Skip the common backward/optimizer code below (already done in train())
 
         # Backward pass and optimizer step (only for mini-batch)
@@ -417,13 +458,11 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
     # Clear cache once after all batches (not per batch)
     if data_loader.is_minibatch() and torch.cuda.is_available():
         mem_before_clear = torch.cuda.memory_allocated(device) / 1024**2
-        print(f"    [DEBUG] About to delete batches list (id: {id(batches)}, len: {len(batches)})")
 
         # Track what's in local scope before deletion
         import sys
         import gc
         local_vars = list(locals().keys())
-        print(f"    [DEBUG] Local variables before cleanup: {local_vars}")
 
         del batches  # Explicitly delete the list
         gc.collect()  # Force garbage collection
@@ -433,22 +472,21 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
         print(f"    [Memory] After training: {mem_before_clear:.0f} MB → {mem_after_del:.0f} MB (after del) → {mem_after_clear:.0f} MB (after cache clear)")
         print(f"    [Memory] Net increase: {mem_after_clear - mem_start:.0f} MB")
 
-        # Track GPU memory right before function returns
-        print(f"    [DEBUG] Memory right before function returns: {torch.cuda.memory_allocated(device) / 1024**2:.0f} MB")
-
     avg_loss = total_loss / count if count > 0 else 0.0
     avg_nll_loss = total_nll_loss / count if count > 0 else 0.0
     avg_de_loss = total_de_loss / count if count > 0 else 0.0
+    avg_contrastive_loss = total_contrastive_loss / count if count > 0 else 0.0
 
-    # Final memory check after return value is computed
-    if data_loader.is_minibatch() and torch.cuda.is_available():
-        print(f"    [DEBUG] Memory at function exit: {torch.cuda.memory_allocated(device) / 1024**2:.0f} MB")
+    # Get dataset name for tracking
+    dataset_name = getattr(data_loader.data, 'name', 'unknown')
 
     # Return dict with breakdown for DE loss tracking
     return {
         'total': avg_loss,
         'nll': avg_nll_loss,
-        'de': avg_de_loss
+        'de': avg_de_loss,
+        'contrastive': avg_contrastive_loss,
+        'dataset_name': dataset_name
     }
 
 
@@ -593,9 +631,17 @@ def evaluate_with_loader(data_loader, split_idx, model, predictor, args, device,
         all_labels = torch.cat(all_labels)
         accuracy = (all_predictions == all_labels).float().mean().item()
 
+        # Get dataset name for tracking
+        dataset_name = getattr(data_loader.data, 'name', 'unknown')
+
         eval_time = time.time() - eval_start
         print(f"    [MiniBatch Eval] {eval_split} accuracy: {accuracy:.4f} ({eval_time:.2f}s)")
-        return accuracy
+
+        # Return dict with accuracy and dataset name
+        return {
+            'accuracy': accuracy,
+            'dataset_name': dataset_name
+        }
 
     else:
         # Full-batch evaluation: fall back to original test() function

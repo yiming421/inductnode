@@ -180,7 +180,7 @@ def load_checkpoint_config(checkpoint_path):
 
 def override_args_from_checkpoint(args, checkpoint_args, rank=0):
     """Override current arguments with checkpoint configuration"""
-    
+
     if rank == 0:
         print("Overriding current arguments with checkpoint configuration:")
         print(f"  Original hidden: {args.hidden} -> Checkpoint hidden: {checkpoint_args['hidden']}")
@@ -189,7 +189,9 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
         print(f"  Original nhead: {args.nhead} -> Checkpoint nhead: {checkpoint_args['nhead']}")
         print(f"  Original model: {args.model} -> Checkpoint model: {checkpoint_args['model']}")
         print(f"  Original predictor: {args.predictor} -> Checkpoint predictor: {checkpoint_args['predictor']}")
-    
+        if 'head_num_layers' in checkpoint_args:
+            print(f"  Original head_num_layers: {getattr(args, 'head_num_layers', 2)} -> Checkpoint head_num_layers: {checkpoint_args['head_num_layers']}")
+
     # Override key model architecture parameters (with fallback for missing keys)
     args.hidden = checkpoint_args['hidden']
     args.num_layers = checkpoint_args['num_layers']
@@ -213,10 +215,14 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
     args.res = checkpoint_args['res']
     args.multilayer = checkpoint_args['multilayer']
     args.use_gin = checkpoint_args['use_gin']
-    
+
+    # Override head_num_layers if present in checkpoint (added for backwards compatibility)
+    if 'head_num_layers' in checkpoint_args:
+        args.head_num_layers = checkpoint_args['head_num_layers']
+
     if rank == 0:
         print("Model configuration successfully overridden from checkpoint!")
-    
+
     return args
 
 

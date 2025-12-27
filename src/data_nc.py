@@ -1,4 +1,4 @@
-from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
+from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit, Reddit2, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
 from src.dataset_twitch import TwitchFixed
 from src.dataset_heterophilous import HeterophilousGraphDataset
 from torch_geometric.data import Data
@@ -316,7 +316,6 @@ def load_data_train(dataset_name: str):
     elif dataset_name in ['Computers', 'Photo']:
         dataset = Amazon(root=os.path.join(root, 'Amazon'), name=dataset_name)
     elif dataset_name == 'Reddit':
-        print('[DEBUG]: Using Reddit dataset loader')
         dataset = Reddit(root=os.path.join(root, 'Reddit'))
     elif dataset_name == 'Flickr':
         flickr_root = os.path.join(root, 'Flickr')
@@ -350,6 +349,11 @@ def load_data_train(dataset_name: str):
         dataset = EllipticBitcoinDataset(root=os.path.join(root, 'EllipticBitcoin'))
     elif dataset_name in ['DBLP']:
         dataset = CitationFull(root=os.path.join(root, 'CitationFull'), name=dataset_name)
+    elif dataset_name in ['Cora-ML', 'core_ml', 'core-ml']:
+        # CitationFull expects lowercase name 'cora_ml'
+        dataset = CitationFull(root=os.path.join(root, 'CitationFull'), name='cora_ml')
+    elif dataset_name == 'Reddit2':
+        dataset = Reddit2(root=os.path.join(root, 'Reddit2'))
     elif dataset_name.startswith('Twitch-'):
         # Extract region from dataset name (e.g., 'Twitch-DE' -> 'DE')
         region = dataset_name.split('-')[1]
@@ -488,6 +492,11 @@ def load_data(dataset):
         dataset = AttributedGraphDataset(root=os.path.join(get_project_root(), 'dataset', 'AttributedGraph'), name=dataset)
     elif dataset in ['DBLP']:
         dataset = CitationFull(root=os.path.join(get_project_root(), 'dataset', 'CitationFull'), name=dataset)
+    elif dataset in ['Cora-ML', 'core_ml', 'core-ml']:
+        # CitationFull expects lowercase name 'cora_ml'
+        dataset = CitationFull(root=os.path.join(get_project_root(), 'dataset', 'CitationFull'), name='cora_ml')
+    elif dataset == 'Reddit2':
+        dataset = Reddit2(root=os.path.join(get_project_root(), 'dataset', 'Reddit2'))
     elif dataset == 'Products':
         # Load Products subset directly
         data, split_idx = load_products_subset()
@@ -513,9 +522,36 @@ def load_data(dataset):
     # Check if dataset has predefined splits
     if hasattr(data, 'train_mask') and data.train_mask is not None:
         split_idx = dict()
-        split_idx['train'] = data.train_mask.nonzero(as_tuple=False).reshape(-1)
-        split_idx['valid'] = data.val_mask.nonzero(as_tuple=False).reshape(-1)
-        split_idx['test'] = data.test_mask.nonzero(as_tuple=False).reshape(-1)
+
+        # Handle 2D masks (e.g., WikiCS has 20 predefined splits as columns)
+        # Use first split (column 0) in such cases
+        train_mask = data.train_mask
+        val_mask = data.val_mask
+        test_mask = data.test_mask
+
+        if train_mask.dim() == 2:
+            print(f"[load_data] Dataset has 2D train_mask with {train_mask.shape[1]} splits, using split 0")
+            train_mask = train_mask[:, 0]
+        if val_mask.dim() == 2:
+            val_mask = val_mask[:, 0]
+        if test_mask is not None and test_mask.dim() == 2:
+            test_mask = test_mask[:, 0]
+
+        split_idx['train'] = train_mask.nonzero(as_tuple=False).reshape(-1)
+        split_idx['valid'] = val_mask.nonzero(as_tuple=False).reshape(-1)
+        split_idx['test'] = test_mask.nonzero(as_tuple=False).reshape(-1) if test_mask is not None else torch.tensor([])
+
+        # CORRUPTION CHECK: Validate split indices
+        num_nodes = data.num_nodes
+        for split_name, split_indices in split_idx.items():
+            if len(split_indices) > 0:
+                if split_indices.max().item() >= num_nodes:
+                    print(f"[CORRUPTION] {name} {split_name}_idx has invalid indices! Max: {split_indices.max().item()}, valid: [0, {num_nodes-1}]")
+                if split_indices.min().item() < 0:
+                    print(f"[CORRUPTION] {name} {split_name}_idx has negative indices! Min: {split_indices.min().item()}")
+                if len(split_indices) != len(split_indices.unique()):
+                    duplicates = len(split_indices) - len(split_indices.unique())
+                    print(f"[CORRUPTION] {name} {split_name}_idx has {duplicates} duplicate indices!")
     else:
         # Create standard 20 per class train split for datasets without predefined splits
         from collections import defaultdict
@@ -587,13 +623,25 @@ def expand_dataset_names(train_datasets):
             expanded_datasets.append(dataset)
     return expanded_datasets
 
-def load_all_data_train(train_datasets, split_strategy='smallest_for_valid'):
+def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
+                        use_augmentation=False, num_augmentations=1,
+                        augmentation_mode='preprocessing',
+                        augmentation_hidden_dim_range=None, augmentation_activation_pool=None,
+                        augmentation_activation='random', augmentation_max_depth=1,
+                        augmentation_verbose=False, augmentation_use_random_noise=False,
+                        augmentation_dropout_rate=0.0, augmentation_use_feature_mixing=False,
+                        augmentation_mix_ratio=0.3, augmentation_mix_alpha=0.5):
     """
-    Load training datasets with optional split rebalancing.
+    Load training datasets with optional split rebalancing and data augmentation.
 
     Args:
         train_datasets: List of dataset names
         split_strategy: Strategy for rebalancing splits (passed to load_ogbn_data_train)
+        use_augmentation: Whether to apply random projection augmentation
+        num_augmentations: Number of augmented copies to create per graph (1, 2, 3, etc.)
+        augmentation_hidden_dim_range: Range for random hidden dimension (min, max) tuple
+        augmentation_activation_pool: List of activation functions for augmentation
+        augmentation_verbose: Print augmentation details
     """
     # Expand any special dataset names first
     expanded_datasets = expand_dataset_names(train_datasets)
@@ -608,6 +656,21 @@ def load_all_data_train(train_datasets, split_strategy='smallest_for_valid'):
             data, split_edge = load_data_train(dataset)
         data_list.append(data)
         split_idx_list.append(split_edge)
+
+    # Apply data augmentation if enabled
+    # Preprocessing mode: defer augmentation to training-time regeneration using a fixed seed pool to avoid duplicating data in memory.
+    # Per-epoch mode: augmentation also happens in the training loop.
+    if use_augmentation:
+        if augmentation_mode == 'preprocessing':
+            print(f"\n[Data Augmentation - Preprocessing Mode]")
+            print(f"  Deferring augmentation to training-time regeneration with a fixed seed pool "
+                  f"(num_augmentations={num_augmentations}); keeping only originals in memory.")
+            print(f"  Original dataset size: {len(data_list)}")
+        else:  # per_epoch
+            print(f"\n[Data Augmentation - Per-Epoch Mode]")
+            print(f"  Augmentations will be regenerated each epoch during training "
+                  f"(num_augmentations={num_augmentations})")
+
     return data_list, split_idx_list
 
 

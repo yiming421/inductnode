@@ -94,7 +94,8 @@ class TwitchFixed(InMemoryDataset):
 
         xs = []
         n_feats = 128
-        for i in target['id'].values:
+        # Use new_id column instead of id column to match feature JSON keys
+        for i in target['new_id'].values:
             f = [0] * n_feats
             if str(i) in features:
                 n_len = len(features[str(i)])

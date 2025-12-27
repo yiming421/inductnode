@@ -31,17 +31,17 @@ def parse_joint_training_args():
     # === Model Architecture ===
     parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN', 'UnifiedGNN'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN'])
-    parser.add_argument('--hidden', type=int, default=256, help='Hidden dimension')
+    parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
     parser.add_argument('--transformer_layers', type=int, default=3, help='Number of transformer layers')
-    parser.add_argument('--transformer_norm_type', type=str, default='post', choices=['pre', 'post'],
-                        help='Transformer normalization type: pre-norm or post-norm')
+    parser.add_argument('--transformer_norm_type', type=str, default='pre', choices=['pre', 'post'],
+                        help='Transformer normalization type: pre-norm (default, more stable) or post-norm')
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
     parser.add_argument('--ffn_expansion_ratio', type=int, default=4,
                         choices=[1, 2, 4, 8],
                         help='FFN expansion ratio: hidden_dim * expansion_ratio')
-    parser.add_argument('--dp', type=float, default=0.08717780667044389, help='Dropout rate')
+    parser.add_argument('--dp', type=float, default=0, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
     parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections')
     parser.add_argument('--activation', type=str, default='relu', choices=['relu', 'gelu', 'silu'],
@@ -69,12 +69,12 @@ def parse_joint_training_args():
     # === Training Configuration ===
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
     parser.add_argument('--lr', type=float, default=0.000001995432810684568, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.00041043056600071503, help='Weight decay')
+    parser.add_argument('--weight_decay', type=float, default=0.005, help='Weight decay')
     parser.add_argument('--eps', type=float, default=1e-8, help='Epsilon for optimizer (term added to denominator for numerical stability)')
-    parser.add_argument('--schedule', type=str, default='step', choices=['cosine', 'step', 'warmup', 'none'])
-    parser.add_argument('--nc_batch_size', type=int, default=8192, help='Node classification batch size')
+    parser.add_argument('--schedule', type=str, default='cosine', choices=['cosine', 'step', 'warmup', 'none'])
+    parser.add_argument('--nc_batch_size', type=int, default=1024, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=32768, help='Link prediction batch size')
-    parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
+    parser.add_argument('--test_batch_size', type=int, default=1024, help='Test batch size')
     parser.add_argument('--clip_grad', type=float, default=5.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
@@ -83,7 +83,7 @@ def parse_joint_training_args():
     parser.add_argument('--enable_gc', type=str2bool, default=True, help='Enable graph classification task')
 
     # Separate optimizers option
-    parser.add_argument('--use_separate_optimizers', type=str2bool, default=False,
+    parser.add_argument('--use_separate_optimizers', type=str2bool, default=True,
                         help='Use separate optimizers for each task with task-specific learning rates')
 
     # Task-specific learning rates (only used when use_separate_optimizers=True)
@@ -131,23 +131,40 @@ def parse_joint_training_args():
                         help='Default regularization strength for ridge regression (legacy, use nc_ridge_alpha/lp_ridge_alpha for task-specific control)')
     
     # Task-Specific Similarity and Ridge Configuration
-    parser.add_argument('--nc_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'], 
+    parser.add_argument('--nc_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'],
                         help='Similarity function for node classification')
-    parser.add_argument('--nc_ridge_alpha', type=float, default=1.0, 
+    parser.add_argument('--nc_ridge_alpha', type=float, default=1.0,
                         help='Ridge regression regularization strength for node classification')
-    parser.add_argument('--lp_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'], 
+    parser.add_argument('--lp_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'],
                         help='Similarity function for link prediction')
-    parser.add_argument('--lp_ridge_alpha', type=float, default=1.0, 
+    parser.add_argument('--lp_ridge_alpha', type=float, default=1.0,
                         help='Ridge regression regularization strength for link prediction')
-    
-    parser.add_argument('--head_num_layers', type=int, default=2, help='Number of MLP layers in task-specific heads')
+    parser.add_argument('--gc_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'],
+                        help='Similarity function for graph classification')
+    parser.add_argument('--gc_ridge_alpha', type=float, default=1.0,
+                        help='Ridge regression regularization strength for graph classification')
+
+    parser.add_argument('--head_num_layers', type=int, default=0, help='Number of MLP layers in task-specific heads')
     parser.add_argument('--orthogonal_push', type=float, default=0, help='Orthogonal push regularization weight')
     parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize class embeddings')
 
     # === Correct & Smooth (C&S) Post-processing ===
-    parser.add_argument('--use_cs', type=str2bool, default=True, help='Apply Correct & Smooth post-processing (only uses if it improves each split)')
+    parser.add_argument('--use_cs', type=str2bool, default=True,
+                        help='Apply Correct & Smooth post-processing. Decision is validation-based: only uses C&S if it improves validation accuracy (no test leakage)')
     parser.add_argument('--cs_num_iters', type=int, default=50, help='Number of label propagation iterations for C&S')
     parser.add_argument('--cs_alpha', type=float, default=0.5, help='Blending factor for C&S (higher = more emphasis on previous iteration)')
+
+    # Meta-Graph C&S for Graph Classification
+    parser.add_argument('--use_graph_cs', type=str2bool, default=False,
+                        help='Use graph-level Correct & Smooth (build meta-graph with anchors and apply label propagation)')
+    parser.add_argument('--num_anchors', type=int, default=1000,
+                        help='Number of anchor graphs for meta-graph construction')
+    parser.add_argument('--cs_k_neighbors', type=int, default=10,
+                        help='Number of neighbors to connect in meta-graph')
+    parser.add_argument('--weight_sharpening', type=float, default=1.0,
+                        help='Power to raise edge weights to (>1: emphasize strong connections)')
+    parser.add_argument('--meta_graph_sim', type=str, default='cos', choices=['cos', 'tanimoto', 'dot'],
+                        help='Similarity metric for meta-graph construction')
 
     # === Matching Network Configuration ===
     parser.add_argument('--use_matching_network', type=str2bool, default=False, help='Use matching network instead of prototype-based prediction')
@@ -158,10 +175,14 @@ def parse_joint_training_args():
     # === Data Processing ===
     parser.add_argument('--use_full_pca', type=str2bool, default=False, help='Use full PCA decomposition')
     parser.add_argument('--use_random_orthogonal', type=str2bool, default=False, help='Use random orthogonal projection instead of PCA (ablation study)')
+    parser.add_argument('--use_orthogonal_noise', type=str2bool, default=False, help='Replace features with orthogonal noise (ablation study)')
     parser.add_argument('--use_sparse_random', type=str2bool, default=False, help='Use sparse random projection instead of PCA (ablation study)')
     parser.add_argument('--sparse_random_density', type=float, default=0.1, help='Density of non-zero entries in sparse random projection (0.1 = 10% non-zero)')
     parser.add_argument('--use_pca_whitening', type=str2bool, default=False, help='Apply whitening after PCA (normalize by eigenvalues)')
     parser.add_argument('--whitening_epsilon', type=float, default=0.01, help='Regularization epsilon for whitening to avoid numerical issues')
+    parser.add_argument('--use_quantile_normalization', type=str2bool, default=False, help='Apply quantile normalization after PCA to align feature distributions across datasets')
+    parser.add_argument('--quantile_norm_before_padding', type=str2bool, default=True, help='Apply quantile normalization before padding (True) or after padding (False). Experiment to see which works better.')
+    parser.add_argument('--test_process_test_only', type=str2bool, default=True, help='For test datasets, only process test split (avoid data leakage and improve efficiency)')
     parser.add_argument('--pca_device', type=str, default='gpu', choices=['cpu', 'gpu'], help='Device to perform PCA computation (cpu=Incremental PCA, gpu=torch.pca_lowrank)')
     parser.add_argument('--incremental_pca_batch_size', type=int, default=10000, help='Batch size for CPU Incremental PCA')
     parser.add_argument('--pca_sample_threshold', type=int, default=100000, help='Threshold for using sampled PCA on GPU')
@@ -204,6 +225,58 @@ def parse_joint_training_args():
                        choices=['element_wise', 'channel_wise', 'gaussian_noise'],
                        help='Type of feature dropout: element_wise, channel_wise, or gaussian_noise')
 
+    # === Random Projection Augmentation ===
+    parser.add_argument('--use_random_projection_augmentation', type=str2bool, default=False,
+                       help='Apply random projection augmentation: σ(WX+b) with random σ, W, b, and hidden_dim')
+    parser.add_argument('--num_augmentations', type=int, default=1,
+                       help='Number of augmented copies to create per graph (1=double dataset, 2=triple, etc.)')
+    parser.add_argument('--augmentation_mode', type=str, default='preprocessing',
+                       choices=['preprocessing', 'per_epoch'],
+                       help='Augmentation mode: preprocessing (fixed augmentations created once) or per_epoch (new random augmentations each epoch)')
+    parser.add_argument('--augmentation_regenerate_interval', type=int, default=1,
+                       help='Regenerate augmentations every N epochs in per_epoch mode (1 = every epoch, 5 = every 5 epochs, etc.)')
+    parser.add_argument('--augmentation_include_original', type=str2bool, default=False,
+                       help='Whether to include original graphs in training (True) or train only on augmented graphs (False)')
+    parser.add_argument('--augmentation_shuffle', type=str2bool, default=False,
+                       help='Shuffle training dataset list each epoch (mix original and augmented graphs)')
+    parser.add_argument('--augmentation_activation', type=str, default='random',
+                       help='Activation function for augmentation: "random" (randomly sample each time) or fixed name like "relu", "gelu", "tanh", "sin", etc.')
+    parser.add_argument('--augmentation_max_depth', type=int, default=1,
+                       help='Maximum depth of MLP for augmentation (1=single layer σ(WX+b), >1=multi-layer MLP with random depth in [1, max_depth])')
+    parser.add_argument('--augmentation_verbose', type=str2bool, default=False,
+                       help='Print detailed augmentation information')
+    parser.add_argument('--augmentation_use_random_noise', type=str2bool, default=False,
+                       help='ABLATION: Replace σ(WX+b) with pure random Gaussian noise (tests if model learns from graph structure only)')
+    parser.add_argument('--augmentation_dropout_rate', type=float, default=0.0,
+                       help='Dropout rate to apply before projection in each layer (X -> dropout -> WX+b -> activation). 0.0 = no dropout, creates stronger augmentation diversity')
+    parser.add_argument('--augmentation_use_feature_mixing', type=str2bool, default=False,
+                       help='Apply feature mixing augmentation: interpolate features between randomly paired nodes')
+    parser.add_argument('--augmentation_mix_ratio', type=float, default=0.4,
+                       help='Ratio of nodes to participate in feature mixing (0.0 to 1.0)')
+    parser.add_argument('--augmentation_mix_alpha', type=float, default=0.5,
+                       help='Interpolation weight for feature mixing (0.5 = equal mix, 0.8 = keep 80%% original)')
+
+    # === Contrastive Augmentation Loss ===
+    parser.add_argument('--use_contrastive_augmentation_loss', type=str2bool, default=False,
+                       help='Enable contrastive loss to minimize difference between original and augmented embeddings (uses cosine similarity)')
+    parser.add_argument('--contrastive_loss_weight', type=float, default=0.1,
+                       help='Weight for contrastive augmentation loss (multiplier for the loss term)')
+
+    # === Llama-based Transformer (Anisotropy Fix) ===
+    parser.add_argument('--use_llama_transformer', type=str2bool, default=False,
+                       help='Use Llama-based transformer (RMSNorm, SwiGLU, small init) to fix anisotropy. Reuses --nhead and --ffn_expansion_ratio')
+
+    # === Test-Time Augmentation (TTA) ===
+    parser.add_argument('--use_test_time_augmentation', type=str2bool, default=False,
+                       help='Apply test-time augmentation during final evaluation: create multiple augmented versions and aggregate predictions')
+    parser.add_argument('--tta_num_augmentations', type=int, default=20,
+                       help='Number of augmented versions to create at test time (will be aggregated with original graph)')
+    parser.add_argument('--tta_aggregation', type=str, default='voting',
+                       choices=['logits', 'probs', 'voting'],
+                       help='TTA aggregation strategy: logits (average logits before softmax), probs (average probabilities), voting (majority vote)')
+    parser.add_argument('--tta_include_original', type=str2bool, default=False,
+                       help='Include original graph in TTA aggregation (True) or only use augmented versions (False)')
+
     # === GPSE Embeddings ===
     parser.add_argument('--use_gpse', type=str2bool, default=False,
                        help='Use GPSE (Graph Positional and Structural Encoder) embeddings to enhance node features')
@@ -223,15 +296,15 @@ def parse_joint_training_args():
                        help='Use external embeddings for node classification (load from fug_root)')
 
     # === Mini-Batch Sampling for Large Datasets ===
-    parser.add_argument('--use_minibatch_sampling', type=str2bool, default=True,
+    parser.add_argument('--use_minibatch_sampling', type=str2bool, default=False,
                        help='Enable mini-batch sampling with NeighborLoader for large datasets')
-    parser.add_argument('--minibatch_node_threshold', type=int, default=1000000,
+    parser.add_argument('--minibatch_node_threshold', type=int, default=100000,
                        help='Datasets with more nodes than this threshold will use mini-batch sampling')
     parser.add_argument('--minibatch_batch_size', type=int, default=1024,
                        help='Batch size for mini-batch sampling (nodes per batch)')
-    parser.add_argument('--minibatch_num_neighbors', type=str, default='8,6,4,3,2',
+    parser.add_argument('--minibatch_num_neighbors', type=str, default='10,8,6,4',
                        help='Number of neighbors to sample per layer (comma-separated, outer to inner). Will be capped at 5 layers.')
-    parser.add_argument('--minibatch_batches_per_epoch', type=int, default=50,
+    parser.add_argument('--minibatch_batches_per_epoch', type=int, default=100,
                        help='Number of batches to sample per epoch for large datasets')
     parser.add_argument('--minibatch_num_workers', type=int, default=2,
                        help='Number of worker threads for parallel batch loading')
@@ -305,13 +378,13 @@ def parse_joint_training_args():
     # === Dynamic Context Refresh ===
     parser.add_argument('--context_refresh_interval', type=int, default=1,
                        help='Refresh contexts every N epochs (0 = never refresh)')
-    parser.add_argument('--context_batch_refresh_interval', type=int, default=1,
+    parser.add_argument('--context_batch_refresh_interval', type=int, default=0,
                        help='Refresh contexts every N batches within each task (0 = disabled)')
-    parser.add_argument('--context_sampling_plan', type=str, default='decay', choices=['ori', 'random', 'decay'],
+    parser.add_argument('--context_sampling_plan', type=str, default='ori', choices=['ori', 'random', 'decay'],
                        help='Context sampling strategy: ori=original fixed, random=random sampling, decay=gradual decay')
     parser.add_argument('--context_bounds', type=str, default='(5,20)(5,20)(5,20)',
                        help='Context bounds for NC/LP/GC: (lower,upper)(lower,upper)(lower,upper). Used for random sampling range and decay start/end.')
-    parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=True,
+    parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=False,
                        help='Use K-Medoids clustering to guide context sampling for better representativeness')
 
     # === GraphCL (Graph Contrastive Learning) ===
@@ -355,10 +428,18 @@ def parse_joint_training_args():
     parser.add_argument('--use_pretrained_model', type=str2bool, default=False, help='Use pretrained model')
     
     # === Logging and Monitoring ===
-    parser.add_argument('--log_level', type=str, default='INFO', 
+    parser.add_argument('--log_level', type=str, default='INFO',
                        choices=['QUIET', 'INFO', 'DEBUG', 'VERBOSE'])
     parser.add_argument('--log_interval', type=int, default=1, help='Logging interval (epochs)')
     parser.add_argument('--eval_interval', type=int, default=5, help='Evaluation interval (epochs)')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='Custom name for wandb run (default: auto-generated)')
+    parser.add_argument('--log_individual_datasets', type=str2bool, default=False,
+                       help='Log individual dataset loss and accuracy to wandb (default: False)')
+
+    # === Transformer Configuration ===
+    parser.add_argument('--skip_token_formulation', type=str2bool, default=False,
+                       help='Skip token formulation (label concatenation) in Transformer, use GNN embeddings directly (default: False)')
+
     # === Experiment Tracking ===
     parser.add_argument('--sweep', type=str2bool, default=False, help='Running hyperparameter sweep')
 
@@ -371,6 +452,35 @@ def parse_joint_training_args():
     # === Visualization ===
     parser.add_argument('--plot_tsne', type=str2bool, default=False, help='Plot t-SNE visualization of processed features')
     parser.add_argument('--tsne_save_dir', type=str, default='./tsne_plots', help='Directory to save t-SNE plots')
+
+    # === GraphPFN Configuration ===
+    parser.add_argument('--use_graphpfn', type=str2bool, default=False,
+                        help='Use GraphPFN (TabPFN-style dual attention transformer) instead of naive transformer')
+    parser.add_argument('--graphpfn_emsize', type=int, default=192,
+                        help='GraphPFN embedding dimension (TabPFN default: 192)')
+    parser.add_argument('--graphpfn_nhead', type=int, default=6,
+                        help='GraphPFN number of attention heads (TabPFN default: 6)')
+    parser.add_argument('--graphpfn_nlayers', type=int, default=12,
+                        help='GraphPFN number of transformer layers (TabPFN default: 12)')
+    parser.add_argument('--graphpfn_nhid_factor', type=int, default=4,
+                        help='GraphPFN MLP hidden dimension = emsize * nhid_factor (TabPFN default: 4)')
+    parser.add_argument('--graphpfn_features_per_group', type=int, default=2,
+                        help='GraphPFN number of features per group for dual attention (TabPFN default: 2, use 1 for coordinate-free with Fourier features)')
+    parser.add_argument('--graphpfn_fourier_scale', type=float, default=1.0,
+                        help='Fourier feature scale when features_per_group=1 (default: 1.0, higher=more sensitive to value differences)')
+    parser.add_argument('--graphpfn_dropout', type=float, default=0.0,
+                        help='GraphPFN dropout probability (TabPFN default: 0.0)')
+    parser.add_argument('--graphpfn_attention_between_features', type=str2bool, default=True,
+                        help='GraphPFN enable attention between feature groups - key TabPFN innovation (default: True)')
+    parser.add_argument('--graphpfn_feature_positional_embedding', type=str, default='subspace',
+                        choices=['subspace', 'learned', 'normal_rand_vec', 'uni_rand_vec', 'none'],
+                        help='GraphPFN feature positional embedding type (TabPFN default: subspace). CRITICAL for distinguishing feature groups!')
+    parser.add_argument('--graphpfn_seed', type=int, default=0,
+                        help='GraphPFN random seed for feature positional embeddings (TabPFN default: 0)')
+    parser.add_argument('--graphpfn_normalize_x', type=str2bool, default=True,
+                        help='GraphPFN normalize input features (TabPFN default: True)')
+    parser.add_argument('--graphpfn_cache_trainset', type=str2bool, default=True,
+                        help='GraphPFN cache K,V for context nodes during inference (major speedup)')
 
     args = parser.parse_args()
 

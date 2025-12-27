@@ -18,6 +18,132 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from .training_monitor import TrainingMonitor
 
 
+def build_anchor_meta_graph(graph_embeddings, anchor_indices, k_neighbors=5, sim='cos', weight_sharpening=1.0):
+    """
+    Build a sparse meta-graph using anchor-based similarity.
+    Instead of computing N×N similarity, we compute N×K similarity to K anchors.
+    Then connect each graph to its top-k similar anchors.
+
+    Args:
+        graph_embeddings: [num_graphs, dim] tensor of all graph embeddings
+        anchor_indices: Indices of anchor graphs (subset of context set)
+        k_neighbors: Number of anchors to connect each graph to
+        sim: Similarity metric ('cos', 'tanimoto', 'dot')
+        weight_sharpening: Power to raise edge weights to (e.g., 2.0 makes strong edges stronger)
+
+    Returns:
+        adj: Sparse adjacency matrix [num_graphs, num_graphs]
+    """
+    num_graphs = graph_embeddings.size(0)
+    num_anchors = len(anchor_indices)
+    device = graph_embeddings.device
+
+    anchor_embeddings = graph_embeddings[anchor_indices]  # [K, dim]
+
+    # Compute similarity from all graphs to anchors: [N, K] matrix
+    if sim == 'cos':
+        norm_all = F.normalize(graph_embeddings, dim=-1)
+        norm_anchors = F.normalize(anchor_embeddings, dim=-1)
+        similarity_to_anchors = norm_all @ norm_anchors.t()  # [N, K]
+    elif sim == 'tanimoto':
+        dot_product = graph_embeddings @ anchor_embeddings.t()  # [N, K]
+        all_norm_sq = (graph_embeddings ** 2).sum(dim=1, keepdim=True)  # [N, 1]
+        anchor_norm_sq = (anchor_embeddings ** 2).sum(dim=1, keepdim=True).t()  # [1, K]
+        similarity_to_anchors = dot_product / (all_norm_sq + anchor_norm_sq - dot_product + 1e-8)
+    else:  # dot
+        similarity_to_anchors = graph_embeddings @ anchor_embeddings.t()
+
+    # Connect each graph to its top-k similar anchors
+    k = min(k_neighbors, num_anchors)
+    top_k_values, top_k_anchor_idx = torch.topk(similarity_to_anchors, k=k, dim=1)
+
+    # Vectorized edge construction
+    # Source nodes: each graph i repeated k times
+    src_nodes = torch.arange(num_graphs, device=device).unsqueeze(1).repeat(1, k).flatten()  # [N*k]
+
+    # Target nodes: map anchor indices to global indices
+    anchor_indices_tensor = torch.tensor(anchor_indices, device=device)
+    dst_nodes = anchor_indices_tensor[top_k_anchor_idx.flatten()]  # [N*k]
+
+    # Edge weights - apply sharpening to control influence
+    edge_weights = top_k_values.flatten()  # [N*k]
+
+    # Apply weight sharpening: w' = w^k
+    if weight_sharpening != 1.0:
+        edge_weights = torch.pow(torch.clamp(edge_weights, min=0), weight_sharpening)
+
+    # Create bidirectional edges
+    edge_index = torch.stack([
+        torch.cat([src_nodes, dst_nodes]),  # sources
+        torch.cat([dst_nodes, src_nodes])   # targets
+    ], dim=0)
+    edge_weights = torch.cat([edge_weights, edge_weights])
+
+    # Add self-loops with weight 1.0
+    self_loop_index = torch.arange(num_graphs, device=device)
+    self_loop_edges = torch.stack([self_loop_index, self_loop_index], dim=0)
+    self_loop_weights = torch.ones(num_graphs, device=device)
+
+    # Combine regular edges with self-loops
+    edge_index = torch.cat([edge_index, self_loop_edges], dim=1)
+    edge_weights = torch.cat([edge_weights, self_loop_weights])
+
+    adj = SparseTensor.from_edge_index(
+        edge_index,
+        edge_attr=edge_weights,
+        sparse_sizes=(num_graphs, num_graphs)
+    )
+
+    return adj
+
+
+def correct_and_smooth_graph(adj, base_logits, train_idx, train_labels, num_classes,
+                             num_iters=50, alpha=0.5):
+    """
+    Correct & Smooth: post-process feature-based predictions with label propagation on meta-graph.
+
+    Args:
+        adj: Sparse adjacency matrix [num_graphs, num_graphs]
+        base_logits: Base predictions [num_graphs, num_classes]
+        train_idx: Indices of training graphs (context set)
+        train_labels: Labels for training graphs
+        num_classes: Number of classes
+        num_iters: Number of propagation iterations
+        alpha: Smoothing factor (higher = more emphasis on old predictions)
+
+    Returns:
+        smoothed_probs: Smoothed probability predictions [num_graphs, num_classes]
+    """
+    device = base_logits.device
+    num_graphs = base_logits.size(0)
+
+    # Compute symmetric normalization: D^(-1/2) A D^(-1/2)
+    deg = adj.sum(dim=1).to_dense()  # Row sum = degree
+    deg_inv_sqrt = (deg + 1e-9).pow(-0.5)  # Add epsilon for numerical stability
+
+    # Initialize with base predictions (softmax)
+    y_soft = F.softmax(base_logits, dim=1)
+
+    # Create one-hot labels for training set
+    y_train = torch.zeros(num_graphs, num_classes, device=device)
+    y_train[train_idx] = F.one_hot(train_labels.long(), num_classes).float()
+
+    # Label propagation with residual connection
+    for _ in range(num_iters):
+        # Symmetric normalization: D^(-1/2) @ A @ D^(-1/2) @ y
+        y_normalized = deg_inv_sqrt.view(-1, 1) * y_soft
+        y_prop = adj @ y_normalized
+        y_prop = deg_inv_sqrt.view(-1, 1) * y_prop
+
+        # Blend: (1-α) * propagated + α * old
+        y_soft = (1 - alpha) * y_prop + alpha * y_soft
+
+        # Fix training labels (hard constraint)
+        y_soft[train_idx] = y_train[train_idx]
+
+    return y_soft
+
+
 def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
     """
     Apply feature dropout if enabled in args (after projection only).
@@ -806,9 +932,9 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
                     degree_normalize=False, attention_pool_module=None,
                     mlp_module=None, normalize=normalize_class_h
                 )
-                
-                # Use PFN predictor
-                pred_output = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
+
+                # Use PFN predictor with graph classification head
+                pred_output = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h, task_type='graph_classification')
                 if len(pred_output) == 3:  # MoE case with auxiliary loss
                     scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
                 else:  # Standard case
@@ -949,8 +1075,8 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
         mlp_module=None, normalize=normalize_class_h
     )
     
-    # Use PFN predictor
-    scores, _ = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h)
+    # Use PFN predictor with graph classification head
+    scores, _ = predictor(pfn_data, context_embeddings, valid_embeddings, context_labels, class_h, task_type='graph_classification')
     scores = F.log_softmax(scores, dim=1)
 
     # Compute loss
@@ -1093,9 +1219,9 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
             mlp_module=None,
             normalize=normalize_class_h
         )
-        
-        # Use PFN predictor (all samples are valid, no masking needed)
-        scores_raw, refined_class_h = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
+
+        # Use PFN predictor with graph classification head (all samples are valid, no masking needed)
+        scores_raw, refined_class_h = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h, task_type='graph_classification')
 
         # Apply log_softmax for loss computation
         scores_log = F.log_softmax(scores_raw, dim=1)
@@ -1186,12 +1312,12 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
 
 @torch.no_grad()
 def evaluate_graph_classification_single_task(model, predictor, dataset_info, data_loaders, task_idx,
-                                             pooling_method='mean', device='cuda', 
-                                             normalize_class_h=True, dataset_name=None, identity_projection=None, context_k=None):
+                                             pooling_method='mean', device='cuda',
+                                             normalize_class_h=True, dataset_name=None, identity_projection=None, context_k=None, args=None):
     """
     Evaluate graph classification performance for a single task with prefiltered data.
     All samples in each batch are guaranteed to have valid labels for the specified task.
-    
+
     Args:
         model: GNN model
         predictor: PFN predictor
@@ -1202,7 +1328,8 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         device (str): Device for computation
         normalize_class_h (bool): Whether to normalize class embeddings
         dataset_name (str): Name of the dataset (for metric selection)
-        
+        args: Training arguments (for meta-graph C&S config)
+
     Returns:
         dict: Dictionary with train/val/test metrics for this task (AUC for chemhiv, AUC for chempcba, accuracy for others)
     """
@@ -1244,6 +1371,15 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
     num_classes = dataset_info.get('num_classes', None)
     metric_type = get_dataset_metric(dataset_name, num_classes=num_classes, is_multitask=is_multitask) if dataset_name else 'accuracy'
 
+    # Check if meta-graph C&S is enabled
+    use_graph_cs = getattr(args, 'use_graph_cs', False) if args is not None else False
+
+    # Storage for meta-graph C&S (only if enabled)
+    all_test_embeddings = []
+    all_test_logits = []
+    all_test_labels = []
+    split_sizes = {}  # Track size of each split for reconstruction
+
     # Evaluate on each split
     split_times = {}
     for split_name, data_loader in data_loaders.items():
@@ -1252,26 +1388,28 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             results[split_name] = 0.0
             split_times[split_name] = 0.0
             continue
-            
+
         all_predictions = []
         all_labels = []
         all_probabilities = []
-        
+        split_embeddings = []
+        split_logits = []
+
         # Time batch processing (direct iteration, no pre-extraction)
         batch_processing_start = time.perf_counter()
         total_samples = len(data_loader.dataset)
-        
+
         for batch_idx, batch_graphs in enumerate(data_loader):
             print(f"\rEvaluating batch {batch_idx+1}...", end="", flush=True)
             batch_data = batch_graphs.to(device)
             node_emb_table = _get_node_embedding_table(dataset_info['dataset'], task_idx, device, dataset_info)
-            
+
             if node_emb_table is not None:
-                batch_data.x = _safe_lookup_node_embeddings(node_emb_table, batch_data.x, context=f"eval_task{task_idx}_batch{batch_idx}", 
+                batch_data.x = _safe_lookup_node_embeddings(node_emb_table, batch_data.x, context=f"eval_task{task_idx}_batch{batch_idx}",
                                                             batch_data=batch_data, dataset_info=dataset_info)
             else:
                 raise ValueError("Expected node embedding table under unified setting")
-            
+
             # Apply identity projection if needed
             if dataset_info.get('needs_identity_projection', False) and identity_projection is not None:
                 x_input = identity_projection(batch_data.x)
@@ -1288,20 +1426,20 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
 
             target_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
-            
+
             # Get labels for this batch - all samples are valid for this task
             batch_labels = batch_data.y
             batch_size = target_embeddings.size(0)
-            
+
             # Skip single-sample batches to avoid dimension issues with PFN predictor
             if batch_size == 1:
                 print(f"Warning: Skipping batch with only 1 sample to avoid PFN predictor dimension issues")
                 continue
-            
+
             # Check if this is a multi-task dataset
             sample_graph = dataset_info['dataset'][0]
             is_multitask = sample_graph.y.numel() > 1
-            
+
             if is_multitask:
                 # Multi-task format: reshape and extract task labels
                 num_tasks = sample_graph.y.numel()
@@ -1312,32 +1450,47 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
                 # Single-task format
                 if batch_labels.dim() > 1:
                     batch_labels = batch_labels.squeeze()
-        
+
             # Ensure labels are long integers
             if batch_labels.dtype != torch.long:
                 batch_labels = batch_labels.to(torch.long)
-            
-            pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h)
+
+            pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h, task_type='graph_classification')
             if len(pred_output) == 3:  # MoE case with auxiliary loss
                 scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
             else:  # Standard case
                 scores, _ = pred_output
             probabilities = F.softmax(scores, dim=1)
             predictions = scores.argmax(dim=1)
-            
+
             all_predictions.append(predictions.cpu())
             all_labels.append(batch_labels.cpu())
             all_probabilities.append(probabilities.cpu())
+
+            # Store embeddings and logits for C&S if enabled
+            if use_graph_cs:
+                split_embeddings.append(target_embeddings.cpu())
+                split_logits.append(scores.cpu())
+
             print(f"\rEvaluating batch {batch_idx+1} completed ({len(predictions)} samples)", end="", flush=True)
 
-        # Concatenate all predictions and labels
+        # Concatenate all predictions and labels for this split
         if all_predictions:
             all_predictions = torch.cat(all_predictions, dim=0)
             all_labels = torch.cat(all_labels, dim=0)
             all_probabilities = torch.cat(all_probabilities, dim=0)
+
+            if use_graph_cs:
+                split_emb = torch.cat(split_embeddings, dim=0)
+                split_log = torch.cat(split_logits, dim=0)
+                all_test_embeddings.append(split_emb)
+                all_test_logits.append(split_log)
+                all_test_labels.append(all_labels)
+                split_sizes[split_name] = len(all_labels)
+
             print(f"\n{split_name} evaluation: {len(all_predictions)} total samples processed", end="")
-            
-            # Calculate the appropriate metric(s)
+
+            # Calculate the appropriate metric(s) - base predictions
             if isinstance(metric_type, list):
                 # Multiple metrics (e.g., PCBA with both AUC and AP)
                 metric_values = calculate_multiple_metrics(all_predictions, all_labels, all_probabilities, metric_type)
@@ -1351,12 +1504,88 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
                 results[split_name] = {metric_name: 0.0 for metric_name in metric_type}
             else:
                 results[split_name] = 0.0
-        
+
         # Time split completion
         batch_processing_time = time.perf_counter() - batch_processing_start
         split_times[split_name] = time.perf_counter() - split_start
-        
+
         print(f" | processing: {batch_processing_time:.3f}s")
+
+    # Apply meta-graph C&S if enabled
+    if use_graph_cs and all_test_embeddings:
+        print("\n[Meta-Graph C&S] Building meta-graph with context + test graphs...")
+        cs_start = time.perf_counter()
+
+        # Combine context embeddings + all test embeddings
+        all_embeddings = torch.cat([context_embeddings.cpu()] + all_test_embeddings, dim=0).to(device)
+        all_logits = torch.cat([torch.zeros(len(context_labels), dataset_info['num_classes']).cpu()] + all_test_logits, dim=0).to(device)
+        all_labels_combined = torch.cat([context_labels.cpu()] + all_test_labels, dim=0)
+
+        num_context = len(context_labels)
+
+        # Use context graphs as anchors (or sample if too many)
+        num_anchors = min(getattr(args, 'num_anchors', 1000), num_context)
+        if num_anchors < num_context:
+            anchor_indices = np.random.choice(num_context, size=num_anchors, replace=False).tolist()
+        else:
+            anchor_indices = list(range(num_context))
+
+        # Build meta-graph
+        k_neighbors = getattr(args, 'cs_k_neighbors', 10)
+        weight_sharpening = getattr(args, 'weight_sharpening', 1.0)
+        meta_graph_sim = getattr(args, 'meta_graph_sim', 'cos')
+
+        adj = build_anchor_meta_graph(
+            all_embeddings,
+            anchor_indices,
+            k_neighbors=k_neighbors,
+            sim=meta_graph_sim,
+            weight_sharpening=weight_sharpening
+        )
+
+        # For C&S, we need proper logits for context graphs
+        # Re-compute context predictions
+        context_pred_output = predictor(pfn_data, context_embeddings, context_embeddings, context_labels, class_h, task_type='graph_classification')
+        if len(context_pred_output) == 3:
+            context_scores, _, _ = context_pred_output
+        else:
+            context_scores, _ = context_pred_output
+
+        # Update logits with context predictions
+        all_logits[:num_context] = context_scores
+
+        # Apply C&S
+        context_idx = torch.arange(num_context, device=device)
+        num_classes = dataset_info['num_classes']
+        cs_num_iters = getattr(args, 'cs_num_iters', 50)
+        cs_alpha = getattr(args, 'cs_alpha', 0.5)
+
+        smoothed_logits = correct_and_smooth_graph(
+            adj, all_logits, context_idx, context_labels.to(device), num_classes,
+            num_iters=cs_num_iters, alpha=cs_alpha
+        )
+
+        # Extract smoothed predictions for each test split
+        offset = num_context
+        for split_name in split_sizes.keys():
+            split_size = split_sizes[split_name]
+            split_smoothed = smoothed_logits[offset:offset + split_size].cpu()
+            split_labels = all_labels_combined[offset:offset + split_size]
+
+            smoothed_predictions = split_smoothed.argmax(dim=1)
+
+            # Recalculate metrics with smoothed predictions
+            if isinstance(metric_type, list):
+                metric_values = calculate_multiple_metrics(smoothed_predictions, split_labels, split_smoothed, metric_type)
+                results[split_name] = metric_values
+            else:
+                metric_value = calculate_metric(smoothed_predictions, split_labels, split_smoothed, metric_type)
+                results[split_name] = metric_value
+
+            offset += split_size
+
+        cs_time = time.perf_counter() - cs_start
+        print(f"[Meta-Graph C&S] Completed in {cs_time:.3f}s")
 
     # Final timing summary
     total_time = time.perf_counter() - total_start
@@ -1609,7 +1838,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         model, predictor, train_dataset_info, task_eval_loaders, task_idx,
                         pooling_method=args.graph_pooling, device=device,
                         normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection,
-                        context_k=getattr(args, 'context_k', None)
+                        context_k=getattr(args, 'context_k', None), args=args
                     )
                     task_train_accs.append(task_results['train'])
                     task_val_accs.append(task_results['val'])
@@ -1795,7 +2024,7 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                                         model, predictor, test_dataset_info, task_test_loaders, task_idx,
                                         pooling_method=args.graph_pooling, device=device,
                                         normalize_class_h=args.normalize_class_h, dataset_name=test_name, identity_projection=identity_projection,
-                                        context_k=getattr(args, 'context_k', None)
+                                        context_k=getattr(args, 'context_k', None), args=args
                                     )
                                 prof.stop()
                                 
@@ -1811,12 +2040,12 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                                     if line.strip():
                                         print(f"        {line}")
                             else:
-                                # Evaluate this specific task - only test split  
+                                # Evaluate this specific task - only test split
                                 task_results = evaluate_graph_classification_single_task(
                                     model, predictor, test_dataset_info, task_test_loaders, task_idx,
                                     pooling_method=args.graph_pooling, device=device,
                                     normalize_class_h=args.normalize_class_h, dataset_name=test_name, identity_projection=identity_projection,
-                                    context_k=getattr(args, 'context_k', None)
+                                    context_k=getattr(args, 'context_k', None), args=args
                                 )
                             
                             # Only collect test results for unseen datasets

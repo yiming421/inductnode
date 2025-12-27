@@ -20,6 +20,7 @@ import time
 import math  # (possibly needed later)
 import hashlib
 from pathlib import Path
+from .data_utils import apply_quantile_normalization
 # FUG-specific loaders moved to separate module
 try:
     from .data_fug import load_ogb_fug_dataset, load_ogb_original_features, load_tu_original_features, load_gnn_benchmark_original_features, load_mnist_superpixels_original_features, load_modelnet_original_features
@@ -1757,7 +1758,8 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
                          pca_device='gpu', incremental_pca_batch_size=10000, pca_sample_threshold=500000,
                          processed_data=None, pcba_context_only_pca=False,
                          use_pca_cache=False, pca_cache_dir="./pca_cache", use_random_orthogonal=False,
-                         plot_tsne=False, tsne_save_dir="./tsne_plots"):
+                         plot_tsne=False, tsne_save_dir="./tsne_plots", use_quantile_normalization=False,
+                         quantile_norm_before_padding=True):
     """
     Process graph features using PCA directly on embedding table for maximum memory efficiency.
     
@@ -1784,9 +1786,15 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         dict: Processing information and flags
     """
     import time
-    
+
     # PCA threshold is now strictly controlled by args parameter
-    
+
+    # Auto-fix: Override zero padding to random when using quantile norm AFTER padding
+    # Zero padding creates constant columns which cannot be normalized to N(0,1)
+    if use_quantile_normalization and not quantile_norm_before_padding and padding_strategy == 'zero':
+        print(f"[AUTO-FIX] Overriding padding_strategy 'zero' -> 'random' (quantile norm after padding requires varying columns)")
+        padding_strategy = 'random'
+
     # GPSE Integration: Replace dataset embeddings with GPSE embeddings if requested
     if use_gpse and dataset_name is not None:
         print(f"GPSE embeddings requested for dataset: {dataset_name}")
@@ -1956,10 +1964,14 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
                 print(f"Applied zero padding ({pca_features.size(1)} -> {projection_small_dim})")
             else:
                 processed_features = pca_features[:, :projection_small_dim]
-        
+
+        # Apply quantile normalization after PCA/whitening if requested (before padding)
+        if use_quantile_normalization and quantile_norm_before_padding:
+            processed_features = apply_quantile_normalization(processed_features, rank=0)
+
         target_dim = projection_large_dim
         needs_identity_projection = True
-        
+
     else:
         # Standard PCA pathway
 
@@ -2014,12 +2026,21 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
                 print(f"Applied {padding_strategy} padding ({pca_features.size(1)} -> {hidden_dim})")
             else:
                 processed_features = pca_features[:, :hidden_dim]
-        
+
+        # Apply quantile normalization after PCA if requested (before padding)
+        if use_quantile_normalization and quantile_norm_before_padding:
+            processed_features = apply_quantile_normalization(processed_features, rank=0)
+
         target_dim = hidden_dim
         needs_identity_projection = False
-    
+
+    # Apply quantile normalization AFTER padding if requested
+    if use_quantile_normalization and not quantile_norm_before_padding:
+        processed_features = apply_quantile_normalization(processed_features, rank=0)
+
     # Apply normalization if requested
-    if normalize_data:
+    # Skip if quantile normalization was already applied (it already gives N(0,1) distribution)
+    if normalize_data and not use_quantile_normalization:
         if use_batchnorm:
             # BatchNorm-style: normalize each feature across batch
             batch_mean = processed_features.mean(dim=0, keepdim=True)

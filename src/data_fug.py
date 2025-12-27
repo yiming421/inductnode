@@ -34,6 +34,16 @@ def load_ogb_fug_dataset(name, ogb_root='./dataset/ogb', fug_root='./fug'):
         'muv': 'ogbg-molmuv',
         'sider': 'ogbg-molsider',
         'toxcast': 'ogbg-moltoxcast',
+        # Also accept full OGB names directly
+        'ogbg-molbace': 'ogbg-molbace',
+        'ogbg-molbbbp': 'ogbg-molbbbp',
+        'ogbg-molhiv': 'ogbg-molhiv',
+        'ogbg-molpcba': 'ogbg-molpcba',
+        'ogbg-moltox21': 'ogbg-moltox21',
+        'ogbg-molclintox': 'ogbg-molclintox',
+        'ogbg-molmuv': 'ogbg-molmuv',
+        'ogbg-molsider': 'ogbg-molsider',
+        'ogbg-moltoxcast': 'ogbg-moltoxcast',
     }
     
     if name not in ogb_names:
@@ -138,6 +148,16 @@ def load_ogb_original_features(name, ogb_root='./dataset/ogb'):
         'muv': 'ogbg-molmuv',
         'sider': 'ogbg-molsider',
         'toxcast': 'ogbg-moltoxcast',
+        # Also accept full OGB names directly
+        'ogbg-molbace': 'ogbg-molbace',
+        'ogbg-molbbbp': 'ogbg-molbbbp',
+        'ogbg-molhiv': 'ogbg-molhiv',
+        'ogbg-molpcba': 'ogbg-molpcba',
+        'ogbg-moltox21': 'ogbg-moltox21',
+        'ogbg-molclintox': 'ogbg-molclintox',
+        'ogbg-molmuv': 'ogbg-molmuv',
+        'ogbg-molsider': 'ogbg-molsider',
+        'ogbg-moltoxcast': 'ogbg-moltoxcast',
     }
 
     if name not in ogb_names:
