@@ -265,6 +265,16 @@ def parse_joint_training_args():
     # === Llama-based Transformer (Anisotropy Fix) ===
     parser.add_argument('--use_llama_transformer', type=str2bool, default=False,
                        help='Use Llama-based transformer (RMSNorm, SwiGLU, small init) to fix anisotropy. Reuses --nhead and --ffn_expansion_ratio')
+    parser.add_argument('--llama_disable_rope', type=str2bool, default=True,
+                       help='Disable RoPE positional encoding in Llama (True=no PE, False=use RoPE to break symmetry)')
+
+    # === Bank of Tags (VQ-VAE Style Fixed Tags) ===
+    parser.add_argument('--use_bank_of_tags', type=str2bool, default=False,
+                       help='Use fixed random orthogonal Bank of Tags instead of learned class prototypes (like VQ-VAE codebook for class labels)')
+    parser.add_argument('--bank_of_tags_max_classes', type=int, default=1024,
+                       help='Maximum number of classes supported by Bank of Tags (tags are orthogonal when hidden_dim >= max_classes)')
+    parser.add_argument('--bank_of_tags_refresh_interval', type=int, default=1,
+                       help='Refresh tag permutation every N epochs to prevent overfitting (1=every epoch, 0=never refresh)')
 
     # === Test-Time Augmentation (TTA) ===
     parser.add_argument('--use_test_time_augmentation', type=str2bool, default=False,

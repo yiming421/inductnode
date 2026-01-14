@@ -88,10 +88,14 @@ class LlamaPFNPredictorNodeCls(nn.Module):
                  head_num_layers=2,
                  # Llama-specific parameters
                  llama_num_heads=1, llama_intermediate_size=None,
+                 disable_rope=True,  # Disable RoPE by default (set False to enable PE)
                  # Token formulation parameters (matching original)
                  skip_token_formulation=False,
                  use_full_embedding=False,
-                 use_first_half_embedding=False):
+                 use_first_half_embedding=False,
+                 # Bank of Tags (VQ-VAE style fixed tags)
+                 use_bank_of_tags=False,
+                 bank_of_tags_max_classes=200):
         """
         Args:
             hidden_dim: Hidden dimension size
@@ -111,9 +115,12 @@ class LlamaPFNPredictorNodeCls(nn.Module):
             head_num_layers: Number of layers in task head
             llama_num_heads: Number of attention heads in Llama
             llama_intermediate_size: FFN intermediate size (default: 4*hidden_dim)
+            disable_rope: Disable RoPE positional encoding (True = no PE, False = use RoPE)
             skip_token_formulation: Skip token formulation (use GNN embeddings directly)
             use_full_embedding: Use full 2*hidden_dim output
             use_first_half_embedding: Use first half of output
+            use_bank_of_tags: Use fixed random orthogonal tags instead of learned class prototypes
+            bank_of_tags_max_classes: Maximum number of classes for Bank of Tags
         """
         super().__init__()
         from transformers import LlamaConfig, LlamaModel
@@ -128,6 +135,16 @@ class LlamaPFNPredictorNodeCls(nn.Module):
         self.skip_token_formulation = skip_token_formulation
         self.use_full_embedding = use_full_embedding
         self.use_first_half_embedding = use_first_half_embedding
+
+        # Bank of Tags (VQ-VAE style fixed tags for class labels)
+        self.use_bank_of_tags = use_bank_of_tags
+        if use_bank_of_tags:
+            from .model import BankOfTags
+            self.bank_of_tags = BankOfTags(
+                max_num_classes=bank_of_tags_max_classes,
+                hidden_dim=hidden_dim,
+                seed=42  # Fixed seed for reproducibility
+            )
 
         # Store parameters for task head (exactly as original)
         self.degree = degree
@@ -165,14 +182,21 @@ class LlamaPFNPredictorNodeCls(nn.Module):
         # Llama model (no embedding layer, we provide embeddings directly)
         self.llama = LlamaModel(self.config)
 
-        # Replace RoPE with No-Op version (we don't need positional info for set-based learning)
-        for layer in self.llama.layers:
-            head_dim = layer.self_attn.head_dim
-            layer.self_attn.rotary_emb = NoOpRotaryEmbedding(
-                dim=head_dim,
-                max_position_embeddings=self.config.max_position_embeddings,
-                base=self.config.rope_theta
-            )
+        # Optionally disable RoPE (replace with No-Op version)
+        if disable_rope:
+            # Replace RoPE with No-Op version (no positional info)
+            for layer in self.llama.layers:
+                head_dim = layer.self_attn.head_dim
+                layer.self_attn.rotary_emb = NoOpRotaryEmbedding(
+                    dim=head_dim,
+                    max_position_embeddings=self.config.max_position_embeddings,
+                    base=self.config.rope_theta
+                )
+        # else: Keep RoPE enabled (default Llama behavior)
+
+        # Diagnostic settings - always enabled for tracking over epochs
+        self._enable_diagnostics = True
+        self._last_diagnostics = None
 
         # Task-specific head (same as original)
         from .model import NodeClassificationHead
@@ -225,8 +249,14 @@ class LlamaPFNPredictorNodeCls(nn.Module):
             target_tokens = target_x    # [num_target, hidden_dim]
         else:
             # Full token formulation path
-            # Context tokens: [context_x, class_x[context_y]]
-            class_x_y = class_x[context_y]  # [num_context, hidden_dim]
+            # Context tokens: [context_x, class_x[context_y]] or [context_x, bank_of_tags[context_y]]
+            if self.use_bank_of_tags:
+                # Use fixed random orthogonal tags instead of learned class prototypes
+                class_x_y = self.bank_of_tags.get_tags(context_y)  # [num_context, hidden_dim]
+            else:
+                # Use learned class prototypes (original approach)
+                class_x_y = class_x[context_y]  # [num_context, hidden_dim]
+
             context_tokens = torch.cat([context_x, class_x_y], dim=1)  # [num_context, 2*hidden_dim]
 
             # Target tokens: [target_x, zero_padding]
@@ -237,6 +267,14 @@ class LlamaPFNPredictorNodeCls(nn.Module):
         all_tokens = torch.cat([context_tokens, target_tokens], dim=0)  # [num_context+num_target, hidden]
         all_tokens = all_tokens.unsqueeze(0)  # [1, seq_len, hidden] - add batch dimension
 
+        # Step 2.5: Pre-Amp Boost to overcome sqrt(d_model) freezing point
+        # Problem: Normalized embeddings have dot products in [-1, 1]
+        # After dividing by sqrt(256)=16, softmax inputs are tiny (~0.06)
+        # This causes attention entropy ~0.99 (nearly uniform, frozen)
+        # Solution: Amplify embeddings to increase attention score range
+        pre_amp_boost = 4.0  # Boost factor (can be tuned: 2-8 range)
+        all_tokens = all_tokens * pre_amp_boost
+
         # Step 3: Create attention mask for cross-attention pattern
         attention_mask = self._create_attention_mask(num_context, num_target, device=all_tokens.device)
 
@@ -244,7 +282,8 @@ class LlamaPFNPredictorNodeCls(nn.Module):
         outputs = self.llama(
             inputs_embeds=all_tokens,
             attention_mask=attention_mask,
-            output_hidden_states=False,
+            output_hidden_states=self._enable_diagnostics,  # Get layer-wise outputs if diagnostics enabled
+            output_attentions=self._enable_diagnostics,  # Get attention weights if diagnostics enabled
             return_dict=True,
         )
 
@@ -252,6 +291,18 @@ class LlamaPFNPredictorNodeCls(nn.Module):
         all_embeddings = outputs.last_hidden_state[0]  # [seq_len, hidden]
         context_tokens_out = all_embeddings[:num_context, :]  # [num_context, hidden]
         target_tokens_out = all_embeddings[num_context:, :]  # [num_target, hidden]
+
+        # Step 5.5: Compute diagnostics if enabled
+        if self._enable_diagnostics:
+            self._last_diagnostics = self._compute_diagnostics(
+                target_tokens_out=target_tokens_out,
+                context_tokens_out=context_tokens_out,
+                all_tokens_input=all_tokens[0],
+                hidden_states=outputs.hidden_states if hasattr(outputs, 'hidden_states') else None,
+                attentions=outputs.attentions if hasattr(outputs, 'attentions') else None,
+                num_context=num_context,
+                num_target=num_target
+            )
 
         # Step 6: Extract label embeddings (matching original logic)
         if self.skip_token_formulation:
@@ -273,17 +324,32 @@ class LlamaPFNPredictorNodeCls(nn.Module):
                 context_label_emb = context_tokens_out[:, self.hidden_dim:]  # [num_context, hidden_dim]
                 target_label_emb = target_tokens_out[:, self.hidden_dim:]    # [num_target, hidden_dim]
 
-        # Step 7: Task head (exactly as original)
-        logits, class_emb = self.nc_head(
-            target_label_emb=target_label_emb,
-            context_label_emb=context_label_emb,
-            context_y=context_y,
-            data=data,
-            degree_normalize=self.degree,
-            attention_pool_module=self.att,
-            mlp_module=self.mlp_pool,
-            normalize=self.normalize
-        )
+        # Step 7: Prediction
+        if self.use_bank_of_tags:
+            # Bank of Tags: Simple dot product between target embeddings and all tags
+            # No complex head needed - tags ARE the class representations
+            # logits[i, j] = target_emb[i] · tag[j]
+            num_classes = int(context_y.max().item() + 1)
+
+            # Get all tags for this dataset's classes (through current permutation)
+            class_indices = torch.arange(num_classes, device=target_label_emb.device)
+            all_tags = self.bank_of_tags.get_tags(class_indices)  # [num_classes, hidden_dim]
+
+            # Simple dot product: target_emb @ tags^T
+            logits = torch.matmul(target_label_emb, all_tags.t())  # [num_target, num_classes]
+            class_emb = all_tags  # Return tags as "class embeddings"
+        else:
+            # Original approach: Complex task head with prototype pooling
+            logits, class_emb = self.nc_head(
+                target_label_emb=target_label_emb,
+                context_label_emb=context_label_emb,
+                context_y=context_y,
+                data=data,
+                degree_normalize=self.degree,
+                attention_pool_module=self.att,
+                mlp_module=self.mlp_pool,
+                normalize=self.normalize
+            )
 
         return logits, class_emb
 
@@ -351,13 +417,22 @@ class LlamaPFNPredictorNodeCls(nn.Module):
             context_tokens = context_x
             target_tokens = target_x
         else:
-            class_x_y = class_x[context_y]
+            # Use BankOfTags if enabled, otherwise use class prototypes
+            if self.use_bank_of_tags:
+                class_x_y = self.bank_of_tags.get_tags(context_y)
+            else:
+                class_x_y = class_x[context_y]
             context_tokens = torch.cat([context_x, class_x_y], dim=1)
 
             padding = torch.zeros_like(target_x)
             target_tokens = torch.cat([target_x, padding], dim=1)
 
         all_tokens = torch.cat([context_tokens, target_tokens], dim=0).unsqueeze(0)
+
+        # Pre-Amp Boost (same as in forward)
+        pre_amp_boost = 4.0
+        all_tokens = all_tokens * pre_amp_boost
+
         attention_mask = self._create_attention_mask(num_context, num_target, device=all_tokens.device)
 
         outputs = self.llama(
@@ -380,3 +455,155 @@ class LlamaPFNPredictorNodeCls(nn.Module):
                 target_embeddings = target_tokens_out[:, self.hidden_dim:]
 
         return target_embeddings
+
+    def _compute_diagnostics(self, target_tokens_out, context_tokens_out, all_tokens_input,
+                            hidden_states, attentions, num_context, num_target):
+        """
+        Compute diagnostic metrics for monitoring model behavior.
+
+        Args:
+            target_tokens_out: [num_target, hidden] - Target embeddings after Llama
+            context_tokens_out: [num_context, hidden] - Context embeddings after Llama
+            all_tokens_input: [seq_len, hidden] - Input tokens to Llama
+            hidden_states: Tuple of hidden states from each layer (if available)
+            attentions: Tuple of attention weights from each layer (if available)
+            num_context: Number of context tokens
+            num_target: Number of target tokens
+
+        Returns:
+            dict: Diagnostic metrics
+        """
+        import torch.nn.functional as F
+
+        diagnostics = {}
+
+        # 1. Anisotropy (Mean Dominance) - measures if outputs collapse to mean vector
+        target_mean = target_tokens_out.mean(dim=0, keepdim=True)
+        target_centered = target_tokens_out - target_mean
+        mean_norm = target_mean.norm(dim=1).mean().item()
+        centered_norm = target_centered.norm(dim=1).mean().item()
+        mean_dominance = mean_norm / (mean_norm + centered_norm + 1e-8)
+        diagnostics['anisotropy/mean_dominance'] = mean_dominance
+        diagnostics['anisotropy/target_mean_norm'] = mean_norm
+        diagnostics['anisotropy/target_centered_norm'] = centered_norm
+
+        # 2. Output Diversity - intra-sample similarity
+        if num_target > 1:
+            target_normalized = F.normalize(target_tokens_out, p=2, dim=1)
+            similarity_matrix = target_normalized @ target_normalized.t()
+            # Average similarity (excluding diagonal)
+            mask = ~torch.eye(num_target, dtype=torch.bool, device=similarity_matrix.device)
+            avg_similarity = similarity_matrix[mask].mean().item()
+            diagnostics['diversity/intra_sample_similarity'] = avg_similarity
+
+        # 3. Input vs Output comparison
+        input_target = all_tokens_input[num_context:num_context+num_target]
+        input_mean = input_target.mean(dim=0, keepdim=True)
+        input_centered = input_target - input_mean
+        input_mean_dom = input_mean.norm(dim=1).mean().item() / (
+            input_mean.norm(dim=1).mean().item() + input_centered.norm(dim=1).mean().item() + 1e-8
+        )
+        diagnostics['anisotropy/input_mean_dominance'] = input_mean_dom
+        diagnostics['anisotropy/delta_mean_dominance'] = mean_dominance - input_mean_dom
+
+        # 3.5. Transformer contribution magnitude (is it bypassed?)
+        # Measure ||output - input|| / ||input|| to see if transformer is making meaningful changes
+        delta = target_tokens_out - input_target
+        delta_norm = delta.norm(dim=1).mean().item()
+        input_norm = input_target.norm(dim=1).mean().item()
+        delta_ratio = delta_norm / (input_norm + 1e-8)
+        diagnostics['transformer/delta_norm'] = delta_norm
+        diagnostics['transformer/input_norm'] = input_norm
+        diagnostics['transformer/delta_ratio'] = delta_ratio  # Should be > 0.1, if < 0.01 = bypassed
+
+        # Cosine similarity between input and output (1.0 = identical direction)
+        input_normalized = F.normalize(input_target, p=2, dim=1)
+        output_normalized = F.normalize(target_tokens_out, p=2, dim=1)
+        cosine_sim = (input_normalized * output_normalized).sum(dim=1).mean().item()
+        diagnostics['transformer/input_output_cosine'] = cosine_sim  # Close to 1.0 = bypassed
+
+        # 4. Layer-wise anisotropy (if hidden states available)
+        if hidden_states is not None:
+            for layer_idx, hidden_state in enumerate(hidden_states):
+                layer_output = hidden_state[0, num_context:num_context+num_target, :]  # Target tokens
+                layer_mean = layer_output.mean(dim=0, keepdim=True)
+                layer_centered = layer_output - layer_mean
+                layer_mean_dom = layer_mean.norm(dim=1).mean().item() / (
+                    layer_mean.norm(dim=1).mean().item() + layer_centered.norm(dim=1).mean().item() + 1e-8
+                )
+                diagnostics[f'anisotropy/layer_{layer_idx}_mean_dom'] = layer_mean_dom
+
+        # 5. Attention statistics (if attention weights available)
+        if attentions is not None:
+            for layer_idx, attn in enumerate(attentions):
+                # attn: [batch=1, num_heads, seq_len, seq_len]
+                attn = attn[0]  # [num_heads, seq_len, seq_len]
+
+                # Focus on target tokens' attention to context
+                target_to_context_attn = attn[:, num_context:, :num_context]  # [num_heads, num_target, num_context]
+
+                # Compute entropy (high entropy = uniform averaging, low = selective)
+                # Entropy: -sum(p * log(p))
+                eps = 1e-8
+                entropy = -(target_to_context_attn * (target_to_context_attn + eps).log()).sum(dim=-1)  # [num_heads, num_target]
+                max_entropy = torch.log(torch.tensor(num_context, dtype=torch.float32))
+                normalized_entropy = (entropy / max_entropy).mean().item()  # 1.0 = uniform, 0.0 = selective
+
+                diagnostics[f'attention/layer_{layer_idx}_avg_entropy'] = normalized_entropy
+
+                # Max attention weight (if close to 1.0, very selective)
+                max_attn_weight = target_to_context_attn.max(dim=-1)[0].mean().item()
+                diagnostics[f'attention/layer_{layer_idx}_max_weight'] = max_attn_weight
+
+        return diagnostics
+
+    def get_diagnostics(self):
+        """
+        Get diagnostic metrics from the last forward pass.
+
+        Returns:
+            dict: Diagnostic metrics, or None if diagnostics not enabled
+        """
+        return self._last_diagnostics
+
+    def enable_diagnostics(self, enable=True):
+        """
+        Enable or disable diagnostic computation.
+
+        Args:
+            enable (bool): Whether to enable diagnostics
+        """
+        self._enable_diagnostics = enable
+
+    def print_diagnostics(self, prefix="[LLAMA DIAGNOSTICS]"):
+        """
+        Print the last computed diagnostics in a readable format.
+
+        Args:
+            prefix (str): Prefix for print output
+        """
+        if self._last_diagnostics is None:
+            print(f"{prefix} No diagnostics available. Call enable_diagnostics(True) before forward pass.")
+            return
+
+        print(f"\n{prefix}")
+        print(f"{'='*60}")
+
+        # Group by category
+        categories = {}
+        for key, value in self._last_diagnostics.items():
+            cat = key.split('/')[0]
+            if cat not in categories:
+                categories[cat] = []
+            categories[cat].append((key.split('/')[1], value))
+
+        # Print each category
+        for cat_name, metrics in sorted(categories.items()):
+            print(f"\n{cat_name.upper()}:")
+            for metric_name, value in sorted(metrics):
+                if isinstance(value, float):
+                    print(f"  {metric_name}: {value:.4f}")
+                else:
+                    print(f"  {metric_name}: {value}")
+
+        print(f"{'='*60}\n")

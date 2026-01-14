@@ -1195,10 +1195,14 @@ def create_unified_model(args, input_dim, device):
                 # Llama-specific parameters (reuse existing args)
                 llama_num_heads=args.nhead,
                 llama_intermediate_size=hidden * getattr(args, 'ffn_expansion_ratio', 4),
+                disable_rope=getattr(args, 'llama_disable_rope', True),
                 # Token formulation parameters
                 skip_token_formulation=getattr(args, 'skip_token_formulation', False),
                 use_full_embedding=getattr(args, 'use_full_embedding', False),
                 use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
+                # Bank of Tags parameters
+                use_bank_of_tags=getattr(args, 'use_bank_of_tags', False),
+                bank_of_tags_max_classes=getattr(args, 'bank_of_tags_max_classes', 200),
             )
         else:
             # Original PFN predictor
@@ -2403,9 +2407,12 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     return result_dict
 
 
-def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None, projector=None, nc_loaders=None):
+def evaluate_node_classification(model, predictor, nc_data, args, split='valid', identity_projection=None, projector=None, nc_loaders=None, epoch=0):
     """
     Evaluate node classification task only.
+
+    Args:
+        epoch: Current epoch number (for Bank of Tags permutation refresh)
 
     Returns:
         Dictionary with node classification metrics
@@ -2452,7 +2459,8 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     train_metrics, valid_metrics, test_metrics = test_all_induct(
                         model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
                         False, None, None, True, projector, 0, identity_projection, None,
-                        use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha
+                        use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha,
+                        args=args, epoch=epoch
                     )
 
                 datasets_time = time.time() - datasets_start_time
@@ -2848,12 +2856,13 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
 
 
 def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='valid',
-                    identity_projection=None, projector=None, gc_tracker=None, nc_loaders=None):
+                    identity_projection=None, projector=None, gc_tracker=None, nc_loaders=None, epoch=0):
     """
     Evaluate enabled tasks and return metrics.
 
     Args:
         nc_loaders: Optional list of MiniBatchNCLoader for mini-batch evaluation
+        epoch: Current epoch number (for Bank of Tags permutation refresh)
 
     Returns:
         Dictionary with metrics for enabled tasks
@@ -2863,7 +2872,7 @@ def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='v
 
     # Evaluate node classification
     if hasattr(args, 'enable_nc') and args.enable_nc and nc_data is not None and nc_data[0] is not None:
-            nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection, projector, nc_loaders)
+            nc_results = evaluate_node_classification(model, predictor, nc_data, args, split, identity_projection, projector, nc_loaders, epoch=epoch)
             results['nc_metrics'] = nc_results
     
     # Evaluate link prediction  
@@ -3293,7 +3302,7 @@ def run_joint_training(args, device='cuda:0'):
         seen_valid_results = joint_evaluation(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
             args, 'valid', identity_projection, projector, gc_tracker,
-            nc_loaders=data_dict.get('nc_train_loaders', None)
+            nc_loaders=data_dict.get('nc_train_loaders', None), epoch=epoch
         )
 
         # Compute combined validation score on seen datasets

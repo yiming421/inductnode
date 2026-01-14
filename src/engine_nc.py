@@ -140,6 +140,26 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     if projector is not None:
         projector.train()
 
+    # Refresh Bank of Tags permutation if enabled and it's time to refresh
+    if (args is not None and
+        hasattr(args, 'use_bank_of_tags') and args.use_bank_of_tags and
+        hasattr(args, 'bank_of_tags_refresh_interval') and args.bank_of_tags_refresh_interval > 0 and
+        hasattr(pred, 'use_bank_of_tags') and pred.use_bank_of_tags and
+        epoch % args.bank_of_tags_refresh_interval == 0):
+
+        # Get number of classes for this dataset
+        num_classes = int(data.y.max().item() + 1)
+
+        # Refresh permutation with epoch-dependent seed for reproducibility
+        # Use dataset name hash for additional variety if available
+        dataset_hash = hash(getattr(data, 'name', 'default')) % 10000
+        refresh_seed = args.seed + epoch * 1000 + dataset_hash
+        pred.bank_of_tags.refresh_permutation(num_classes=num_classes, seed=refresh_seed)
+
+        if rank == 0:
+            dataset_name = getattr(data, 'name', 'unknown')
+            print(f"[BankOfTags] Refreshed permutation for {dataset_name} (epoch {epoch}, {num_classes} classes)")
+
     # Use distributed sampler for DDP
     if dist.is_initialized():
         indices = torch.arange(train_idx.size(0))
@@ -235,6 +255,33 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             pred._debug_print = True
 
         score, class_h = pred(data, context_h, target_h, context_y, class_h)
+
+        # Log Llama diagnostics if available (for monitoring anisotropy, attention, etc.)
+        if hasattr(pred, 'get_diagnostics') and rank == 0 and batch_idx == 0:
+            diag = pred.get_diagnostics()
+            if diag is not None:
+                import wandb
+                if wandb.run is not None:
+                    # Add epoch prefix to metrics
+                    diag_with_prefix = {f"llama/{k}": v for k, v in diag.items()}
+                    wandb.log(diag_with_prefix, step=epoch)
+
+                # Print key metrics
+                print(f"\n[LLAMA DIAGNOSTICS - Epoch {epoch}, Batch {batch_idx}]")
+                print(f"  Anisotropy: mean_dom={diag.get('anisotropy/mean_dominance', 'N/A'):.4f} "
+                      f"(input={diag.get('anisotropy/input_mean_dominance', 'N/A'):.4f}, "
+                      f"delta={diag.get('anisotropy/delta_mean_dominance', 'N/A'):.4f})")
+                if 'attention/layer_0_avg_entropy' in diag:
+                    print(f"  Attention entropy (layer 0): {diag['attention/layer_0_avg_entropy']:.4f} (1.0=uniform, 0.0=selective)")
+                # Check if transformer is bypassed
+                delta_ratio = diag.get('transformer/delta_ratio', None)
+                input_output_cos = diag.get('transformer/input_output_cosine', None)
+                if delta_ratio is not None:
+                    bypass_warning = " ⚠️ BYPASSED!" if delta_ratio < 0.05 else ""
+                    print(f"  Transformer delta: {delta_ratio:.4f} (||Δ||/||x||){bypass_warning}")
+                if input_output_cos is not None:
+                    identity_warning = " ⚠️ IDENTITY!" if input_output_cos > 0.95 else ""
+                    print(f"  Input→Output cosine: {input_output_cos:.4f}{identity_warning}")
 
         # Compute contrastive augmentation loss if enabled
         # This compares Transformer-generated embeddings from original vs augmented features
@@ -856,7 +903,7 @@ def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, deg
 @torch.no_grad()
 def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False,
          att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None,
-         external_embeddings=None, args=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5):
+         external_embeddings=None, args=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5, epoch=0):
     st = time.time()
     model.eval()
     predictor.eval()
@@ -864,6 +911,20 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
         projector.eval()
     if identity_projection is not None:
         identity_projection.eval()
+
+    # Refresh Bank of Tags permutation to match training (use same seed as training for this epoch)
+    # This ensures test evaluation uses the same tag mapping as training
+    if (args is not None and
+        hasattr(args, 'use_bank_of_tags') and args.use_bank_of_tags and
+        hasattr(predictor, 'use_bank_of_tags') and predictor.use_bank_of_tags):
+
+        # Get number of classes for this dataset
+        num_classes = int(data.y.max().item() + 1)
+
+        # Use same seed as training to ensure consistency
+        dataset_hash = hash(getattr(data, 'name', 'default')) % 10000
+        refresh_seed = args.seed + epoch * 1000 + dataset_hash
+        predictor.bank_of_tags.refresh_permutation(num_classes=num_classes, seed=refresh_seed)
 
     device = next(model.parameters()).device
     moved_to_device = False
@@ -1041,7 +1102,7 @@ def test_all(model, predictor, data_list, split_idx_list, batch_size, degree=Fal
 
 def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, degree=False,
                     att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None,
-                    external_embeddings_list=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5, args=None):
+                    external_embeddings_list=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5, args=None, epoch=0):
     import time
 
     train_metric_list, valid_metric_list, test_metric_list = [], [], []
@@ -1071,8 +1132,8 @@ def test_all_induct(model, predictor, data_list, split_idx_list, batch_size, deg
         external_embeddings = external_embeddings_list[dataset_idx] if external_embeddings_list else None
         train_metric, valid_metric, test_metric = \
         test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree, att, mlp,
-             normalize_class_h, projector, rank, identity_projection, external_embeddings, args=None,
-             use_cs=use_cs, cs_num_iters=cs_num_iters, cs_alpha=cs_alpha)
+             normalize_class_h, projector, rank, identity_projection, external_embeddings, args=args,
+             use_cs=use_cs, cs_num_iters=cs_num_iters, cs_alpha=cs_alpha, epoch=epoch)
 
         dataset_time = time.time() - dataset_start_time
 

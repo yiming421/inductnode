@@ -18,6 +18,87 @@ def get_activation_fn(activation_name):
     else:
         raise ValueError(f"Unsupported activation function: {activation_name}")
 
+
+class BankOfTags(nn.Module):
+    """
+    Fixed random tag bank for class labels (like VQ-VAE codebook).
+
+    Key properties:
+    - Tags are fixed (never trained) random vectors
+    - True orthogonality via QR when hidden_dim >= max_num_classes
+    - Normalized random vectors when hidden_dim < max_num_classes
+    - Random permutation mapping class_idx -> tag_idx to prevent overfitting
+    - Permutation can be refreshed periodically (e.g., every epoch)
+
+    Usage:
+        bank = BankOfTags(max_num_classes=200, hidden_dim=128)
+        bank.refresh_permutation(num_classes=7, seed=42)  # For dataset with 7 classes
+        tags = bank.get_tags(class_indices)  # [num_samples, hidden_dim]
+    """
+    def __init__(self, max_num_classes, hidden_dim, seed=42):
+        """
+        Args:
+            max_num_classes: Maximum number of classes to support
+            hidden_dim: Dimension of each tag vector
+            seed: Random seed for reproducibility
+        """
+        super().__init__()
+
+        torch.manual_seed(seed)
+
+        if hidden_dim >= max_num_classes:
+            # True orthogonality via QR decomposition
+            # Generate random matrix and orthogonalize
+            # Transpose to get correct shape: QR of [hidden_dim, max_num_classes] gives Q [hidden_dim, max_num_classes]
+            random_matrix = torch.randn(hidden_dim, max_num_classes)
+            Q, R = torch.linalg.qr(random_matrix)
+            tags = Q.t()  # Transpose to get [max_num_classes, hidden_dim] orthonormal vectors
+        else:
+            # Pseudo-orthogonality: normalized random vectors
+            # When we have more classes than dimensions, true orthogonality is impossible
+            tags = torch.randn(max_num_classes, hidden_dim)
+            tags = F.normalize(tags, p=2, dim=1)  # Unit vectors
+
+        # Register as buffer (not parameter) - won't be trained
+        self.register_buffer('tags', tags)
+
+        # Permutation mapping: class_idx -> tag_idx (refreshed periodically)
+        # Initially identity mapping [0, 1, 2, ..., max_num_classes-1]
+        self.register_buffer('permutation', torch.arange(max_num_classes))
+
+    def refresh_permutation(self, num_classes, seed=None):
+        """
+        Randomly shuffle the class->tag mapping to prevent overfitting.
+
+        This ensures the model can't memorize "tag[0] always means class strawberry".
+        Instead, the mapping changes each time it's refreshed.
+
+        Args:
+            num_classes: Number of classes in current dataset
+            seed: Random seed for reproducibility (optional)
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        # Random permutation of tag indices
+        perm = torch.randperm(self.tags.size(0))[:num_classes]
+        self.permutation[:num_classes] = perm
+
+    def get_tags(self, class_indices):
+        """
+        Lookup tags by class indices through random permutation.
+
+        Args:
+            class_indices: Tensor of class indices [num_samples]
+
+        Returns:
+            tags: Tensor of tag vectors [num_samples, hidden_dim]
+        """
+        # Map class indices to tag indices via permutation
+        tag_indices = self.permutation[class_indices]
+        return self.tags[tag_indices]
+
+
 class PureGCNConv(nn.Module):
     def __init__(self) -> None:
         super().__init__()
