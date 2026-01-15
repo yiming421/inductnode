@@ -75,7 +75,7 @@ def parse_joint_training_args():
     parser.add_argument('--nc_batch_size', type=int, default=1024, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=32768, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=1024, help='Test batch size')
-    parser.add_argument('--clip_grad', type=float, default=5.0, help='Gradient clipping')
+    parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
     parser.add_argument('--enable_nc', type=str2bool, default=True, help='Enable node classification task')
@@ -117,7 +117,7 @@ def parse_joint_training_args():
                        help='Link prediction test datasets')
     
     # === Model Components ===
-    parser.add_argument('--use_identity_projection', type=str2bool, default=True, help='Use identity projection')
+    parser.add_argument('--use_identity_projection', type=str2bool, default=False, help='Use identity projection')
     
     # === PFN Predictor Configuration ===
     parser.add_argument('--context_num', type=int, default=5, help='Number of context nodes')
@@ -277,14 +277,14 @@ def parse_joint_training_args():
                        help='Refresh tag permutation every N epochs to prevent overfitting (1=every epoch, 0=never refresh)')
 
     # === Test-Time Augmentation (TTA) ===
-    parser.add_argument('--use_test_time_augmentation', type=str2bool, default=False,
+    parser.add_argument('--use_test_time_augmentation', type=str2bool, default=True,
                        help='Apply test-time augmentation during final evaluation: create multiple augmented versions and aggregate predictions')
     parser.add_argument('--tta_num_augmentations', type=int, default=20,
                        help='Number of augmented versions to create at test time (will be aggregated with original graph)')
-    parser.add_argument('--tta_aggregation', type=str, default='voting',
+    parser.add_argument('--tta_aggregation', type=str, default='probs',
                        choices=['logits', 'probs', 'voting'],
                        help='TTA aggregation strategy: logits (average logits before softmax), probs (average probabilities), voting (majority vote)')
-    parser.add_argument('--tta_include_original', type=str2bool, default=False,
+    parser.add_argument('--tta_include_original', type=str2bool, default=True,
                        help='Include original graph in TTA aggregation (True) or only use augmented versions (False)')
 
     # === GPSE Embeddings ===

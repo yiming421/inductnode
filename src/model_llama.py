@@ -170,7 +170,7 @@ class LlamaPFNPredictorNodeCls(nn.Module):
             num_hidden_layers=num_layers,
             num_key_value_heads=llama_num_heads,  # Can be < num_heads for GQA
             rms_norm_eps=1e-6,
-            initializer_range=0.02,  # Small initialization (vs Xavier's ~0.088)
+            initializer_range=1.0 / (llama_hidden_size ** 0.5),  # Xavier-like initialization (e.g. 0.125 for d=64) to avoid frozen attention
             rope_theta=10000.0,
             attention_bias=False,  # Modern architecture: bias-free attention (Llama 3, DeepSeek)
             attention_dropout=dropout,
@@ -266,14 +266,6 @@ class LlamaPFNPredictorNodeCls(nn.Module):
         # Step 2: Concatenate into single sequence and add batch dimension
         all_tokens = torch.cat([context_tokens, target_tokens], dim=0)  # [num_context+num_target, hidden]
         all_tokens = all_tokens.unsqueeze(0)  # [1, seq_len, hidden] - add batch dimension
-
-        # Step 2.5: Pre-Amp Boost to overcome sqrt(d_model) freezing point
-        # Problem: Normalized embeddings have dot products in [-1, 1]
-        # After dividing by sqrt(256)=16, softmax inputs are tiny (~0.06)
-        # This causes attention entropy ~0.99 (nearly uniform, frozen)
-        # Solution: Amplify embeddings to increase attention score range
-        pre_amp_boost = 4.0  # Boost factor (can be tuned: 2-8 range)
-        all_tokens = all_tokens * pre_amp_boost
 
         # Step 3: Create attention mask for cross-attention pattern
         attention_mask = self._create_attention_mask(num_context, num_target, device=all_tokens.device)
@@ -428,10 +420,6 @@ class LlamaPFNPredictorNodeCls(nn.Module):
             target_tokens = torch.cat([target_x, padding], dim=1)
 
         all_tokens = torch.cat([context_tokens, target_tokens], dim=0).unsqueeze(0)
-
-        # Pre-Amp Boost (same as in forward)
-        pre_amp_boost = 4.0
-        all_tokens = all_tokens * pre_amp_boost
 
         attention_mask = self._create_attention_mask(num_context, num_target, device=all_tokens.device)
 
