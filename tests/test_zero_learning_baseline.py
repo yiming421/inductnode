@@ -623,8 +623,99 @@ def propagate_and_pool_graphs(graph_list, num_hops=2, method='residual', alpha=0
     return graph_emb
 
 
+def _kcenter_indices(features, k, seed=0):
+    """Farthest-first (k-center) selection on cosine distance."""
+    n = features.size(0)
+    if n <= k:
+        return torch.arange(n, device=features.device)
+
+    torch.manual_seed(seed)
+    first = torch.randint(0, n, (1,), device=features.device).item()
+    selected = [first]
+
+    x_norm = F.normalize(features, dim=-1)
+    sims = (x_norm @ x_norm[first].unsqueeze(1)).squeeze(1)
+    min_dist = 1.0 - sims
+
+    for _ in range(1, k):
+        idx = torch.argmax(min_dist).item()
+        selected.append(idx)
+        sims = (x_norm @ x_norm[idx].unsqueeze(1)).squeeze(1)
+        dist = 1.0 - sims
+        min_dist = torch.minimum(min_dist, dist)
+
+    return torch.tensor(selected, device=features.device, dtype=torch.long)
+
+
+def _kmeans_prototypes(features, k, num_iters=10, seed=0, use_cosine=True):
+    """Simple k-means to produce k prototypes."""
+    n = features.size(0)
+    if n <= k:
+        return features
+
+    rng_state = torch.random.get_rng_state()
+    torch.manual_seed(seed)
+
+    if use_cosine:
+        x = F.normalize(features, dim=-1)
+    else:
+        x = features
+
+    init_idx = torch.randperm(n, device=features.device)[:k]
+    centers = x[init_idx].clone()
+
+    for _ in range(num_iters):
+        if use_cosine:
+            sims = x @ centers.t()
+            assign = sims.argmax(dim=1)
+        else:
+            dist = torch.cdist(x, centers)
+            assign = dist.argmin(dim=1)
+
+        new_centers = []
+        for j in range(k):
+            mask = assign == j
+            if mask.any():
+                c = x[mask].mean(dim=0)
+                if use_cosine:
+                    c = F.normalize(c, dim=0)
+            else:
+                if use_cosine:
+                    min_dist = 1.0 - sims.max(dim=1).values
+                    idx = torch.argmax(min_dist).item()
+                else:
+                    min_dist = dist.min(dim=1).values
+                    idx = torch.argmax(min_dist).item()
+                c = x[idx]
+            new_centers.append(c)
+        centers = torch.stack(new_centers, dim=0)
+
+    torch.random.set_rng_state(rng_state)
+    return centers
+
+
+def _kernel_matrix(a, b, kernel='rbf', sigma=1.0):
+    if kernel == 'rbf':
+        a_norm = (a ** 2).sum(dim=1, keepdim=True)
+        b_norm = (b ** 2).sum(dim=1, keepdim=True).t()
+        dist2 = a_norm + b_norm - 2.0 * (a @ b.t())
+        dist2 = torch.clamp(dist2, min=0.0)
+        gamma = 1.0 / (2.0 * (sigma ** 2) + 1e-12)
+        return torch.exp(-gamma * dist2)
+    if kernel == 'cos':
+        a_n = F.normalize(a, dim=-1)
+        b_n = F.normalize(b, dim=-1)
+        return a_n @ b_n.t()
+    # dot
+    return a @ b.t()
+
+
 def zero_learning_classify(x, context_indices, context_labels, target_indices, num_classes, sim='cos',
-                           use_ridge=False, ridge_alpha=1.0):
+                           use_ridge=False, ridge_alpha=1.0,
+                           proto_per_class=1, proto_method='kmeans', proto_agg='max',
+                           proto_kmeans_iters=10, proto_seed=0,
+                           use_knn=False, knn_k=3, knn_weighting='uniform',
+                           use_kernel_ridge=False, kernel_type='rbf', kernel_sigma=1.0, kernel_ridge_alpha=1.0):
     """
     Zero-learning classification with prototypical networks or ridge regression.
 
@@ -632,6 +723,53 @@ def zero_learning_classify(x, context_indices, context_labels, target_indices, n
         use_ridge: Use ridge regression (closed-form solution)
         ridge_alpha: Regularization strength for ridge regression
     """
+
+    if use_knn:
+        support_x = x[context_indices]
+        target_x = x[target_indices]
+
+        if sim == 'cos':
+            support_n = F.normalize(support_x, dim=-1)
+            target_n = F.normalize(target_x, dim=-1)
+            sims = target_n @ support_n.t()
+        elif sim == 'tanimoto':
+            dot_product = target_x @ support_x.t()
+            target_norm_sq = (target_x ** 2).sum(dim=1, keepdim=True)
+            support_norm_sq = (support_x ** 2).sum(dim=1, keepdim=True).t()
+            sims = dot_product / (target_norm_sq + support_norm_sq - dot_product + 1e-8)
+        else:  # dot
+            sims = target_x @ support_x.t()
+
+        k = min(knn_k, support_x.size(0))
+        topk_sim, topk_idx = torch.topk(sims, k=k, dim=1)
+        labels = context_labels.long()
+        topk_labels = labels[topk_idx]  # [n_target, k]
+
+        if knn_weighting == 'uniform':
+            weights = torch.ones_like(topk_sim)
+        else:  # similarity
+            weights = torch.clamp(topk_sim, min=0.0)
+
+        logits = torch.zeros(target_x.size(0), num_classes, device=x.device)
+        for j in range(k):
+            logits.scatter_add_(1, topk_labels[:, j].unsqueeze(1), weights[:, j].unsqueeze(1))
+
+        return logits.argmax(dim=1), logits
+
+    if use_kernel_ridge:
+        support_x = x[context_indices]
+        target_x = x[target_indices]
+        if support_x.numel() == 0:
+            logits = torch.zeros(target_x.size(0), num_classes, device=x.device)
+            return logits.argmax(dim=1), logits
+
+        K = _kernel_matrix(support_x, support_x, kernel=kernel_type, sigma=kernel_sigma)
+        Y = F.one_hot(context_labels.long(), num_classes=num_classes).float()
+        I = torch.eye(K.size(0), device=x.device, dtype=K.dtype)
+        alpha = torch.linalg.solve(K + kernel_ridge_alpha * I, Y)
+        K_test = _kernel_matrix(target_x, support_x, kernel=kernel_type, sigma=kernel_sigma)
+        logits = K_test @ alpha
+        return logits.argmax(dim=1), logits
 
     if use_ridge:
         # Ridge Regression: solve W = (X^T X + λI)^{-1} X^T Y
@@ -655,34 +793,82 @@ def zero_learning_classify(x, context_indices, context_labels, target_indices, n
         return logits.argmax(dim=1), logits
 
     else:
-        # Prototypical Network: compute class prototypes then match
-        prototypes = torch.zeros(num_classes, x.size(1), device=x.device)
+        # Prototypical Network: single or multiple prototypes per class
+        target_x = x[target_indices]
 
+        if proto_per_class <= 1:
+            prototypes = torch.zeros(num_classes, x.size(1), device=x.device)
+            for c in range(num_classes):
+                mask = context_labels == c
+                if mask.any():
+                    class_features = x[context_indices[mask]]
+                    prototypes[c] = class_features.mean(dim=0)
+
+            if sim == 'cos':
+                target_norm = F.normalize(target_x, dim=-1)
+                proto_norm = F.normalize(prototypes, dim=-1)
+                logits = target_norm @ proto_norm.t()
+            elif sim == 'tanimoto':
+                dot_product = target_x @ prototypes.t()
+                target_norm_sq = (target_x ** 2).sum(dim=1, keepdim=True)
+                proto_norm_sq = (prototypes ** 2).sum(dim=1, keepdim=True).t()
+                logits = dot_product / (target_norm_sq + proto_norm_sq - dot_product + 1e-8)
+            else:
+                logits = target_x @ prototypes.t()
+
+            return logits.argmax(dim=1), logits
+
+        proto_list = []
+        proto_labels = []
         for c in range(num_classes):
             mask = context_labels == c
-            if mask.any():
-                class_features = x[context_indices[mask]]
-                # Mean pooling
-                prototypes[c] = class_features.mean(dim=0)
+            if not mask.any():
+                continue
+            class_features = x[context_indices[mask]]
+            k = min(proto_per_class, class_features.size(0))
 
-        target_x = x[target_indices]
+            if k == 1:
+                proto = class_features.mean(dim=0, keepdim=True)
+            elif proto_method == 'kcenter':
+                sel = _kcenter_indices(class_features, k, seed=proto_seed + c)
+                proto = class_features[sel]
+            else:
+                proto = _kmeans_prototypes(
+                    class_features, k, num_iters=proto_kmeans_iters,
+                    seed=proto_seed + c, use_cosine=(sim == 'cos')
+                )
+
+            proto_list.append(proto)
+            proto_labels.append(torch.full((proto.size(0),), c, device=x.device, dtype=torch.long))
+
+        if not proto_list:
+            logits = torch.zeros(target_x.size(0), num_classes, device=x.device)
+            return logits.argmax(dim=1), logits
+
+        prototypes = torch.cat(proto_list, dim=0)
+        proto_labels = torch.cat(proto_labels, dim=0)
 
         if sim == 'cos':
             target_norm = F.normalize(target_x, dim=-1)
             proto_norm = F.normalize(prototypes, dim=-1)
-            logits = target_norm @ proto_norm.t()
+            sim_mat = target_norm @ proto_norm.t()
         elif sim == 'tanimoto':
-            # Tanimoto kernel (Jaccard similarity for continuous features)
-            # T(A,B) = (A·B) / (||A||² + ||B||² - A·B)
-            # Compute pairwise Tanimoto similarity
-            dot_product = target_x @ prototypes.t()  # [n_target, n_classes]
-            target_norm_sq = (target_x ** 2).sum(dim=1, keepdim=True)  # [n_target, 1]
-            proto_norm_sq = (prototypes ** 2).sum(dim=1, keepdim=True).t()  # [1, n_classes]
+            dot_product = target_x @ prototypes.t()
+            target_norm_sq = (target_x ** 2).sum(dim=1, keepdim=True)
+            proto_norm_sq = (prototypes ** 2).sum(dim=1, keepdim=True).t()
+            sim_mat = dot_product / (target_norm_sq + proto_norm_sq - dot_product + 1e-8)
+        else:
+            sim_mat = target_x @ prototypes.t()
 
-            # Tanimoto similarity
-            logits = dot_product / (target_norm_sq + proto_norm_sq - dot_product + 1e-8)
-        else:  # dot product
-            logits = target_x @ prototypes.t()
+        logits = torch.full((target_x.size(0), num_classes), -1e9, device=x.device)
+        for c in range(num_classes):
+            idxs = (proto_labels == c).nonzero(as_tuple=True)[0]
+            if idxs.numel() == 0:
+                continue
+            if proto_agg == 'mean':
+                logits[:, c] = sim_mat[:, idxs].mean(dim=1)
+            else:
+                logits[:, c] = sim_mat[:, idxs].max(dim=1).values
 
         return logits.argmax(dim=1), logits
 
@@ -943,7 +1129,10 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
                  use_ridge=False, ridge_alpha=1.0, feature_norm='none', dataset_name='',
                  use_pca=False, pca_dim=128, use_full_pca=False, pca_preserve_norms=False, num_runs=1, seeds=None,
                  use_kmedoids=False, kmedoids_on_gcn=True, use_tta=False, tta_num_augmentations=5, tta_include_original=True,
-                 tta_aggregation='logits'):
+                 tta_aggregation='logits',
+                 proto_per_class=1, proto_method='kmeans', proto_agg='max', proto_kmeans_iters=10,
+                 use_knn=False, knn_k=3, knn_weighting='uniform',
+                 use_kernel_ridge=False, kernel_type='rbf', kernel_sigma=1.0, kernel_ridge_alpha=1.0):
     """Test zero-learning baseline on a dataset with multiple runs for averaging.
 
     Args:
@@ -959,6 +1148,17 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
         tta_num_augmentations: Number of augmented versions to create for TTA
         tta_include_original: Whether to include original features in TTA aggregation
         tta_aggregation: TTA aggregation method - 'logits' (average logits), 'probs' (average probabilities), 'voting' (majority vote)
+        proto_per_class: Number of prototypes per class (1 = standard prototypes)
+        proto_method: Prototype clustering method when proto_per_class > 1 ('kmeans' or 'kcenter')
+        proto_agg: How to aggregate multiple prototypes per class ('max' or 'mean')
+        proto_kmeans_iters: Number of k-means iterations for prototype clustering
+        use_knn: Use KNN classifier instead of prototypes/ridge
+        knn_k: Number of neighbors for KNN
+        knn_weighting: 'uniform' or 'similarity'
+        use_kernel_ridge: Use kernel ridge regression instead of prototypes/ridge
+        kernel_type: Kernel type for kernel ridge ('rbf', 'cos', 'dot')
+        kernel_sigma: RBF kernel bandwidth
+        kernel_ridge_alpha: Kernel ridge regularization strength
     """
 
     if seeds is None:
@@ -1063,6 +1263,7 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
             x_prop = gcn_propagate(x_ver, adj, num_hops=hops, method=prop_method, alpha=alpha,
                                    use_layer_norm=gcn_layer_norm)
             x_prop_versions.append(x_prop)
+    x_prop_base = x_prop_versions[0]
 
     # Loop over different seeds
     for run_idx, seed in enumerate(seeds):
@@ -1127,8 +1328,15 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
             all_logits_test = []
             all_preds = []
             for version_idx, x_prop in enumerate(x_prop_versions):
-                pred, logits = zero_learning_classify(x_prop, train_idx_device, context_y, test_idx_device, num_classes, sim,
-                                                      use_ridge=use_ridge, ridge_alpha=ridge_alpha)
+                pred, logits = zero_learning_classify(
+                    x_prop, train_idx_device, context_y, test_idx_device, num_classes, sim,
+                    use_ridge=use_ridge, ridge_alpha=ridge_alpha,
+                    proto_per_class=proto_per_class, proto_method=proto_method, proto_agg=proto_agg,
+                    proto_kmeans_iters=proto_kmeans_iters, proto_seed=seed,
+                    use_knn=use_knn, knn_k=knn_k, knn_weighting=knn_weighting,
+                    use_kernel_ridge=use_kernel_ridge, kernel_type=kernel_type,
+                    kernel_sigma=kernel_sigma, kernel_ridge_alpha=kernel_ridge_alpha
+                )
                 all_logits_test.append(logits)
                 all_preds.append(pred)
 
@@ -1170,8 +1378,15 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
         else:
             # Single version (no TTA)
             x_prop = x_prop_versions[0]
-            preds, _ = zero_learning_classify(x_prop, train_idx_device, context_y, test_idx_device, num_classes, sim,
-                                              use_ridge=use_ridge, ridge_alpha=ridge_alpha)
+            preds, _ = zero_learning_classify(
+                x_prop, train_idx_device, context_y, test_idx_device, num_classes, sim,
+                use_ridge=use_ridge, ridge_alpha=ridge_alpha,
+                proto_per_class=proto_per_class, proto_method=proto_method, proto_agg=proto_agg,
+                proto_kmeans_iters=proto_kmeans_iters, proto_seed=seed,
+                use_knn=use_knn, knn_k=knn_k, knn_weighting=knn_weighting,
+                use_kernel_ridge=use_kernel_ridge, kernel_type=kernel_type,
+                kernel_sigma=kernel_sigma, kernel_ridge_alpha=kernel_ridge_alpha
+            )
             base_acc = (preds == target_y).float().mean().item()
 
         # If C&S is enabled, try it and use if better
@@ -1181,7 +1396,12 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
                                                      torch.arange(data.num_nodes, device=device),
                                                      num_classes, sim,
                                                      use_ridge=use_ridge,
-                                                     ridge_alpha=ridge_alpha)
+                                                     ridge_alpha=ridge_alpha,
+                                                     proto_per_class=proto_per_class, proto_method=proto_method, proto_agg=proto_agg,
+                                                     proto_kmeans_iters=proto_kmeans_iters, proto_seed=seed,
+                                                     use_knn=use_knn, knn_k=knn_k, knn_weighting=knn_weighting,
+                                                     use_kernel_ridge=use_kernel_ridge, kernel_type=kernel_type,
+                                                     kernel_sigma=kernel_sigma, kernel_ridge_alpha=kernel_ridge_alpha)
             # Apply Correct & Smooth
             Y = correct_and_smooth(adj, base_logits, train_idx_device, context_y, num_classes,
                                    num_iters=cs_hops, alpha=cs_alpha)
@@ -1211,7 +1431,11 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
 
         if run_idx == 0 or num_runs <= 5:  # Print individual results for first run or if few runs
             method_str = f'{hops}-hop {prop_method} {sim.upper()}'
-            if use_ridge:
+            if use_knn:
+                method_str += f' + knn(k={knn_k},{knn_weighting})'
+            elif use_kernel_ridge:
+                method_str += f' + krr({kernel_type},σ={kernel_sigma},λ={kernel_ridge_alpha})'
+            elif use_ridge:
                 method_str += f' + ridge(α={ridge_alpha})'
             
             if use_cs:
@@ -1231,7 +1455,11 @@ def test_dataset(data, split_idx, num_classes, mode='full', k_shot=5, hops=2, si
     avg_final = sum(final_accs) / len(final_accs)
     
     method_str = f'{hops}-hop {prop_method} {sim.upper()}'
-    if use_ridge:
+    if use_knn:
+        method_str += f' + knn(k={knn_k},{knn_weighting})'
+    elif use_kernel_ridge:
+        method_str += f' + krr({kernel_type},σ={kernel_sigma},λ={kernel_ridge_alpha})'
+    elif use_ridge:
         method_str += f' + ridge(α={ridge_alpha})'
     
     if use_cs:
@@ -1252,7 +1480,8 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
                       use_pca=False, pca_dim=128, use_full_pca=False, pca_preserve_norms=False,
                       num_runs=1, seeds=None, pool_method='mean', gin_eps=0.0,
                       use_graph_cs=False, num_anchors=100, cs_k_neighbors=5, cs_num_iters=50, cs_alpha=0.5, weight_sharpening=1.0,
-                      use_pe=False):
+                      use_pe=False, use_knn=False, knn_k=3, knn_weighting='uniform',
+                      use_kernel_ridge=False, kernel_type='rbf', kernel_sigma=1.0, kernel_ridge_alpha=1.0):
     """Test zero-learning baseline on graph classification datasets with multiple runs for averaging.
 
     Args:
@@ -1446,7 +1675,10 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
                 # Base classification for this task
                 base_preds, base_logits = zero_learning_classify(
                     all_graph_emb, valid_context_indices, task_context_labels_filtered,
-                    valid_test_indices, num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha
+                    valid_test_indices, num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha,
+                    use_knn=use_knn, knn_k=knn_k, knn_weighting=knn_weighting,
+                    use_kernel_ridge=use_kernel_ridge, kernel_type=kernel_type,
+                    kernel_sigma=kernel_sigma, kernel_ridge_alpha=kernel_ridge_alpha
                 )
 
                 # Compute base metrics
@@ -1467,7 +1699,10 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
                     all_indices = torch.arange(len(all_graph_emb), device=device)
                     _, all_logits = zero_learning_classify(
                         all_graph_emb, valid_context_indices, task_context_labels_filtered,
-                        all_indices, num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha
+                        all_indices, num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha,
+                        use_knn=use_knn, knn_k=knn_k, knn_weighting=knn_weighting,
+                        use_kernel_ridge=use_kernel_ridge, kernel_type=kernel_type,
+                        kernel_sigma=kernel_sigma, kernel_ridge_alpha=kernel_ridge_alpha
                     )
 
                     # Apply C&S on the shared meta-graph
@@ -1516,7 +1751,10 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
             # Single-task classification - get base predictions
             base_preds, base_logits = zero_learning_classify(
                 all_graph_emb, context_indices, context_labels, test_indices,
-                num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha
+                num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha,
+                use_knn=use_knn, knn_k=knn_k, knn_weighting=knn_weighting,
+                use_kernel_ridge=use_kernel_ridge, kernel_type=kernel_type,
+                kernel_sigma=kernel_sigma, kernel_ridge_alpha=kernel_ridge_alpha
             )
 
             # Compute base accuracy and AUC
@@ -1569,7 +1807,10 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
                 all_indices = torch.arange(len(all_graph_emb), device=device)
                 _, all_logits = zero_learning_classify(
                     all_graph_emb, context_indices, context_labels, all_indices,
-                    num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha
+                    num_classes, sim, use_ridge=use_ridge, ridge_alpha=ridge_alpha,
+                    use_knn=use_knn, knn_k=knn_k, knn_weighting=knn_weighting,
+                    use_kernel_ridge=use_kernel_ridge, kernel_type=kernel_type,
+                    kernel_sigma=kernel_sigma, kernel_ridge_alpha=kernel_ridge_alpha
                 )
 
                 if run_idx == 0:
@@ -1622,7 +1863,11 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
 
         if run_idx == 0 or num_runs <= 5:
             method_str = f'{hops}-hop {prop_method} {pool_method}-pool {sim.upper()}'
-            if use_ridge:
+            if use_knn:
+                method_str += f' + knn(k={knn_k},{knn_weighting})'
+            elif use_kernel_ridge:
+                method_str += f' + krr({kernel_type},σ={kernel_sigma},λ={kernel_ridge_alpha})'
+            elif use_ridge:
                 method_str += f' + ridge(α={ridge_alpha})'
             print(f'    Run {run_idx+1}: {method_str}: Acc={acc:.4f} ({acc*100:.2f}%), AUC={auc:.4f}')
 
@@ -1633,7 +1878,11 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
     avg_auc = sum(aucs) / len(aucs)
 
     method_str = f'{hops}-hop {prop_method} {pool_method}-pool {sim.upper()}'
-    if use_ridge:
+    if use_knn:
+        method_str += f' + knn(k={knn_k},{knn_weighting})'
+    elif use_kernel_ridge:
+        method_str += f' + krr({kernel_type},σ={kernel_sigma},λ={kernel_ridge_alpha})'
+    elif use_ridge:
         method_str += f' + ridge(α={ridge_alpha})'
 
     print(f'  Average: {method_str}: Acc={avg_acc:.4f} ({avg_acc*100:.2f}%), AUC={avg_auc:.4f}')
@@ -1644,8 +1893,12 @@ def test_graph_dataset(dataset, split_idx, num_classes, mode='full', k_shot=5, h
 def main():
     parser = argparse.ArgumentParser(description='Zero-Learning Baseline Test')
     parser.add_argument('--datasets', type=str, nargs='+',
-                        default=['ogbg-molhiv', 'ogbg-moltox21', 'ogbg-molbace', 'ogbg-molbbbp', 'ogbg-molclintox', 'ogbg-molmuv', 'ogbg-molsider', 'ogbg-moltoxcast'],
-                        help='Datasets to test')
+                        default=['Actor', 'AirBrazil', 'AirEU', 'AirUS', 'AmzComp', 'AmzPhoto', 'AmzRatings',
+                                 'BlogCatalog', 'Chameleon', 'Citeseer', 'CoCS', 'CoPhysics', 'Cora', 'Cornell',
+                                 'DBLP', 'Deezer', 'LastFMAsia', 'Minesweeper', 'Pubmed', 'Questions', 'Reddit',
+                                 'Roman', 'Squirrel', 'Texas', 'Tolokers', 'Wiki', 'Wisconsin', 'WikiCS',
+                                 'ogbn-arxiv', 'ogbn-products', 'FullCora'],
+                        help='List of datasets to test')
     parser.add_argument('--mode', type=str, choices=['full', 'few-shot'], default='few-shot',
                         help='full-shot or few-shot mode')
     parser.add_argument('--k_shot', type=int, default=5,
@@ -1672,6 +1925,28 @@ def main():
                         help='Use ridge regression (closed-form linear classifier)')
     parser.add_argument('--ridge_alpha', type=float, default=0.1,
                         help='Regularization strength for ridge regression')
+    parser.add_argument('--use_knn', type=str2bool, default=False,
+                        help='Use KNN classifier instead of prototypes/ridge')
+    parser.add_argument('--knn_k', type=int, default=3,
+                        help='Number of neighbors for KNN')
+    parser.add_argument('--knn_weighting', type=str, default='uniform', choices=['uniform', 'similarity'],
+                        help='KNN weighting: uniform or similarity')
+    parser.add_argument('--use_kernel_ridge', type=str2bool, default=False,
+                        help='Use kernel ridge regression instead of prototypes/ridge')
+    parser.add_argument('--kernel_type', type=str, default='rbf', choices=['rbf', 'cos', 'dot'],
+                        help='Kernel type for kernel ridge')
+    parser.add_argument('--kernel_sigma', type=float, default=1.0,
+                        help='RBF kernel bandwidth')
+    parser.add_argument('--kernel_ridge_alpha', type=float, default=1.0,
+                        help='Kernel ridge regularization strength')
+    parser.add_argument('--proto_per_class', type=int, default=1,
+                        help='Number of prototypes per class (1 = standard prototypes)')
+    parser.add_argument('--proto_method', type=str, default='kmeans', choices=['kmeans', 'kcenter'],
+                        help='Prototype clustering method when proto_per_class > 1')
+    parser.add_argument('--proto_agg', type=str, default='max', choices=['max', 'mean'],
+                        help='How to aggregate multiple prototypes per class')
+    parser.add_argument('--proto_kmeans_iters', type=int, default=10,
+                        help='Number of k-means iterations for prototype clustering')
     parser.add_argument('--feature_norm', type=str, choices=['none', 'row', 'col', 'row+col'], default='none',
                         help='Feature normalization (row=L2 per node, col=standardize per feature)')
     parser.add_argument('--use_pca', type=str2bool, default=False,
@@ -1849,7 +2124,18 @@ def main():
                     use_tta=args.use_tta,
                     tta_num_augmentations=args.tta_num_augmentations,
                     tta_include_original=args.tta_include_original,
-                    tta_aggregation=args.tta_aggregation
+                    tta_aggregation=args.tta_aggregation,
+                    proto_per_class=args.proto_per_class,
+                    proto_method=args.proto_method,
+                    proto_agg=args.proto_agg,
+                    proto_kmeans_iters=args.proto_kmeans_iters,
+                    use_knn=args.use_knn,
+                    knn_k=args.knn_k,
+                    knn_weighting=args.knn_weighting,
+                    use_kernel_ridge=args.use_kernel_ridge,
+                    kernel_type=args.kernel_type,
+                    kernel_sigma=args.kernel_sigma,
+                    kernel_ridge_alpha=args.kernel_ridge_alpha
                 )
                 metric_name = 'acc'
 
@@ -1939,7 +2225,14 @@ def main():
                     cs_num_iters=args.cs_hops,
                     cs_alpha=args.cs_alpha,
                     weight_sharpening=args.weight_sharpening,
-                    use_pe=args.use_pe
+                    use_pe=args.use_pe,
+                    use_knn=args.use_knn,
+                    knn_k=args.knn_k,
+                    knn_weighting=args.knn_weighting,
+                    use_kernel_ridge=args.use_kernel_ridge,
+                    kernel_type=args.kernel_type,
+                    kernel_sigma=args.kernel_sigma,
+                    kernel_ridge_alpha=args.kernel_ridge_alpha
                 )
                 metric_name = 'auc'
 

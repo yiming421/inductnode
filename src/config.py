@@ -58,11 +58,11 @@ def parse_joint_training_args():
     parser.add_argument('--conv_type', type=str, default='GCN', choices=['GCN', 'SAGE', 'GAT', 'GIN'],
                        help='Convolution type for UnifiedGNN')
     parser.add_argument('--residual', type=float, default=1.0, help='Residual connection strength')
-    parser.add_argument('--linear', type=str2bool, default=False, help='Apply linear transformation after conv')
+    parser.add_argument('--linear', type=str2bool, default=True, help='Apply linear transformation after conv')
     parser.add_argument('--alpha', type=float, default=0.5, help='Alpha parameter for LightGCN')
     parser.add_argument('--exp', type=str2bool, default=False, help='Use exponential alpha weights')
     parser.add_argument('--gin_aggr', type=str, default='sum', choices=['sum', 'mean'], help='Aggregation for GIN')
-    parser.add_argument('--supports_edge_weight', type=str2bool, default=False, help='Whether model supports edge weights')
+    parser.add_argument('--supports_edge_weight', type=str2bool, default=True, help='Whether model supports edge weights')
     parser.add_argument('--no_parameters', type=str2bool, default=False, help='Use parameter-free convolutions')
     parser.add_argument('--input_norm', type=str2bool, default=False, help='Apply input normalization')
     
@@ -75,6 +75,8 @@ def parse_joint_training_args():
     parser.add_argument('--nc_batch_size', type=int, default=1024, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=32768, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=1024, help='Test batch size')
+    parser.add_argument('--unseen_test_context_samples', type=int, default=3,
+                        help='Average unseen NC test metrics over N random few-shot context resamples (>=1)')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
@@ -262,12 +264,6 @@ def parse_joint_training_args():
     parser.add_argument('--contrastive_loss_weight', type=float, default=0.1,
                        help='Weight for contrastive augmentation loss (multiplier for the loss term)')
 
-    # === Llama-based Transformer (Anisotropy Fix) ===
-    parser.add_argument('--use_llama_transformer', type=str2bool, default=False,
-                       help='Use Llama-based transformer (RMSNorm, SwiGLU, small init) to fix anisotropy. Reuses --nhead and --ffn_expansion_ratio')
-    parser.add_argument('--llama_disable_rope', type=str2bool, default=True,
-                       help='Disable RoPE positional encoding in Llama (True=no PE, False=use RoPE to break symmetry)')
-
     # === Bank of Tags (VQ-VAE Style Fixed Tags) ===
     parser.add_argument('--use_bank_of_tags', type=str2bool, default=False,
                        help='Use fixed random orthogonal Bank of Tags instead of learned class prototypes (like VQ-VAE codebook for class labels)')
@@ -394,8 +390,6 @@ def parse_joint_training_args():
                        help='Context sampling strategy: ori=original fixed, random=random sampling, decay=gradual decay')
     parser.add_argument('--context_bounds', type=str, default='(5,20)(5,20)(5,20)',
                        help='Context bounds for NC/LP/GC: (lower,upper)(lower,upper)(lower,upper). Used for random sampling range and decay start/end.')
-    parser.add_argument('--use_kmedoids_sampling', type=str2bool, default=False,
-                       help='Use K-Medoids clustering to guide context sampling for better representativeness')
 
     # === GraphCL (Graph Contrastive Learning) ===
     parser.add_argument('--enable_graphcl', type=str2bool, default=False,

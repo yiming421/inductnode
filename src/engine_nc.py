@@ -256,33 +256,6 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
         score, class_h = pred(data, context_h, target_h, context_y, class_h)
 
-        # Log Llama diagnostics if available (for monitoring anisotropy, attention, etc.)
-        if hasattr(pred, 'get_diagnostics') and rank == 0 and batch_idx == 0:
-            diag = pred.get_diagnostics()
-            if diag is not None:
-                import wandb
-                if wandb.run is not None:
-                    # Add epoch prefix to metrics
-                    diag_with_prefix = {f"llama/{k}": v for k, v in diag.items()}
-                    wandb.log(diag_with_prefix, step=epoch)
-
-                # Print key metrics
-                print(f"\n[LLAMA DIAGNOSTICS - Epoch {epoch}, Batch {batch_idx}]")
-                print(f"  Anisotropy: mean_dom={diag.get('anisotropy/mean_dominance', 'N/A'):.4f} "
-                      f"(input={diag.get('anisotropy/input_mean_dominance', 'N/A'):.4f}, "
-                      f"delta={diag.get('anisotropy/delta_mean_dominance', 'N/A'):.4f})")
-                if 'attention/layer_0_avg_entropy' in diag:
-                    print(f"  Attention entropy (layer 0): {diag['attention/layer_0_avg_entropy']:.4f} (1.0=uniform, 0.0=selective)")
-                # Check if transformer is bypassed
-                delta_ratio = diag.get('transformer/delta_ratio', None)
-                input_output_cos = diag.get('transformer/input_output_cosine', None)
-                if delta_ratio is not None:
-                    bypass_warning = " ⚠️ BYPASSED!" if delta_ratio < 0.05 else ""
-                    print(f"  Transformer delta: {delta_ratio:.4f} (||Δ||/||x||){bypass_warning}")
-                if input_output_cos is not None:
-                    identity_warning = " ⚠️ IDENTITY!" if input_output_cos > 0.95 else ""
-                    print(f"  Input→Output cosine: {input_output_cos:.4f}{identity_warning}")
-
         # Compute contrastive augmentation loss if enabled
         # This compares Transformer-generated embeddings from original vs augmented features
         contrastive_loss = torch.tensor(0.0, device=score.device)

@@ -14,8 +14,6 @@ import signal
 import psutil
 import numpy as np
 from contextlib import contextmanager, nullcontext
-from sknetwork.ranking import PageRank
-from torch_geometric.utils import to_scipy_sparse_matrix
 
 # Add the project root to the Python path
 project_root = os.path.abspath(os.path.dirname(__file__))
@@ -510,135 +508,6 @@ def parse_context_bounds(bounds_string):
     return bounds
 
 
-def filter_candidates_with_pagerank(data, candidate_indices, max_candidates):
-    """
-    Efficiently filter candidate nodes using PageRank on the original graph.
-    
-    Args:
-        data: Graph data object with adjacency information
-        candidate_indices: Tensor of candidate node indices
-        max_candidates (int): Maximum number of candidates to keep
-        
-    Returns:
-        torch.Tensor: Filtered candidate indices based on PageRank scores
-    """
-    if len(candidate_indices) <= max_candidates:
-        return candidate_indices
-    
-    device = candidate_indices.device
-    
-    # Convert to SciPy sparse matrix
-    row, col, _ = data.adj_t.coo()  # torch_sparse.SparseTensor.coo() returns (row, col, values)
-    edge_index = torch.stack([row, col], dim=0)
-    adj = to_scipy_sparse_matrix(edge_index, num_nodes=data.x.shape[0])
-    
-    # Compute PageRank using scikit-network
-    pagerank = PageRank()
-    pagerank.fit(adj)
-    scores = pagerank.scores_
-    
-    # Extract scores for candidates using direct numpy indexing
-    candidate_nodes = candidate_indices.cpu().numpy()
-    candidate_scores = scores[candidate_nodes]
-    
-    # Use simple argsort for sorting (descending order)
-    top_k_indices = np.argsort(candidate_scores)[-max_candidates:][::-1]
-    top_candidates = candidate_nodes[top_k_indices]
-    
-    # Convert back to tensor
-    filtered_candidates = torch.tensor(top_candidates, dtype=torch.long, device=device)
-    
-    print(f"[PageRank] Filtered {len(candidate_indices)} candidates to {len(filtered_candidates)} using PageRank")
-    return filtered_candidates
-
-
-def sample_context_with_kmedoids(data, k_shot, train_indices, use_kmedoids=False, random_state=None):
-    """
-    Sample context nodes using K-Medoids clustering for better representativeness.
-    
-    Args:
-        data: Graph data object with node features and labels
-        k_shot (int): Number of context samples per class
-        train_indices: Training node indices
-        use_kmedoids (bool): Whether to use K-Medoids clustering
-        random_state (int): Random seed
-        
-    Returns:
-        context_sample (torch.Tensor): Indices of selected context nodes
-    """
-    if not use_kmedoids:
-        # Fallback to original random sampling
-        from src.data_utils import select_k_shot_context
-        return select_k_shot_context(data, k_shot, train_indices)
-    
-    try:
-        from sklearn_extra.cluster import KMedoids
-    except ImportError:
-        print("[K-Medoids] scikit-learn-extra not available, falling back to random sampling")
-        from src.data_utils import select_k_shot_context
-        return select_k_shot_context(data, k_shot, train_indices)
-    
-    device = data.x.device
-    context_samples = []
-    
-    # Get unique classes
-    unique_classes = data.y.unique()
-    
-    for class_label in unique_classes:
-        # Get training nodes for this class
-        class_mask = data.y == class_label
-        class_train_mask = torch.zeros_like(data.y, dtype=torch.bool)
-        class_train_mask[train_indices] = True
-        
-        # Find intersection: nodes that are both in this class and in training set
-        class_train_nodes = torch.where(class_mask & class_train_mask)[0]
-        
-        if len(class_train_nodes) == 0:
-            continue
-            
-        if len(class_train_nodes) <= k_shot:
-            # If we have fewer nodes than k_shot, take all of them
-            context_samples.append(class_train_nodes)
-        else:
-            # Check if candidate pool is too large (>10x k_shot)
-            if len(class_train_nodes) > 10 * k_shot:
-                # Use PageRank to pre-filter candidates
-                max_candidates = 10 * k_shot
-                class_train_nodes = filter_candidates_with_pagerank(data, class_train_nodes, max_candidates)
-            
-            # Use K-Medoids clustering to find representative nodes for this class
-            class_features = data.x[class_train_nodes].detach().cpu().numpy()
-            
-            # Apply K-Medoids clustering
-            n_clusters = min(k_shot, len(class_train_nodes))
-            kmedoids = KMedoids(
-                n_clusters=n_clusters,
-                metric='cosine',  # Use cosine distance for node features
-                init='k-medoids++',  # Smart initialization
-                max_iter=100,
-                random_state=random_state
-            )
-            
-            kmedoids.fit(class_features)
-            medoid_indices_in_class = kmedoids.medoid_indices_
-            
-            # Map medoid indices back to original node indices
-            selected_nodes = class_train_nodes[medoid_indices_in_class]
-            context_samples.append(selected_nodes)
-    
-    if not context_samples:
-        # Fallback if no samples found
-        from src.data_utils import select_k_shot_context
-        return select_k_shot_context(data, k_shot, train_indices)
-    
-    # Concatenate all context samples
-    context_sample = torch.cat(context_samples, dim=0)
-    
-    print(f"[K-Medoids] Sampled {len(context_sample)} context nodes using clustering (target: {k_shot} per class)")
-    
-    return context_sample
-
-
 def resolve_context_shots(dataset_name, task_type, args, epoch=None):
     """
     Resolve context shots for a specific dataset and task using the configured sampling plan.
@@ -755,23 +624,12 @@ def refresh_nc_contexts(nc_data, args=None, epoch=None):
                 # Fallback to original behavior: get current context size
                 current_context_size = len(data.context_sample) // len(data.y.unique())
             
-            # Check if K-Medoids sampling is enabled
-            use_kmedoids = getattr(args, 'use_kmedoids_sampling', False) if args is not None else False
-            
-            if use_kmedoids:
-                # Use K-Medoids clustering for context sampling
-                new_context_sample = sample_context_with_kmedoids(
-                    data, current_context_size, split_idx['train'], 
-                    use_kmedoids=True, random_state=epoch
-                )
-            else:
-                # Use original random sampling
-                from src.data_utils import select_k_shot_context
-                new_context_sample = select_k_shot_context(data, current_context_size, split_idx['train'])
+            # Use original random sampling
+            from src.data_utils import select_k_shot_context
+            new_context_sample = select_k_shot_context(data, current_context_size, split_idx['train'])
             
             data.context_sample = new_context_sample.to(data.context_sample.device)
-            sampling_method = "K-Medoids clustering" if use_kmedoids else "random sampling"
-            print(f"    ✓ Refreshed {data.name}: {len(new_context_sample)} context samples ({current_context_size} per class, {sampling_method})")
+            print(f"    ✓ Refreshed {data.name}: {len(new_context_sample)} context samples ({current_context_size} per class, random sampling)")
 
             # Reprocess data with GraphPFN if enabled
             if args is not None and getattr(args, 'use_graphpfn', False):
@@ -1172,63 +1030,30 @@ def create_unified_model(args, input_dim, device):
               f"nlayers={graphpfn_config.nlayers}, features_per_group={graphpfn_config.features_per_group}")
         print(f"GraphPFN PE mode: {graphpfn_config.feature_positional_embedding}")
     elif args.predictor == 'PFN':
-        # Check if we should use Llama-based transformer
-        if getattr(args, 'use_llama_transformer', False):
-            from src.model_llama import LlamaPFNPredictorNodeCls
-            predictor = LlamaPFNPredictorNodeCls(
-                hidden_dim=hidden,
-                nhead=args.nhead,  # Legacy parameter (not used, llama_num_heads used instead)
-                num_layers=args.transformer_layers,
-                mlp_layers=args.mlp_layers,  # Legacy parameter (not used in Llama)
-                dropout=args.dp,
-                norm=args.norm,
-                degree=args.seperate,
-                att=None,  # Will be set later if needed
-                mlp=None,  # Will be set later if needed
-                sim=args.sim,  # Legacy parameter
-                norm_affine=args.mlp_norm_affine,
-                normalize=args.normalize_class_h,
-                # Node classification ridge regression
-                nc_sim=args.nc_sim,
-                nc_ridge_alpha=args.nc_ridge_alpha,
-                head_num_layers=getattr(args, 'head_num_layers', 2),
-                # Llama-specific parameters (reuse existing args)
-                llama_num_heads=args.nhead,
-                llama_intermediate_size=hidden * getattr(args, 'ffn_expansion_ratio', 4),
-                disable_rope=getattr(args, 'llama_disable_rope', True),
-                # Token formulation parameters
-                skip_token_formulation=getattr(args, 'skip_token_formulation', False),
-                use_full_embedding=getattr(args, 'use_full_embedding', False),
-                use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
-                # Bank of Tags parameters
-                use_bank_of_tags=getattr(args, 'use_bank_of_tags', False),
-                bank_of_tags_max_classes=getattr(args, 'bank_of_tags_max_classes', 200),
-            )
-        else:
-            # Original PFN predictor
-            predictor = PFNPredictorNodeCls(
-                hidden, args.nhead, args.transformer_layers, args.mlp_layers,
-                args.dp, args.norm, args.seperate, False, None, None, args.sim,
-                args.padding, args.mlp_norm_affine, args.normalize_class_h,
-                use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
-                use_full_embedding=getattr(args, 'use_full_embedding', False),
-                norm_type=getattr(args, 'transformer_norm_type', 'post'),
-                ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4),
-                use_matching_network=getattr(args, 'use_matching_network', False),
-                matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
-                matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
-                matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
-                # Task-specific ridge regression configuration
-                nc_sim=args.nc_sim,  # Use explicit config values (have proper defaults)
-                nc_ridge_alpha=args.nc_ridge_alpha,
-                lp_sim=args.lp_sim,
-                lp_ridge_alpha=args.lp_ridge_alpha,
-                gc_sim=args.gc_sim,
-                gc_ridge_alpha=args.gc_ridge_alpha,
-                head_num_layers=getattr(args, 'head_num_layers', 2),
-                # NEW: Skip token formulation option
-                skip_token_formulation=getattr(args, 'skip_token_formulation', False)
-            )
+        # Original PFN predictor
+        predictor = PFNPredictorNodeCls(
+            hidden, args.nhead, args.transformer_layers, args.mlp_layers,
+            args.dp, args.norm, args.seperate, False, None, None, args.sim,
+            args.padding, args.mlp_norm_affine, args.normalize_class_h,
+            use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
+            use_full_embedding=getattr(args, 'use_full_embedding', False),
+            norm_type=getattr(args, 'transformer_norm_type', 'post'),
+            ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4),
+            use_matching_network=getattr(args, 'use_matching_network', False),
+            matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
+            matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
+            matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
+            # Task-specific ridge regression configuration
+            nc_sim=args.nc_sim,  # Use explicit config values (have proper defaults)
+            nc_ridge_alpha=args.nc_ridge_alpha,
+            lp_sim=args.lp_sim,
+            lp_ridge_alpha=args.lp_ridge_alpha,
+            gc_sim=args.gc_sim,
+            gc_ridge_alpha=args.gc_ridge_alpha,
+            head_num_layers=getattr(args, 'head_num_layers', 2),
+            # NEW: Skip token formulation option
+            skip_token_formulation=getattr(args, 'skip_token_formulation', False)
+        )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
     
@@ -1431,12 +1256,6 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                         args=args
                     )
 
-                if getattr(args, 'use_kmedoids_sampling', False):
-                    new_context_sample = sample_context_with_kmedoids(
-                        data, args.context_num, split_idx['train'], use_kmedoids=True, random_state=args.seed
-                    )
-                    data.context_sample = new_context_sample.to(data.context_sample.device)
-
                 # Move processed tensors back to CPU to free GPU memory until training uses them
                 move_nc_tensors_to_cpu(data, split_idx)
 
@@ -1480,12 +1299,6 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                     use_orthogonal_noise=args.use_orthogonal_noise,
                     args=args
                 )
-
-            if getattr(args, 'use_kmedoids_sampling', False):
-                new_context_sample = sample_context_with_kmedoids(
-                    data, context_shots, split_idx['train'], use_kmedoids=True, random_state=args.seed
-                )
-                data.context_sample = new_context_sample.to(data.context_sample.device)
 
             # Move processed tensors back to CPU to free GPU memory until evaluation
             move_nc_tensors_to_cpu(data, split_idx)
@@ -1556,6 +1369,7 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                     if hasattr(data, 'context_sample') and data.context_sample is not None:
                         data.context_sample = data.context_sample.to(original_x_device)
                         print(f"[MEMORY_FIX] Moved {data.name} context_sample back to CPU")
+
                     
                     print(f"[MEMORY_FIX] Moved {data.name} processed features back to CPU")
                     
@@ -1611,6 +1425,7 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 if hasattr(data, 'context_sample') and data.context_sample is not None:
                     data.context_sample = data.context_sample.to(original_x_device)
                     print(f"[MEMORY_FIX] Moved {data.name} context_sample back to CPU")
+
                 
                 print(f"[MEMORY_FIX] Moved {data.name} processed features back to CPU")
                 
@@ -1963,7 +1778,13 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
             # Regenerate augmented data and recreate loaders at specified intervals
             augmentation_interval = getattr(args, 'augmentation_regenerate_interval', 1)
-            should_regenerate = (epoch >= 0 and epoch % augmentation_interval == 0)  # Changed to >= 0 to force at epoch 0
+            
+            if augmentation_mode == 'preprocessing':
+                # Preprocessing mode: only regenerate at epoch 0 (one-time generation)
+                should_regenerate = (epoch == 0)
+            else:
+                # Per-epoch mode: regenerate at intervals
+                should_regenerate = (epoch >= 0 and epoch % augmentation_interval == 0)
 
             if use_augmentation and augmentation_mode in ('per_epoch', 'preprocessing') and should_regenerate:
                 print(f"\n{'='*80}")
@@ -2436,32 +2257,87 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
 
                 # Check if TTA is enabled for final test evaluation
                 use_tta = getattr(args, 'use_test_time_augmentation', False)
+                num_context_samples = max(1, int(getattr(args, 'unseen_test_context_samples', 1)))
+                if num_context_samples > 1:
+                    print(f"  Averaging test metrics over {num_context_samples} random context resamples")
+
+                def _average_metric_lists(metric_lists):
+                    if not metric_lists:
+                        return []
+                    if not isinstance(metric_lists[0], (list, tuple)):
+                        return sum(metric_lists) / len(metric_lists)
+                    num_items = len(metric_lists[0])
+                    avg = []
+                    for i in range(num_items):
+                        vals = [ml[i] for ml in metric_lists if len(ml) > i]
+                        avg.append(sum(vals) / len(vals) if vals else 0.0)
+                    return avg
 
                 # Use inductive evaluation for unseen datasets
-                # Use GraphPFN engine if enabled
-                if getattr(args, 'use_graphpfn', False):
-                    from src.engine_nc_graphpfn import test_all_induct_graphpfn
-                    train_metrics, valid_metrics, test_metrics = test_all_induct_graphpfn(
-                        model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                        projector, 0, identity_projection, None, args=args
-                    )
-                elif use_tta:
-                    # Use TTA for final test evaluation
-                    from src.engine_nc import test_all_induct_with_tta
-                    train_metrics, valid_metrics, test_metrics = test_all_induct_with_tta(
-                        model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
-                        False, None, None, True, projector, 0, identity_projection, None,
-                        use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha,
-                        args=args
-                    )
-                else:
+                def _run_eval_once():
+                    # Use GraphPFN engine if enabled
+                    if getattr(args, 'use_graphpfn', False):
+                        from src.engine_nc_graphpfn import test_all_induct_graphpfn
+                        return test_all_induct_graphpfn(
+                            model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                            projector, 0, identity_projection, None, args=args
+                        )
+                    if use_tta:
+                        # Use TTA for final test evaluation
+                        from src.engine_nc import test_all_induct_with_tta
+                        return test_all_induct_with_tta(
+                            model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
+                            False, None, None, True, projector, 0, identity_projection, None,
+                            use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha,
+                            args=args
+                        )
                     # Standard evaluation without TTA
-                    train_metrics, valid_metrics, test_metrics = test_all_induct(
+                    return test_all_induct(
                         model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
                         False, None, None, True, projector, 0, identity_projection, None,
                         use_cs=args.use_cs, cs_num_iters=args.cs_num_iters, cs_alpha=args.cs_alpha,
                         args=args, epoch=epoch
                     )
+
+                if num_context_samples == 1:
+                    train_metrics, valid_metrics, test_metrics = _run_eval_once()
+                else:
+                    from src.data_utils import select_k_shot_context
+                    original_contexts = []
+                    for data in nc_data_list:
+                        ctx = data.context_sample.clone() if hasattr(data, 'context_sample') and data.context_sample is not None else None
+                        original_contexts.append(ctx)
+
+                    all_train_metrics = []
+                    all_valid_metrics = []
+                    all_test_metrics = []
+
+                    base_seed = int(getattr(args, 'seed', 42))
+                    for sample_idx in range(num_context_samples):
+                        torch.manual_seed(base_seed + sample_idx)
+                        for data, split_idx in zip(nc_data_list, nc_split_idx_list):
+                            context_shots = resolve_context_shots(data.name, 'nc', args, epoch=None)
+                            if len(split_idx['train']) > 0:
+                                context_source_split = split_idx['train']
+                            else:
+                                context_source_split = split_idx['test']
+                            context_source_split = context_source_split.to(data.y.device)
+                            new_context = select_k_shot_context(data, context_shots, context_source_split)
+                            data.context_sample = new_context.to(data.y.device)
+
+                        train_m, valid_m, test_m = _run_eval_once()
+                        all_train_metrics.append(train_m)
+                        all_valid_metrics.append(valid_m)
+                        all_test_metrics.append(test_m)
+
+                    # Restore original contexts
+                    for data, ctx in zip(nc_data_list, original_contexts):
+                        if ctx is not None:
+                            data.context_sample = ctx.to(data.y.device)
+
+                    train_metrics = _average_metric_lists(all_train_metrics)
+                    valid_metrics = _average_metric_lists(all_valid_metrics)
+                    test_metrics = _average_metric_lists(all_test_metrics)
 
                 datasets_time = time.time() - datasets_start_time
                 tta_suffix = " (with TTA)" if use_tta else ""
@@ -2567,6 +2443,12 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
     predictor.eval()
     
     results = {}
+
+    num_context_samples = 1
+    if split == 'test':
+        num_context_samples = max(1, int(getattr(args, 'unseen_test_context_samples', 1)))
+        if num_context_samples > 1:
+            print(f"  Averaging LP test metrics over {num_context_samples} random context resamples")
     
     # Initialize tracker if needed
     if lp_tracker is None:
@@ -2598,13 +2480,35 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                         
                         # Record memory before evaluation
                         lp_tracker.record_memory()
-                        
-                        lp_results = evaluate_link_prediction(
-                            model, predictor, data, link_data_all[split_key], context_data,
-                            args.test_batch_size, None, None, None, identity_projection,
-                            0, True, degree=False, k_values=[20, 50, 100],
-                            use_full_adj_for_test=True, lp_metric=args.lp_metric
-                        )
+
+                        def _eval_with_context(context_edges):
+                            lp_results = evaluate_link_prediction(
+                                model, predictor, data, link_data_all[split_key], context_edges,
+                                args.test_batch_size, None, None, None, identity_projection,
+                                0, True, degree=False, k_values=[20, 50, 100],
+                                use_full_adj_for_test=True, lp_metric=args.lp_metric
+                            )
+                            return lp_results.get('default_metric', 0.0)
+
+                        if num_context_samples == 1:
+                            lp_metric_value = _eval_with_context(context_data)
+                        else:
+                            context_source = link_data_all.get('train', None)
+                            context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
+                            base_seed = int(getattr(args, 'seed', 42))
+                            sample_metrics = []
+                            for sample_idx in range(num_context_samples):
+                                torch.manual_seed(base_seed + i * 1000 + sample_idx)
+                                if context_source is not None and context_source['edge_pairs'].size(0) > 0:
+                                    context_data_sample, _ = select_link_context(
+                                        context_source, context_shots, args.context_neg_ratio, False
+                                    )
+                                else:
+                                    context_data_sample = context_data
+
+                                sample_metrics.append(_eval_with_context(context_data_sample))
+
+                            lp_metric_value = sum(sample_metrics) / len(sample_metrics) if sample_metrics else 0.0
                         
                         # Move all data back to CPU to free GPU memory
                         data.x = data.x.cpu()
@@ -2623,7 +2527,7 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                         
                         lp_tracker.operation_counts['evaluation_steps'] += 1
                         
-                    lp_results_list.append(lp_results.get('default_metric', 0.0))
+                    lp_results_list.append(lp_metric_value)
                 else:
                     lp_results_list.append(0.0)
             
