@@ -2077,6 +2077,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
         # Check if multi-dataset sampling is enabled
         use_multi_dataset_sampling = getattr(args, 'multi_dataset_sampling', False)
+        use_gc_vectorized = getattr(args, 'gc_multitask_vectorized', False)
 
         if use_multi_dataset_sampling:
             # NEW: Multi-dataset sampling with temperature
@@ -2122,42 +2123,68 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
                 gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_splits_loaded")
 
-                # Train on each task separately using prefiltered data
-                for task_idx, task_splits in task_filtered_splits.items():
-                    gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_task_{task_idx}_start")
-
-                    # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
+                # Vectorized multi-task path (e.g., PCBA) if enabled
+                sample_graph = dataset_info['dataset'][0]
+                is_multitask = sample_graph.y.numel() > 1
+                if use_gc_vectorized and is_multitask:
+                    # Create unfiltered data loaders once (no task filtering)
                     use_index_tracking = ('fug_mapping' in dataset_info or
-                                        'tsgfm_mapping' in dataset_info or
-                                        'tag_mapping' in dataset_info)
-
-                    # Create task-specific data loaders
-                    task_data_loaders = create_data_loaders(
+                                          'tsgfm_mapping' in dataset_info or
+                                          'tag_mapping' in dataset_info)
+                    unfiltered_loaders = create_data_loaders(
                         dataset_info['dataset'],
-                        task_splits,
+                        dataset_info['split_idx'],
                         batch_size=args.gc_batch_size,
                         shuffle=True,
-                        task_idx=task_idx,
+                        task_idx=None,
                         use_index_tracking=use_index_tracking
                     )
-
-                    # Track memory before graph classification training
-                    gc_tracker.log_memory(f"gc_task_{task_idx}_training_start")
-
-                    # Train on this specific task
-                    task_loss = train_graph_classification_single_task(
-                        model, predictor, dataset_info, task_data_loaders, opt_gc, task_idx,
+                    from src.engine_gc import train_graph_classification_multitask_vectorized
+                    dataset_loss = train_graph_classification_multitask_vectorized(
+                        model, predictor, dataset_info, unfiltered_loaders, opt_gc,
                         pooling_method=args.graph_pooling, device=device,
                         clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
                         normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
-                        lambda_=args.lambda_gc
+                        args=args, lambda_=args.lambda_gc
                     )
+                    dataset_tasks = 1
+                else:
+                    # Train on each task separately using prefiltered data
+                    for task_idx, task_splits in task_filtered_splits.items():
+                        gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_task_{task_idx}_start")
 
-                    # Track memory after graph classification training
-                    gc_tracker.log_memory(f"gc_task_{task_idx}_training_complete")
+                        # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
+                        use_index_tracking = ('fug_mapping' in dataset_info or
+                                            'tsgfm_mapping' in dataset_info or
+                                            'tag_mapping' in dataset_info)
 
-                    dataset_loss += task_loss
-                    dataset_tasks += 1
+                        # Create task-specific data loaders
+                        task_data_loaders = create_data_loaders(
+                            dataset_info['dataset'],
+                            task_splits,
+                            batch_size=args.gc_batch_size,
+                            shuffle=True,
+                            task_idx=task_idx,
+                            use_index_tracking=use_index_tracking
+                        )
+
+                        # Track memory before graph classification training
+                        gc_tracker.log_memory(f"gc_task_{task_idx}_training_start")
+
+                        # Train on this specific task
+                        task_loss = train_graph_classification_single_task(
+                            model, predictor, dataset_info, task_data_loaders, opt_gc, task_idx,
+                            pooling_method=args.graph_pooling, device=device,
+                            clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
+                            normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
+                            lambda_=args.lambda_gc
+                        )
+
+                        # Track memory after graph classification training
+                        gc_tracker.log_memory(f"gc_task_{task_idx}_training_complete")
+
+                        dataset_loss += task_loss
+                        dataset_tasks += 1
 
                 # Track memory after processing all tasks for this dataset
                 gc_tracker.log_memory(f"gc_dataset_{dataset_idx}_all_tasks_complete")
@@ -2588,121 +2615,163 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     task_filtered_splits = dataset_info['task_filtered_splits_test_only']
                 else:
                     task_filtered_splits = dataset_info['task_filtered_splits']
-                
+
                 # Evaluate each task separately and aggregate results
                 task_results = []
-                
+
                 tasks_start_time = time.time()
-                print(f"    Dataset {dataset_idx} ({dataset_name}): Processing {len(task_filtered_splits)} tasks...")
-                
-                for task_idx, task_splits in task_filtered_splits.items():
-                    task_start_time = time.time()
-                    
-                    # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
-                    setup_start_time = time.time()
+
+                sample_graph = dataset_info['dataset'][0]
+                is_multitask = sample_graph.y.numel() > 1
+                if is_multitask and getattr(args, 'gc_multitask_vectorized', False):
+                    print(f"    Dataset {dataset_idx} ({dataset_name}): Vectorized multi-task evaluation")
+                    from src.engine_gc import evaluate_graph_classification_multitask_vectorized
                     use_index_tracking = ('fug_mapping' in dataset_info or 
-                                        'tsgfm_mapping' in dataset_info or 
-                                        'tag_mapping' in dataset_info)
-                    
-                    # Create task-specific data loaders for evaluation
-                    dataloader_start_time = time.time()
+                                          'tsgfm_mapping' in dataset_info or 
+                                          'tag_mapping' in dataset_info)
+
                     if split == 'test':
-                        # Only use test split for unseen datasets
-                        test_only_splits = {'test': task_splits['test']}
+                        test_only_splits = {'test': dataset_info['split_idx']['test']}
                         task_eval_loaders = create_data_loaders(
-                            dataset_info['dataset'], 
+                            dataset_info['dataset'],
                             test_only_splits,
                             batch_size=args.gc_test_batch_size,
                             shuffle=False,
-                            task_idx=task_idx,
+                            task_idx=None,
                             use_index_tracking=use_index_tracking
                         )
                     else:
-                        # Use all splits for seen datasets
                         task_eval_loaders = create_data_loaders(
-                            dataset_info['dataset'], 
-                            task_splits,
+                            dataset_info['dataset'],
+                            dataset_info['split_idx'],
                             batch_size=args.gc_test_batch_size,
                             shuffle=False,
-                            task_idx=task_idx,
+                            task_idx=None,
                             use_index_tracking=use_index_tracking
                         )
+
+                    task_eval_results = evaluate_graph_classification_multitask_vectorized(
+                        model, predictor, dataset_info, task_eval_loaders,
+                        pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
+                        normalize_class_h=args.normalize_class_h, dataset_name=dataset_name,
+                        identity_projection=identity_projection, args=args
+                    )
+
+                    result_key = 'val' if split == 'valid' else split
+                    split_result = task_eval_results.get(result_key, 0.0)
+                    task_results.append(split_result)
+                else:
+                    print(f"    Dataset {dataset_idx} ({dataset_name}): Processing {len(task_filtered_splits)} tasks...")
+
+                    for task_idx, task_splits in task_filtered_splits.items():
+                        task_start_time = time.time()
                     
-                    dataloader_time = time.time() - dataloader_start_time
+                    # Check if any embedding mapping is present to use index tracking (FUG, TSGFM, TAGDataset)
+                        setup_start_time = time.time()
+                        use_index_tracking = ('fug_mapping' in dataset_info or 
+                                            'tsgfm_mapping' in dataset_info or 
+                                            'tag_mapping' in dataset_info)
+                    
+                    # Create task-specific data loaders for evaluation
+                        dataloader_start_time = time.time()
+                        if split == 'test':
+                            # Only use test split for unseen datasets
+                            test_only_splits = {'test': task_splits['test']}
+                            task_eval_loaders = create_data_loaders(
+                                dataset_info['dataset'], 
+                                test_only_splits,
+                                batch_size=args.gc_test_batch_size,
+                                shuffle=False,
+                                task_idx=task_idx,
+                                use_index_tracking=use_index_tracking
+                            )
+                        else:
+                            # Use all splits for seen datasets
+                            task_eval_loaders = create_data_loaders(
+                                dataset_info['dataset'], 
+                                task_splits,
+                                batch_size=args.gc_test_batch_size,
+                                shuffle=False,
+                                task_idx=task_idx,
+                                use_index_tracking=use_index_tracking
+                            )
+                        
+                        dataloader_time = time.time() - dataloader_start_time
                     
                     # Debug: Check profiling setting
-                    profiling_enabled = getattr(args, 'enable_profiling', False)
-                    
-                    if gc_tracker:
-                        gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_before_eval")
-                    
-                    # Per-task profiling if enabled
-                    eval_start_time = time.time()
-                    if profiling_enabled:
-                        from torch.profiler import profile, record_function, ProfilerActivity
-                        prof = profile(
-                            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                            record_shapes=True,
-                            profile_memory=True,
-                            with_stack=True
-                        )
-                        prof.start()
-                        with record_function(f"gc_eval_{dataset_name}_task_{task_idx}"):
+                        profiling_enabled = getattr(args, 'enable_profiling', False)
+                        
+                        if gc_tracker:
+                            gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_before_eval")
+                        
+                        # Per-task profiling if enabled
+                        eval_start_time = time.time()
+                        if profiling_enabled:
+                            from torch.profiler import profile, record_function, ProfilerActivity
+                            prof = profile(
+                                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                                record_shapes=True,
+                                profile_memory=True,
+                                with_stack=True
+                            )
+                            prof.start()
+                            with record_function(f"gc_eval_{dataset_name}_task_{task_idx}"):
+                                # Evaluate this specific task
+                                task_eval_results = evaluate_graph_classification_single_task(
+                                    model, predictor, dataset_info, task_eval_loaders, task_idx,
+                                    pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
+                                    normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
+                                )
+                            prof.stop()
+                            eval_time = time.time() - eval_start_time
+                            
+                            if gc_tracker:
+                                gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_profiled_eval")
+                            
+                            # Save per-task profiling results
+                            profile_filename = f"gc_eval_{dataset_name}_task_{task_idx}.json"
+                            prof.export_chrome_trace(profile_filename)
+                            print(f"      [PROFILING] Task {task_idx}: evaluation: {eval_time:.3f}s, saved profiling to {profile_filename}")
+                            
+                            # Print top CPU functions for this task
+                            print(f"      [PROFILING] Task {task_idx} Top CPU ops:")
+                            cpu_table = prof.key_averages().table(sort_by="cpu_time_total", row_limit=5)
+                            for line in cpu_table.split('\n')[:7]:  # Header + top 5 rows
+                                if line.strip():
+                                    print(f"        {line}")
+                        else:
                             # Evaluate this specific task
                             task_eval_results = evaluate_graph_classification_single_task(
                                 model, predictor, dataset_info, task_eval_loaders, task_idx,
                                 pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
                                 normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
                             )
-                        prof.stop()
-                        eval_time = time.time() - eval_start_time
+                            eval_time = time.time() - eval_start_time
+                            
+                            if gc_tracker:
+                                gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_eval")
+                        
                         
                         if gc_tracker:
-                            gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_profiled_eval")
+                            gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_complete")
                         
-                        # Save per-task profiling results
-                        profile_filename = f"gc_eval_{dataset_name}_task_{task_idx}.json"
-                        prof.export_chrome_trace(profile_filename)
-                        print(f"      [PROFILING] Task {task_idx}: evaluation: {eval_time:.3f}s, saved profiling to {profile_filename}")
+                        # Extract the appropriate split result
+                        # Map 'valid' to 'val' for consistency with data loader keys
+                        result_key = 'val' if split == 'valid' else split
+                        split_result = task_eval_results.get(result_key, 0.0)
+                        task_results.append(split_result)
                         
-                        # Print top CPU functions for this task
-                        print(f"      [PROFILING] Task {task_idx} Top CPU ops:")
-                        cpu_table = prof.key_averages().table(sort_by="cpu_time_total", row_limit=5)
-                        for line in cpu_table.split('\n')[:7]:  # Header + top 5 rows
-                            if line.strip():
-                                print(f"        {line}")
-                    else:
-                        # Evaluate this specific task
-                        task_eval_results = evaluate_graph_classification_single_task(
-                            model, predictor, dataset_info, task_eval_loaders, task_idx,
-                            pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
-                            normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
-                        )
-                        eval_time = time.time() - eval_start_time
+                        task_time = time.time() - task_start_time
+                        overhead_time = task_time - eval_time - dataloader_time
                         
-                        if gc_tracker:
-                            gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_after_eval")
-                    
-                    
-                    if gc_tracker:
-                        gc_tracker.log_memory(f"eval_{split}_dataset_{dataset_idx}_task_{task_idx}_complete")
-                    
-                    # Extract the appropriate split result
-                    # Map 'valid' to 'val' for consistency with data loader keys
-                    result_key = 'val' if split == 'valid' else split
-                    split_result = task_eval_results.get(result_key, 0.0)
-                    task_results.append(split_result)
-                    
-                    task_time = time.time() - task_start_time
-                    overhead_time = task_time - eval_time - dataloader_time
-                    
-                    # Handle both numeric and dict results for display
-                    if isinstance(split_result, dict):
-                        # Extract primary metric for display
-                        display_metric = split_result.get('ap', split_result.get('auc', 0.0))
-                        print(f"      Task {task_idx}: {display_metric:.4f} (eval: {eval_time:.2f}s)")
-                    else:
-                        print(f"      Task {task_idx}: {split_result:.4f} (eval: {eval_time:.2f}s)")
+                        # Handle both numeric and dict results for display
+                        if isinstance(split_result, dict):
+                            # Extract primary metric for display
+                            display_metric = split_result.get('ap', split_result.get('auc', 0.0))
+                            print(f"      Task {task_idx}: {display_metric:.4f} (eval: {eval_time:.2f}s)")
+                        else:
+                            print(f"      Task {task_idx}: {split_result:.4f} (eval: {eval_time:.2f}s)")
+                # End per-task loop (non-vectorized)
                 
                 # Aggregate results across tasks for this dataset
                 # Task accumulation completed for this dataset

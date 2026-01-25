@@ -116,7 +116,7 @@ def load_data(dataset, device='cpu', is_pretraining=False):
         dataset = safe_load_dataset(AttributedGraphDataset, root=os.path.join(DATASET_ROOT, 'AttributedGraph'), name=dataset)
     elif dataset == 'DBLP':
         dataset = safe_load_dataset(CitationFull, root=os.path.join(DATASET_ROOT, 'CitationFull'), name=dataset)
-    elif dataset == 'FacebookPage':
+    elif dataset in ['FacebookPage', 'FacebookPagePage']:
         dataset = safe_load_dataset(FacebookPagePage, root=os.path.join(DATASET_ROOT, 'FacebookPagePage'))
     elif dataset == 'ogbn-arxiv':
         dataset = safe_load_dataset(PygNodePropPredDataset, name=dataset, root=DATASET_ROOT)
