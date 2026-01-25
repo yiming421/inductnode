@@ -718,7 +718,8 @@ def _create_context_embeddings_computed(model, context_structure, dataset, task_
     return context_embeddings, context_labels
 
 
-def _create_all_task_context_embeddings(model, context_structure, dataset, pooling_method, device, identity_projection, dataset_info):
+def _create_all_task_context_embeddings(model, context_structure, dataset, pooling_method, device, identity_projection,
+                                        dataset_info, return_timing=False, sync_cuda=False):
     """
     Compute context embeddings for ALL tasks in one pass through the context structure.
     Returns per-task tensors for pos/neg classes.
@@ -726,14 +727,33 @@ def _create_all_task_context_embeddings(model, context_structure, dataset, pooli
     Returns:
         pos_embeddings_by_task: list[Tensor] (len=num_tasks), each [n_pos, hidden_dim]
         neg_embeddings_by_task: list[Tensor] (len=num_tasks), each [n_neg, hidden_dim]
+        timing (optional): dict with encode_time, overhead_time, concat_time, total_time, num_context_batches
     """
     if not context_structure:
+        if return_timing:
+            return [], [], {
+                'encode_time': 0.0,
+                'overhead_time': 0.0,
+                'concat_time': 0.0,
+                'total_time': 0.0,
+                'num_context_batches': 0
+            }
         return [], []
 
     task_indices = sorted(context_structure.keys())
     num_tasks = max(task_indices) + 1 if task_indices else 0
     pos_embeddings_by_task = [None] * num_tasks
     neg_embeddings_by_task = [None] * num_tasks
+
+    timing = {
+        'encode_time': 0.0,
+        'overhead_time': 0.0,
+        'concat_time': 0.0,
+        'total_time': 0.0,
+        'num_context_batches': 0
+    }
+    total_start = time.perf_counter()
+    use_sync = sync_cuda and torch.cuda.is_available()
 
     for task_idx in task_indices:
         task_context = context_structure[task_idx]
@@ -744,6 +764,7 @@ def _create_all_task_context_embeddings(model, context_structure, dataset, pooli
         for class_label, context_data in task_context.items():
             if not context_data:
                 continue
+            step_start = time.perf_counter()
 
             if isinstance(context_data, dict) and 'graphs' in context_data and 'indices' in context_data:
                 graphs = context_data['graphs']
@@ -775,17 +796,32 @@ def _create_all_task_context_embeddings(model, context_structure, dataset, pooli
                 sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
             ).to_symmetric().coalesce()
 
+            if use_sync:
+                torch.cuda.synchronize()
+            encode_start = time.perf_counter()
             node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
             graph_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
+            if use_sync:
+                torch.cuda.synchronize()
+            encode_end = time.perf_counter()
+            timing['encode_time'] += encode_end - encode_start
 
             if class_label == 1:
                 pos_list.append(graph_embeddings)
             else:
                 neg_list.append(graph_embeddings)
+            step_end = time.perf_counter()
+            timing['overhead_time'] += (step_end - step_start) - (encode_end - encode_start)
+            timing['num_context_batches'] += 1
 
+        concat_start = time.perf_counter()
         pos_embeddings_by_task[task_idx] = torch.cat(pos_list, dim=0) if pos_list else None
         neg_embeddings_by_task[task_idx] = torch.cat(neg_list, dim=0) if neg_list else None
+        timing['concat_time'] += time.perf_counter() - concat_start
 
+    timing['total_time'] = time.perf_counter() - total_start
+    if return_timing:
+        return pos_embeddings_by_task, neg_embeddings_by_task, timing
     return pos_embeddings_by_task, neg_embeddings_by_task
 
 
@@ -844,13 +880,31 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
     batch_count = 0
     batch_time_total = 0.0
     proto_time_total = 0.0
+    proto_encode_time_total = 0.0
+    proto_overhead_time_total = 0.0
+    proto_concat_time_total = 0.0
+    proto_context_batches_total = 0
+    profile_context = getattr(args, 'gc_profile_context', False) if args is not None else False
 
     for batch in data_loaders['train']:
-        proto_start = time.perf_counter()
-        # Recompute prototypes EVERY batch (expensive, but requested)
-        pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
-            model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
-        )
+        if profile_context:
+            # Recompute prototypes EVERY batch (expensive, but requested)
+            pos_embeds_by_task, neg_embeds_by_task, timing = _create_all_task_context_embeddings(
+                model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+                return_timing=True, sync_cuda=True
+            )
+            proto_time_total += timing['total_time']
+            proto_encode_time_total += timing['encode_time']
+            proto_overhead_time_total += timing['overhead_time']
+            proto_concat_time_total += timing['concat_time']
+            proto_context_batches_total += timing['num_context_batches']
+        else:
+            proto_start = time.perf_counter()
+            # Recompute prototypes EVERY batch (expensive, but requested)
+            pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
+                model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
+            )
+            proto_time_total += time.perf_counter() - proto_start
 
         # Compute prototypes (mean) for each task, fallback to zeros if missing
         proto_dim = None
@@ -957,6 +1011,12 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
     avg_proto_time = proto_time_total / max(batch_count, 1)
     avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
     print(f"[GC-VEC] train: avg_loss={avg_loss:.4f} proto_avg={avg_proto_time:.2f}s batches={batch_count} avg_batch={avg_batch_time:.3f}s total={total_time:.2f}s")
+    if profile_context:
+        avg_encode = proto_encode_time_total / max(batch_count, 1)
+        avg_overhead = (proto_overhead_time_total + proto_concat_time_total) / max(batch_count, 1)
+        overhead_pct = (avg_overhead / max(avg_proto_time, 1e-9)) * 100.0
+        avg_context_batches = proto_context_batches_total / max(batch_count, 1)
+        print(f"[GC-VEC] proto_breakdown: encode_avg={avg_encode:.2f}s overhead_avg={avg_overhead:.2f}s overhead_pct={overhead_pct:.1f}% context_batches={avg_context_batches:.1f}")
 
     return avg_loss
 

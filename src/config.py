@@ -344,6 +344,8 @@ def parse_joint_training_args():
     parser.add_argument('--context_graph_num', type=int, default=5, help='Number of context graphs for graph classification')
     parser.add_argument('--gc_multitask_vectorized', type=str2bool, default=False,
                        help='Enable vectorized multi-task prototypical GC (single BCEWithLogits over all tasks, e.g., PCBA)')
+    parser.add_argument('--gc_profile_context', type=str2bool, default=False,
+                       help='Profile context prototype computation time (encode vs overhead) in vectorized GC')
 
     # === Multi-Dataset Sampling Arguments ===
     parser.add_argument('--multi_dataset_sampling', type=str2bool, default=False,

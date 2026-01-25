@@ -1,4 +1,5 @@
 from torch_geometric.datasets import Planetoid, Coauthor, Amazon, Flickr, Airports, AttributedGraphDataset, CitationFull, FacebookPagePage, WikiCS, Reddit, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, Twitch
+from src.dataset_twitch import TwitchFixed
 from torch_geometric.utils import to_undirected
 from torch_geometric import transforms
 from torch_sparse import SparseTensor
@@ -136,8 +137,8 @@ def load_data(dataset, device='cpu', is_pretraining=False):
         dataset = safe_load_dataset(LastFMAsia, root=os.path.join(DATASET_ROOT, 'LastFMAsia'))
     elif dataset.startswith('Twitch'):
         region = dataset.split('-')[1]
-        # Load Twitch dataset with the specified region
-        dataset = safe_load_dataset(Twitch, root=os.path.join(DATASET_ROOT, 'Twitch'), name=region)
+        # Load Twitch dataset with the specified region using local SNAP-based loader
+        dataset = safe_load_dataset(TwitchFixed, root=os.path.join(DATASET_ROOT, 'Twitch'), name=region)
     else:
         raise ValueError(f"Dataset {dataset} not supported in load_data")
     
