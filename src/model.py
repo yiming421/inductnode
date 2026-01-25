@@ -988,14 +988,9 @@ class NodeClassificationHead(nn.Module):
         """
         from .utils import process_node_features
 
-        # TEMPORARY: Completely disable head to test
-        # # Normalize inputs before projection (separate norms for target and context)
-        # target_label_emb = self.target_input_norm(target_label_emb)
-        # context_label_emb = self.context_input_norm(context_label_emb)
-
-        # # Project embeddings through task-specific head
-        # target_label_emb = self.proj(target_label_emb)
-        # context_label_emb = self.proj(context_label_emb)
+        # Project embeddings through task-specific head (restore 9fa7dd8 behavior)
+        target_label_emb = self.proj(target_label_emb)
+        context_label_emb = self.proj(context_label_emb)
 
         # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
         if target_label_emb.dim() == 1:
@@ -1129,14 +1124,9 @@ class LinkPredictionHead(nn.Module):
             logits: [num_target, 2] - scores for no-link and link
             class_emb: [2, hidden_dim] - link prototypes
         """
-        # TEMPORARY: Completely disable head to test
-        # # Normalize inputs before projection (separate norms for target and context)
-        # target_label_emb = self.target_input_norm(target_label_emb)
-        # context_label_emb = self.context_input_norm(context_label_emb)
-
-        # # Project embeddings through task-specific head
-        # target_label_emb = self.proj(target_label_emb)
-        # context_label_emb = self.proj(context_label_emb)
+        # Project embeddings through task-specific head (restore 9fa7dd8 behavior)
+        target_label_emb = self.proj(target_label_emb)
+        context_label_emb = self.proj(context_label_emb)
 
         # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
         if target_label_emb.dim() == 1:

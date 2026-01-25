@@ -248,8 +248,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
             
             st = time.time()
             try:
-                # batch_indices from DataLoader should already be on CPU
-                # No need to move them around
+                # Move batch indices to the same device as edge_pairs/labels for indexing
+                if batch_indices.device != device:
+                    batch_indices = batch_indices.to(device)
                 
                 # Only zero gradients if optimizer is provided (for joint training compatibility)
                 if optimizer is not None:
@@ -324,8 +325,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     # Create a default mask that includes all edges in the batch
                     mask_for_loss = torch.ones(batch_indices.size(0), dtype=torch.bool, device=device)
                 else:
-                    # Index with CPU batch_indices, then move result to GPU
-                    mask_for_loss = train_mask[batch_indices].to(device)
+                    mask_for_loss = train_mask[batch_indices]
 
                 # Use CrossEntropyLoss for multi-class classification (link vs no-link)
                 nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
