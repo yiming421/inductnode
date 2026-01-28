@@ -433,8 +433,8 @@ def get_dataset_metric(dataset_name, num_classes=None, is_multitask=None):
     if 'chemhiv' in dataset_name or 'hiv' in dataset_name:
         return 'auc'
     elif 'chempcba' in dataset_name or 'pcba' in dataset_name:
-        # PCBA uses AUC metric
-        return 'auc'
+        # PCBA: report both AP (OGB primary) and AUC for completeness
+        return ['ap', 'auc']
     elif 'mnist' in dataset_name:
         # MNIST is multi-class classification
         return 'accuracy'
@@ -493,16 +493,22 @@ def aggregate_task_metrics(metric_values):
     if not metric_values:
         return 0.0
         
+    def _mean_ignore_nan(values):
+        filtered = [v for v in values if v == v]  # NaN check
+        if not filtered:
+            return 0.0
+        return sum(filtered) / len(filtered)
+
     if all(isinstance(val, dict) for val in metric_values):
         # All are dicts with multiple metrics - aggregate each metric separately
         aggregated_metrics = {}
         for metric_name in metric_values[0].keys():
             metric_vals = [val[metric_name] for val in metric_values]
-            aggregated_metrics[metric_name] = sum(metric_vals) / len(metric_vals)
+            aggregated_metrics[metric_name] = _mean_ignore_nan(metric_vals)
         return aggregated_metrics
     elif all(isinstance(val, (int, float)) for val in metric_values):
-        # All are single metrics - simple average
-        return sum(metric_values) / len(metric_values)
+        # All are single metrics - average, ignoring NaN
+        return _mean_ignore_nan(metric_values)
     else:
         # Mixed types - extract primary metric from dicts, average all
         primary_values = []
@@ -556,8 +562,13 @@ def calculate_metric(predictions, labels, probabilities, metric_type):
         return accuracy
     elif metric_type == 'auc':
         # For binary classification, use probabilities of positive class
-        if probabilities.shape[1] == 2:
-            probs = probabilities[:, 1].cpu().numpy()
+        if probabilities.dim() > 1:
+            if probabilities.shape[1] == 2:
+                probs = probabilities[:, 1].cpu().numpy()
+            elif probabilities.shape[1] == 1:
+                probs = probabilities.view(-1).cpu().numpy()
+            else:
+                probs = probabilities.cpu().numpy()
         else:
             probs = probabilities.cpu().numpy()
         
@@ -566,8 +577,7 @@ def calculate_metric(predictions, labels, probabilities, metric_type):
         # Debug: Check for unusual cases
         unique_labels = set(labels_np)
         if len(unique_labels) < 2:
-            pass
-            return 0.0
+            return float('nan')
         
         try:
             auc_score = roc_auc_score(labels_np, probs)
@@ -576,12 +586,16 @@ def calculate_metric(predictions, labels, probabilities, metric_type):
                 return 0.0
             return auc_score
         except ValueError as e:
-            pass
-            return 0.0
+            return float('nan')
     elif metric_type == 'ap':
         # For binary classification, use probabilities of positive class
-        if probabilities.shape[1] == 2:
-            probs = probabilities[:, 1].cpu().numpy()
+        if probabilities.dim() > 1:
+            if probabilities.shape[1] == 2:
+                probs = probabilities[:, 1].cpu().numpy()
+            elif probabilities.shape[1] == 1:
+                probs = probabilities.view(-1).cpu().numpy()
+            else:
+                probs = probabilities.cpu().numpy()
         else:
             probs = probabilities.cpu().numpy()
         try:
@@ -591,7 +605,7 @@ def calculate_metric(predictions, labels, probabilities, metric_type):
             return ap_score
         except ValueError as e:
             # Handle case where only one class is present
-            return 0.0
+            return float('nan')
     else:
         raise ValueError(f"Unknown metric type: {metric_type}")
 
@@ -825,6 +839,308 @@ def _create_all_task_context_embeddings(model, context_structure, dataset, pooli
     return pos_embeddings_by_task, neg_embeddings_by_task
 
 
+def _collect_multitask_context_graphs(context_structure, dataset, dataset_info=None):
+    """
+    Collect a unique set of context graphs across ALL tasks for multi-task ridge regression.
+
+    Returns:
+        graphs (list): List of unique Data objects
+        graph_indices (list or None): Dataset indices for graphs (required for FUG mapping)
+    """
+    if not context_structure:
+        return [], None
+
+    # Prefer using indices for stable deduplication and FUG mapping
+    use_indices = True
+    unique_indices = []
+    seen = set()
+    for task_context in context_structure.values():
+        for context_data in task_context.values():
+            if not context_data:
+                continue
+            if isinstance(context_data, dict) and 'indices' in context_data:
+                for idx in context_data['indices']:
+                    idx_int = idx.item() if torch.is_tensor(idx) else int(idx)
+                    if idx_int not in seen:
+                        seen.add(idx_int)
+                        unique_indices.append(idx_int)
+            else:
+                use_indices = False
+                break
+        if not use_indices:
+            break
+
+    if use_indices:
+        unique_indices = sorted(unique_indices)
+        graphs = [dataset[idx] for idx in unique_indices]
+        return graphs, unique_indices
+
+    # Fallback: deduplicate by object id (no indices available)
+    graphs = []
+    seen_ids = set()
+    for task_context in context_structure.values():
+        for context_data in task_context.values():
+            if not context_data:
+                continue
+            if isinstance(context_data, dict) and 'graphs' in context_data:
+                graph_list = context_data['graphs']
+            else:
+                graph_list = context_data
+            for graph in graph_list:
+                gid = id(graph)
+                if gid in seen_ids:
+                    continue
+                seen_ids.add(gid)
+                graphs.append(graph)
+
+    if dataset_info and 'fug_mapping' in dataset_info:
+        raise ValueError("Context indices required for FUG mapping but not found in context_structure")
+
+    return graphs, None
+
+
+def _extract_multitask_labels_and_masks(graphs):
+    """
+    Extract multi-task labels and masks from a list of graphs.
+
+    Returns:
+        labels (Tensor): [N, T] float
+        masks (Tensor): [N, T] bool
+    """
+    labels = []
+    masks = []
+    num_tasks = None
+
+    for graph in graphs:
+        y = graph.y
+        if y.dim() > 1:
+            y = y.view(-1)
+        else:
+            y = y.view(-1)
+
+        if num_tasks is None:
+            num_tasks = y.numel()
+
+        if hasattr(graph, 'task_mask') and graph.task_mask is not None:
+            mask = graph.task_mask
+            mask = mask.view(-1).bool() if mask.dim() > 0 else mask.bool()
+        else:
+            if y.dtype.is_floating_point:
+                mask = ~torch.isnan(y)
+            else:
+                mask = (y != -1)
+
+        if y.dtype.is_floating_point:
+            y = torch.where(mask, y, torch.zeros_like(y))
+        else:
+            y = torch.where(mask, y, torch.zeros_like(y))
+
+        labels.append(y.float())
+        masks.append(mask.bool())
+
+    if num_tasks is None:
+        num_tasks = 0
+
+    if labels:
+        labels = torch.stack(labels, dim=0)
+        masks = torch.stack(masks, dim=0)
+    else:
+        labels = torch.empty((0, num_tasks), dtype=torch.float32)
+        masks = torch.empty((0, num_tasks), dtype=torch.bool)
+
+    return labels, masks
+
+
+def _build_multitask_support_mask(context_structure, graphs, graph_indices):
+    """
+    Build per-task support mask from context_structure.
+
+    Returns:
+        support_mask (Tensor): [N, T] bool, True if graph is in support set for task t.
+    """
+    if not context_structure or not graphs:
+        return torch.empty((0, 0), dtype=torch.bool)
+
+    task_indices = sorted(context_structure.keys())
+    num_tasks = max(task_indices) + 1 if task_indices else 0
+    support_mask = torch.zeros((len(graphs), num_tasks), dtype=torch.bool)
+
+    id_to_row = {id(graph): i for i, graph in enumerate(graphs)}
+
+    if graph_indices is not None:
+        index_to_row = {int(idx): i for i, idx in enumerate(graph_indices)}
+        for task_idx, task_context in context_structure.items():
+            for context_data in task_context.values():
+                if not context_data:
+                    continue
+                if isinstance(context_data, dict) and 'indices' in context_data:
+                    for idx in context_data['indices']:
+                        row = index_to_row.get(int(idx))
+                        if row is not None:
+                            support_mask[row, task_idx] = True
+                else:
+                    # Fallback: use object ids if indices missing
+                    for graph in (context_data.get('graphs', []) if isinstance(context_data, dict) else context_data):
+                        row = id_to_row.get(id(graph))
+                        if row is not None:
+                            support_mask[row, task_idx] = True
+    else:
+        for task_idx, task_context in context_structure.items():
+            for context_data in task_context.values():
+                if not context_data:
+                    continue
+                graph_list = context_data.get('graphs', []) if isinstance(context_data, dict) else context_data
+                for graph in graph_list:
+                    row = id_to_row.get(id(graph))
+                    if row is not None:
+                        support_mask[row, task_idx] = True
+
+    return support_mask
+
+
+def _create_multitask_context_embeddings(model, context_structure, dataset, pooling_method, device, identity_projection,
+                                         dataset_info, batch_size=1024, return_timing=False, sync_cuda=False):
+    """
+    Compute context embeddings and [N, T] labels/masks for multi-task ridge regression.
+
+    Returns:
+        context_embeddings: [N, D]
+        context_labels: [N, T]
+        context_masks: [N, T] (valid label mask AND per-task support mask)
+        timing (optional)
+    """
+    graphs, graph_indices = _collect_multitask_context_graphs(context_structure, dataset, dataset_info)
+    if not graphs:
+        empty = torch.empty((0, 0), device=device)
+        labels = torch.empty((0, 0), device=device)
+        masks = torch.empty((0, 0), dtype=torch.bool, device=device)
+        if return_timing:
+            return empty, labels, masks, {
+                'encode_time': 0.0,
+                'overhead_time': 0.0,
+                'concat_time': 0.0,
+                'total_time': 0.0,
+                'num_context_batches': 0
+            }
+        return empty, labels, masks
+
+    labels_cpu, masks_cpu = _extract_multitask_labels_and_masks(graphs)
+    support_mask = _build_multitask_support_mask(context_structure, graphs, graph_indices)
+    if support_mask.numel() > 0:
+        masks_cpu = masks_cpu & support_mask
+
+    timing = {
+        'encode_time': 0.0,
+        'overhead_time': 0.0,
+        'concat_time': 0.0,
+        'total_time': 0.0,
+        'num_context_batches': 0
+    }
+    total_start = time.perf_counter()
+    use_sync = sync_cuda and torch.cuda.is_available()
+
+    context_embeddings = []
+    node_emb_table = _get_node_embedding_table(dataset, 0, device, dataset_info)
+    if node_emb_table is None:
+        raise ValueError("Expected node embedding table under unified setting")
+
+    for start in range(0, len(graphs), batch_size):
+        end = min(start + batch_size, len(graphs))
+        step_start = time.perf_counter()
+
+        batch_graphs = graphs[start:end]
+        batch_data = create_graph_batch(batch_graphs, device)
+        if graph_indices is not None:
+            batch_data.original_graph_indices = torch.tensor(graph_indices[start:end], dtype=torch.long)
+
+        batch_data.x = _safe_lookup_node_embeddings(
+            node_emb_table, batch_data.x,
+            context="multitask_context", batch_data=batch_data, dataset_info=dataset_info
+        )
+
+        if dataset_info and dataset_info.get('needs_identity_projection', False) and identity_projection is not None:
+            x_input = identity_projection(batch_data.x)
+        else:
+            x_input = batch_data.x
+
+        batch_data.adj_t = SparseTensor.from_edge_index(
+            batch_data.edge_index,
+            sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
+        ).to_symmetric().coalesce()
+
+        if use_sync:
+            torch.cuda.synchronize()
+        encode_start = time.perf_counter()
+        node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
+        graph_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
+        if use_sync:
+            torch.cuda.synchronize()
+        encode_end = time.perf_counter()
+
+        timing['encode_time'] += encode_end - encode_start
+        timing['overhead_time'] += (time.perf_counter() - step_start) - (encode_end - encode_start)
+        timing['num_context_batches'] += 1
+        context_embeddings.append(graph_embeddings)
+
+    concat_start = time.perf_counter()
+    context_embeddings = torch.cat(context_embeddings, dim=0) if context_embeddings else torch.empty((0, 0), device=device)
+    timing['concat_time'] += time.perf_counter() - concat_start
+    timing['total_time'] = time.perf_counter() - total_start
+
+    context_labels = labels_cpu.to(device)
+    context_masks = masks_cpu.to(device)
+
+    if return_timing:
+        return context_embeddings, context_labels, context_masks, timing
+    return context_embeddings, context_labels, context_masks
+
+
+def _compute_multitask_ridge_weights(context_embeddings, context_labels, context_masks, ridge_alpha=1.0):
+    """
+    Closed-form ridge regression for multi-task labels with per-task masks.
+
+    Args:
+        context_embeddings: [N, D]
+        context_labels: [N, T]
+        context_masks: [N, T] boolean
+        ridge_alpha: > 0
+    Returns:
+        W: [D, T]
+    """
+    if ridge_alpha <= 0:
+        raise ValueError("Ridge alpha must be positive for numerical stability")
+
+    if context_embeddings.numel() == 0 or context_labels.numel() == 0:
+        return torch.empty((0, 0), device=context_embeddings.device)
+
+    num_tasks = context_labels.size(1)
+    hidden_dim = context_embeddings.size(1)
+    device = context_embeddings.device
+    dtype = context_embeddings.dtype
+
+    W = torch.zeros(hidden_dim, num_tasks, device=device, dtype=dtype)
+    I = torch.eye(hidden_dim, device=device, dtype=dtype)
+    failures = 0
+
+    for t in range(num_tasks):
+        mask_t = context_masks[:, t]
+        if mask_t.sum() < 2:
+            continue
+        w = mask_t.float()
+        XtX = context_embeddings.t() @ (context_embeddings * w.unsqueeze(1))
+        XtY = context_embeddings.t() @ (context_labels[:, t] * w)
+        try:
+            W[:, t] = torch.linalg.solve(XtX + ridge_alpha * I, XtY)
+        except torch.linalg.LinAlgError:
+            failures += 1
+            W[:, t] = torch.zeros(hidden_dim, device=device, dtype=dtype)
+
+    if failures > 0:
+        print(f"[GC-VEC] ridge: {failures}/{num_tasks} tasks failed solve; using zero weights.")
+
+    return W
+
+
 def _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim='dot'):
     """
     Compute per-task logits in a vectorized way.
@@ -859,7 +1175,7 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
                                                    orthogonal_push=0.0, normalize_class_h=True,
                                                    identity_projection=None, args=None, lambda_=1.0):
     """
-    Vectorized multi-task training: single forward, build per-task pos/neg prototypes,
+    Vectorized multi-task training: single forward, build per-task pos/neg prototypes (or ridge weights),
     compute logits [B, T], and apply BCEWithLogits with task_mask.
     """
     model.train()
@@ -885,52 +1201,79 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
     proto_concat_time_total = 0.0
     proto_context_batches_total = 0
     profile_context = getattr(args, 'gc_profile_context', False) if args is not None else False
+    sim_type = getattr(args, 'gc_sim', 'dot') if args is not None else 'dot'
+    use_ridge = sim_type == 'ridge'
+    ridge_alpha = getattr(args, 'gc_ridge_alpha', 1.0) if args is not None else 1.0
+    context_batch_size = getattr(args, 'gc_batch_size', 1024) if args is not None else 1024
 
     for batch in data_loaders['train']:
-        if profile_context:
-            # Recompute prototypes EVERY batch (expensive, but requested)
-            pos_embeds_by_task, neg_embeds_by_task, timing = _create_all_task_context_embeddings(
-                model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
-                return_timing=True, sync_cuda=True
-            )
-            proto_time_total += timing['total_time']
-            proto_encode_time_total += timing['encode_time']
-            proto_overhead_time_total += timing['overhead_time']
-            proto_concat_time_total += timing['concat_time']
-            proto_context_batches_total += timing['num_context_batches']
+        if use_ridge:
+            if profile_context:
+                context_embeddings, context_labels, context_masks, timing = _create_multitask_context_embeddings(
+                    model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+                    batch_size=context_batch_size, return_timing=True, sync_cuda=True
+                )
+                proto_time_total += timing['total_time']
+                proto_encode_time_total += timing['encode_time']
+                proto_overhead_time_total += timing['overhead_time']
+                proto_concat_time_total += timing['concat_time']
+                proto_context_batches_total += timing['num_context_batches']
+            else:
+                proto_start = time.perf_counter()
+                context_embeddings, context_labels, context_masks = _create_multitask_context_embeddings(
+                    model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+                    batch_size=context_batch_size
+                )
+                proto_time_total += time.perf_counter() - proto_start
+
+            ridge_start = time.perf_counter()
+            W = _compute_multitask_ridge_weights(context_embeddings, context_labels, context_masks, ridge_alpha=ridge_alpha)
+            proto_time_total += time.perf_counter() - ridge_start
         else:
-            proto_start = time.perf_counter()
-            # Recompute prototypes EVERY batch (expensive, but requested)
-            pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
-                model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
-            )
+            if profile_context:
+                # Recompute prototypes EVERY batch (expensive, but requested)
+                pos_embeds_by_task, neg_embeds_by_task, timing = _create_all_task_context_embeddings(
+                    model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+                    return_timing=True, sync_cuda=True
+                )
+                proto_time_total += timing['total_time']
+                proto_encode_time_total += timing['encode_time']
+                proto_overhead_time_total += timing['overhead_time']
+                proto_concat_time_total += timing['concat_time']
+                proto_context_batches_total += timing['num_context_batches']
+                proto_start = time.perf_counter()
+            else:
+                proto_start = time.perf_counter()
+                # Recompute prototypes EVERY batch (expensive, but requested)
+                pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
+                    model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
+                )
+
+            # Compute prototypes (mean) for each task, fallback to zeros if missing
+            proto_dim = None
+            pos_proto = []
+            neg_proto = []
+            for t in range(num_tasks):
+                pos_e = pos_embeds_by_task[t]
+                neg_e = neg_embeds_by_task[t]
+                if pos_e is None or neg_e is None:
+                    if proto_dim is None:
+                        for e in pos_embeds_by_task + neg_embeds_by_task:
+                            if e is not None:
+                                proto_dim = e.size(-1)
+                                break
+                    if proto_dim is None:
+                        proto_dim = 256
+                    pos_proto.append(torch.zeros(proto_dim, device=device))
+                    neg_proto.append(torch.zeros(proto_dim, device=device))
+                    continue
+                proto_dim = pos_e.size(-1)
+                pos_proto.append(pos_e.mean(dim=0))
+                neg_proto.append(neg_e.mean(dim=0))
+
+            pos_proto = torch.stack(pos_proto, dim=0)
+            neg_proto = torch.stack(neg_proto, dim=0)
             proto_time_total += time.perf_counter() - proto_start
-
-        # Compute prototypes (mean) for each task, fallback to zeros if missing
-        proto_dim = None
-        pos_proto = []
-        neg_proto = []
-        for t in range(num_tasks):
-            pos_e = pos_embeds_by_task[t]
-            neg_e = neg_embeds_by_task[t]
-            if pos_e is None or neg_e is None:
-                if proto_dim is None:
-                    for e in pos_embeds_by_task + neg_embeds_by_task:
-                        if e is not None:
-                            proto_dim = e.size(-1)
-                            break
-                if proto_dim is None:
-                    proto_dim = 256
-                pos_proto.append(torch.zeros(proto_dim, device=device))
-                neg_proto.append(torch.zeros(proto_dim, device=device))
-                continue
-            proto_dim = pos_e.size(-1)
-            pos_proto.append(pos_e.mean(dim=0))
-            neg_proto.append(neg_e.mean(dim=0))
-
-        pos_proto = torch.stack(pos_proto, dim=0)
-        neg_proto = torch.stack(neg_proto, dim=0)
-        proto_time_total += time.perf_counter() - proto_start
 
         batch_start = time.perf_counter()
         optimizer.zero_grad()
@@ -985,8 +1328,10 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
         labels = torch.where(task_mask, labels, torch.zeros_like(labels))
 
         # Vectorized logits [B, T]
-        sim_type = getattr(args, 'gc_sim', 'dot') if args is not None else 'dot'
-        logits = _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim=sim_type)
+        if use_ridge:
+            logits = target_embeddings @ W
+        else:
+            logits = _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim=sim_type)
         if logits is None:
             continue
 
@@ -1010,13 +1355,14 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
     avg_batch_time = batch_time_total / max(batch_count, 1)
     avg_proto_time = proto_time_total / max(batch_count, 1)
     avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
-    print(f"[GC-VEC] train: avg_loss={avg_loss:.4f} proto_avg={avg_proto_time:.2f}s batches={batch_count} avg_batch={avg_batch_time:.3f}s total={total_time:.2f}s")
+    method_name = "ridge" if use_ridge else "proto"
+    print(f"[GC-VEC] train ({method_name}): avg_loss={avg_loss:.4f} ctx_avg={avg_proto_time:.2f}s batches={batch_count} avg_batch={avg_batch_time:.3f}s total={total_time:.2f}s")
     if profile_context:
         avg_encode = proto_encode_time_total / max(batch_count, 1)
         avg_overhead = (proto_overhead_time_total + proto_concat_time_total) / max(batch_count, 1)
         overhead_pct = (avg_overhead / max(avg_proto_time, 1e-9)) * 100.0
         avg_context_batches = proto_context_batches_total / max(batch_count, 1)
-        print(f"[GC-VEC] proto_breakdown: encode_avg={avg_encode:.2f}s overhead_avg={avg_overhead:.2f}s overhead_pct={overhead_pct:.1f}% context_batches={avg_context_batches:.1f}")
+        print(f"[GC-VEC] ctx_breakdown: encode_avg={avg_encode:.2f}s overhead_avg={avg_overhead:.2f}s overhead_pct={overhead_pct:.1f}% context_batches={avg_context_batches:.1f}")
 
     return avg_loss
 
@@ -1042,37 +1388,48 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
 
     num_tasks = sample_graph.y.numel()
     metric_type = get_dataset_metric(dataset_name, num_classes=dataset_info.get('num_classes', None), is_multitask=True)
+    sim_type = getattr(args, 'gc_sim', 'dot') if args is not None else 'dot'
+    use_ridge = sim_type == 'ridge'
+    ridge_alpha = getattr(args, 'gc_ridge_alpha', 1.0) if args is not None else 1.0
+    context_batch_size = getattr(args, 'gc_test_batch_size', 4096) if args is not None else 4096
 
     eval_start = time.perf_counter()
     proto_start = time.perf_counter()
-    pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
-        model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
-    )
+    if use_ridge:
+        context_embeddings, context_labels, context_masks = _create_multitask_context_embeddings(
+            model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+            batch_size=context_batch_size
+        )
+        W = _compute_multitask_ridge_weights(context_embeddings, context_labels, context_masks, ridge_alpha=ridge_alpha)
+    else:
+        pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
+            model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
+        )
+
+        proto_dim = None
+        pos_proto = []
+        neg_proto = []
+        for t in range(num_tasks):
+            pos_e = pos_embeds_by_task[t]
+            neg_e = neg_embeds_by_task[t]
+            if pos_e is None or neg_e is None:
+                if proto_dim is None:
+                    for e in pos_embeds_by_task + neg_embeds_by_task:
+                        if e is not None:
+                            proto_dim = e.size(-1)
+                            break
+                if proto_dim is None:
+                    proto_dim = 256
+                pos_proto.append(torch.zeros(proto_dim, device=device))
+                neg_proto.append(torch.zeros(proto_dim, device=device))
+                continue
+            proto_dim = pos_e.size(-1)
+            pos_proto.append(pos_e.mean(dim=0))
+            neg_proto.append(neg_e.mean(dim=0))
+
+        pos_proto = torch.stack(pos_proto, dim=0)
+        neg_proto = torch.stack(neg_proto, dim=0)
     proto_time = time.perf_counter() - proto_start
-
-    proto_dim = None
-    pos_proto = []
-    neg_proto = []
-    for t in range(num_tasks):
-        pos_e = pos_embeds_by_task[t]
-        neg_e = neg_embeds_by_task[t]
-        if pos_e is None or neg_e is None:
-            if proto_dim is None:
-                for e in pos_embeds_by_task + neg_embeds_by_task:
-                    if e is not None:
-                        proto_dim = e.size(-1)
-                        break
-            if proto_dim is None:
-                proto_dim = 256
-            pos_proto.append(torch.zeros(proto_dim, device=device))
-            neg_proto.append(torch.zeros(proto_dim, device=device))
-            continue
-        proto_dim = pos_e.size(-1)
-        pos_proto.append(pos_e.mean(dim=0))
-        neg_proto.append(neg_e.mean(dim=0))
-
-    pos_proto = torch.stack(pos_proto, dim=0)
-    neg_proto = torch.stack(neg_proto, dim=0)
 
     split_results = {}
     for split_name in ['train', 'val', 'test']:
@@ -1130,8 +1487,10 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
             labels = batch_labels.float()
             labels = torch.where(task_mask, labels, torch.zeros_like(labels))
 
-            sim_type = getattr(args, 'gc_sim', 'dot') if args is not None else 'dot'
-            logits = _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim=sim_type)
+            if use_ridge:
+                logits = target_embeddings @ W
+            else:
+                logits = _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim=sim_type)
             if logits is None:
                 continue
 
@@ -1158,19 +1517,20 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
             if mask_t.sum() == 0:
                 continue
             labels_t = all_labels[mask_t, t]
-            probs_t = torch.sigmoid(all_logits[mask_t, t])
+            probs_t = torch.sigmoid(all_logits[mask_t, t]).view(-1)
             preds_t = (probs_t >= 0.5).long()
             if isinstance(metric_type, list):
-                metrics_t = calculate_multiple_metrics(preds_t, labels_t.long(), probs_t.unsqueeze(1), metric_type)
+                metrics_t = calculate_multiple_metrics(preds_t, labels_t.long(), probs_t, metric_type)
                 task_metrics.append(metrics_t)
             else:
-                metric_t = calculate_metric(preds_t, labels_t.long(), probs_t.unsqueeze(1), metric_type)
+                metric_t = calculate_metric(preds_t, labels_t.long(), probs_t, metric_type)
                 task_metrics.append(metric_t)
 
         split_results[split_name] = aggregate_task_metrics(task_metrics) if task_metrics else 0.0
         split_time = time.perf_counter() - split_start
         avg_batch_time = split_batch_time / max(len(data_loaders[split_name]), 1)
-        print(f"[GC-VEC] eval {split_name}: proto={proto_time:.2f}s split_time={split_time:.2f}s avg_batch={avg_batch_time:.3f}s")
+        method_name = "ridge" if use_ridge else "proto"
+        print(f"[GC-VEC] eval {split_name} ({method_name}): ctx={proto_time:.2f}s split_time={split_time:.2f}s avg_batch={avg_batch_time:.3f}s")
 
     total_time = time.perf_counter() - eval_start
     print(f"[GC-VEC] eval total: {total_time:.2f}s")
@@ -1423,17 +1783,7 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
         
         # Aggregate across all tasks for this split
         if all_task_metrics:
-            if isinstance(metric_type, list):
-                # Multiple metrics: aggregate each metric separately
-                aggregated_metrics = {}
-                for metric_name in metric_type:
-                    metric_values = [task_metrics[metric_name] for task_metrics in all_task_metrics]
-                    aggregated_metrics[metric_name] = sum(metric_values) / len(metric_values)
-                split_results[split_name] = aggregated_metrics
-            else:
-                # Single metric: simple average
-                avg_metric = sum(all_task_metrics) / len(all_task_metrics)
-                split_results[split_name] = avg_metric
+            split_results[split_name] = aggregate_task_metrics(all_task_metrics)
         else:
             if isinstance(metric_type, list):
                 split_results[split_name] = {metric_name: 0.0 for metric_name in metric_type}

@@ -73,8 +73,8 @@ def parse_joint_training_args():
     parser.add_argument('--eps', type=float, default=1e-8, help='Epsilon for optimizer (term added to denominator for numerical stability)')
     parser.add_argument('--schedule', type=str, default='cosine', choices=['cosine', 'step', 'warmup', 'none'])
     parser.add_argument('--nc_batch_size', type=int, default=1024, help='Node classification batch size')
-    parser.add_argument('--lp_batch_size', type=int, default=32768, help='Link prediction batch size')
-    parser.add_argument('--test_batch_size', type=int, default=1024, help='Test batch size')
+    parser.add_argument('--lp_batch_size', type=int, default=16384, help='Link prediction batch size')
+    parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--unseen_test_context_samples', type=int, default=3,
                         help='Average unseen NC test metrics over N random few-shot context resamples (>=1)')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
