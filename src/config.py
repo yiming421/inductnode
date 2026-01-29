@@ -346,6 +346,12 @@ def parse_joint_training_args():
                        help='Enable vectorized multi-task prototypical GC (single BCEWithLogits over all tasks, e.g., PCBA)')
     parser.add_argument('--gc_profile_context', type=str2bool, default=False,
                        help='Profile context prototype computation time (encode vs overhead) in vectorized GC')
+    parser.add_argument('--gc_log_train_metrics', type=str2bool, default=True,
+                       help='Log graph classification train metrics each epoch (can be expensive for large datasets)')
+    parser.add_argument('--gc_train_eval_max_batches', type=int, default=20,
+                       help='Max batches to use when computing GC train metrics (0 = all batches)')
+    parser.add_argument('--gc_train_eval_shuffle', type=str2bool, default=True,
+                       help='Shuffle train eval loader when using batch sampling for GC train metrics')
 
     # === Multi-Dataset Sampling Arguments ===
     parser.add_argument('--multi_dataset_sampling', type=str2bool, default=False,

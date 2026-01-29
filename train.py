@@ -2632,20 +2632,26 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
 
                     if split == 'test':
                         test_only_splits = {'test': dataset_info['split_idx']['test']}
+                        shuffle_train_eval = False
                         task_eval_loaders = create_data_loaders(
                             dataset_info['dataset'],
                             test_only_splits,
                             batch_size=args.gc_test_batch_size,
-                            shuffle=False,
+                            shuffle=shuffle_train_eval,
                             task_idx=None,
                             use_index_tracking=use_index_tracking
                         )
                     else:
+                        shuffle_train_eval = (
+                            split == 'train'
+                            and getattr(args, 'gc_train_eval_max_batches', 0) > 0
+                            and getattr(args, 'gc_train_eval_shuffle', True)
+                        )
                         task_eval_loaders = create_data_loaders(
                             dataset_info['dataset'],
                             dataset_info['split_idx'],
                             batch_size=args.gc_test_batch_size,
-                            shuffle=False,
+                            shuffle=shuffle_train_eval,
                             task_idx=None,
                             use_index_tracking=use_index_tracking
                         )
@@ -2677,21 +2683,27 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                         if split == 'test':
                             # Only use test split for unseen datasets
                             test_only_splits = {'test': task_splits['test']}
+                            shuffle_train_eval = False
                             task_eval_loaders = create_data_loaders(
                                 dataset_info['dataset'], 
                                 test_only_splits,
                                 batch_size=args.gc_test_batch_size,
-                                shuffle=False,
+                                shuffle=shuffle_train_eval,
                                 task_idx=task_idx,
                                 use_index_tracking=use_index_tracking
                             )
                         else:
+                            shuffle_train_eval = (
+                                split == 'train'
+                                and getattr(args, 'gc_train_eval_max_batches', 0) > 0
+                                and getattr(args, 'gc_train_eval_shuffle', True)
+                            )
                             # Use all splits for seen datasets
                             task_eval_loaders = create_data_loaders(
                                 dataset_info['dataset'], 
                                 task_splits,
                                 batch_size=args.gc_test_batch_size,
-                                shuffle=False,
+                                shuffle=shuffle_train_eval,
                                 task_idx=task_idx,
                                 use_index_tracking=use_index_tracking
                             )
@@ -3283,6 +3295,15 @@ def run_joint_training(args, device='cuda:0'):
         lp_valid_seen = seen_valid_results['lp_metrics'].get('valid', 0.0) if seen_valid_results['lp_metrics'] else 0.0
         gc_valid_seen = seen_valid_results['gc_metrics'].get('valid', 0.0) if seen_valid_results['gc_metrics'] else 0.0
         combined_valid_seen = nc_valid_seen + lp_valid_seen + gc_valid_seen
+
+        # Optional: Log GC train metrics for diagnostics
+        gc_train_seen = None
+        if (getattr(args, 'enable_gc', True) and getattr(args, 'gc_log_train_metrics', True)
+            and data_dict['gc_train'] is not None and len(data_dict['gc_train'][0]) > 0):
+            gc_train_results = evaluate_graph_classification_task(
+                model, predictor, data_dict['gc_train'], args, 'train', identity_projection, gc_tracker
+            )
+            gc_train_seen = gc_train_results.get('train', 0.0)
         
         # Save best model based on seen validation performance
         if combined_valid_seen > best_valid_score:
@@ -3375,6 +3396,10 @@ def run_joint_training(args, device='cuda:0'):
                          f"GraphCL Loss: {train_results['graphcl_loss']:.4f} | "
                          f"Combined: {train_results['combined_loss']:.4f} | "
                          f"NC Valid (Seen): {nc_valid_seen:.4f} | LP Valid (Seen): {lp_valid_seen:.4f} | GC Valid (Seen): {gc_valid_seen:.4f}")
+
+            if gc_train_seen is not None:
+                gc_train_str = format_metric_results(gc_train_seen) if isinstance(gc_train_seen, dict) else f"{gc_train_seen:.4f}"
+                log_message += f" | GC Train (Seen): {gc_train_str}"
             
             if unseen_metrics:
                 log_message += f" | NC Test (Unseen): {unseen_metrics['test_unseen/nc_metric']:.4f} | LP Test (Unseen): {unseen_metrics['test_unseen/lp_metric']:.4f} | GC Test (Unseen): {unseen_metrics['test_unseen/gc_metric']:.4f}"
@@ -3416,6 +3441,13 @@ def run_joint_training(args, device='cuda:0'):
                 'valid_seen/combined_score': combined_valid_seen,
                 'lr': optimizer.param_groups[0]['lr']
             }
+
+            if gc_train_seen is not None:
+                if isinstance(gc_train_seen, dict):
+                    for metric_name, metric_val in gc_train_seen.items():
+                        wandb_log[f'train/gc_metric_{metric_name}'] = metric_val
+                else:
+                    wandb_log['train/gc_metric'] = gc_train_seen
 
             # Optionally add per-dataset training loss and validation accuracy metrics
             if getattr(args, 'log_individual_datasets', False):

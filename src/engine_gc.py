@@ -1392,6 +1392,7 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
     use_ridge = sim_type == 'ridge'
     ridge_alpha = getattr(args, 'gc_ridge_alpha', 1.0) if args is not None else 1.0
     context_batch_size = getattr(args, 'gc_test_batch_size', 4096) if args is not None else 4096
+    max_eval_batches = getattr(args, 'gc_train_eval_max_batches', 0) if args is not None else 0
 
     eval_start = time.perf_counter()
     proto_start = time.perf_counter()
@@ -1442,7 +1443,9 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
         all_labels = []
         all_masks = []
 
-        for batch in data_loaders[split_name]:
+        for batch_idx, batch in enumerate(data_loaders[split_name]):
+            if split_name == 'train' and max_eval_batches > 0 and batch_idx >= max_eval_batches:
+                break
             batch_start = time.perf_counter()
             batch_data = batch.to(device)
             if batch_data.num_graphs == 0:
@@ -1636,7 +1639,7 @@ def train_graph_classification_full_batch(model, predictor, train_dataset_info, 
 @torch.no_grad()
 def evaluate_graph_classification_full_batch(model, predictor, dataset_info, data_loaders,
                                            pooling_method='mean', device='cuda', 
-                                           normalize_class_h=True, dataset_name=None, identity_projection=None):
+                                           normalize_class_h=True, dataset_name=None, identity_projection=None, args=None):
     """
     Evaluate graph classification using full batch approach: NO pre-filtering by tasks.
     Process ALL graphs and check ALL tasks dynamically, then aggregate results.
@@ -1665,12 +1668,15 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
         all_task_metrics = []
         
         # For each task, collect predictions across all graphs in this split
+        max_eval_batches = getattr(args, 'gc_train_eval_max_batches', 0) if args is not None else 0
         for task_idx in range(num_tasks):
             all_predictions = []
             all_labels = []
             all_probabilities = []
             
-            for batch in data_loaders[split_name]:
+            for batch_idx, batch in enumerate(data_loaders[split_name]):
+                if split_name == 'train' and max_eval_batches and batch_idx >= max_eval_batches:
+                    break
                 batch_data = batch.to(device)
                 batch_size = batch_data.num_graphs
                 
@@ -2207,7 +2213,10 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         batch_processing_start = time.perf_counter()
         total_samples = len(data_loader.dataset)
 
+        max_eval_batches = getattr(args, 'gc_train_eval_max_batches', 0) if args is not None else 0
         for batch_idx, batch_graphs in enumerate(data_loader):
+            if split_name == 'train' and max_eval_batches > 0 and batch_idx >= max_eval_batches:
+                break
             print(f"\rEvaluating batch {batch_idx+1}...", end="", flush=True)
             batch_data = batch_graphs.to(device)
             node_emb_table = _get_node_embedding_table(dataset_info['dataset'], task_idx, device, dataset_info)
@@ -2592,8 +2601,8 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                 val_results = evaluate_graph_classification_full_batch(
                     model, predictor, train_dataset_info, eval_loaders,
                     pooling_method=args.graph_pooling, device=device,
-                    normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, 
-                    identity_projection=identity_projection
+                    normalize_class_h=args.normalize_class_h, dataset_name=dataset_name,
+                    identity_projection=identity_projection, args=args
                 )
                 
                 all_val_results[dataset_name] = val_results
@@ -2760,8 +2769,8 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         test_eval_results = evaluate_graph_classification_full_batch(
                             model, predictor, test_dataset_info, test_loaders,
                             pooling_method=args.graph_pooling, device=device,
-                            normalize_class_h=args.normalize_class_h, dataset_name=test_name, 
-                            identity_projection=identity_projection
+                            normalize_class_h=args.normalize_class_h, dataset_name=test_name,
+                            identity_projection=identity_projection, args=args
                         )
                         
                         test_results = {'test': test_eval_results.get('test', 0.0)}
