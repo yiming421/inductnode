@@ -1750,7 +1750,7 @@ class PFNPredictorNodeCls(nn.Module):
             head_num_layers=self.head_num_layers
         )
     
-    def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification', adj_t=None, lp_edges=None, node_emb=None):
+    def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification', adj_t=None, lp_edges=None, node_emb=None, lp_cn_context=None, lp_cn_target=None):
         """
         Unified forward pass supporting node classification, link prediction, and graph classification.
 
@@ -1834,7 +1834,18 @@ class PFNPredictorNodeCls(nn.Module):
                 target_label_emb = target_tokens[:, self.hidden_dim:]    # [num_target, hidden_dim]
 
 
-        # Step 6 & 7: Route through task-specific heads
+        # Step 6: Optional CN concat at LP head input (post-transformer)
+        if task_type == 'link_prediction' and self.lp_concat_common_neighbors:
+            if lp_cn_context is not None:
+                if lp_cn_context.dim() == 1:
+                    lp_cn_context = lp_cn_context.unsqueeze(1)
+                context_label_emb = torch.cat([context_label_emb, lp_cn_context.to(context_label_emb.device)], dim=1)
+            if lp_cn_target is not None:
+                if lp_cn_target.dim() == 1:
+                    lp_cn_target = lp_cn_target.unsqueeze(1)
+                target_label_emb = torch.cat([target_label_emb, lp_cn_target.to(target_label_emb.device)], dim=1)
+
+        # Step 7: Route through task-specific heads
         if task_type == 'node_classification':
             logits, class_emb = self.nc_head(
                 target_label_emb=target_label_emb,

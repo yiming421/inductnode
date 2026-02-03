@@ -297,9 +297,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 context_src_embeds = node_embeddings[context_edge_pairs[:, 0]]
                 context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
                 context_edge_embeds = context_src_embeds * context_dst_embeds
+                cn_context = None
                 if getattr(args, 'lp_concat_common_neighbors', False) and getattr(predictor, 'lp_head_type', '') != 'mplp':
                     cn_context = _common_neighbor_count(adj_for_gnn, context_edge_pairs)
-                    context_edge_embeds = torch.cat([context_edge_embeds, cn_context.to(context_edge_embeds.device)], dim=-1)
 
                 batch_labels = labels[batch_indices]
                 batch_edges = edge_pairs[batch_indices]
@@ -308,9 +308,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 src_embeds = node_embeddings[batch_edges[:, 0]]
                 dst_embeds = node_embeddings[batch_edges[:, 1]]
                 target_edge_embeds = src_embeds * dst_embeds
+                cn_target = None
                 if getattr(args, 'lp_concat_common_neighbors', False) and getattr(predictor, 'lp_head_type', '') != 'mplp':
                     cn_target = _common_neighbor_count(adj_for_gnn, batch_edges)
-                    target_edge_embeds = torch.cat([target_edge_embeds, cn_target.to(target_edge_embeds.device)], dim=-1)
 
                 # Get link prototypes (binary class embeddings)
                 link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
@@ -339,7 +339,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                         target_edge_embeds,
                         context_labels.long(),
                         link_prototypes,
-                        "link_prediction"
+                        "link_prediction",
+                        lp_cn_context=cn_context,
+                        lp_cn_target=cn_target
                     )
 
                 # Use the train_mask to ensure loss is only calculated on non-context edges
@@ -568,9 +570,9 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         context_src_embeds = node_embeddings[context_edge_pairs[:, 0]]
         context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
         context_edge_embeds = context_src_embeds * context_dst_embeds
+        cn_context = None
         if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
             cn_context = _common_neighbor_count(adj_for_lp, context_edge_pairs)
-            context_edge_embeds = torch.cat([context_edge_embeds, cn_context.to(context_edge_embeds.device)], dim=-1)
         
         # Generate link prototypes
         link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
@@ -615,9 +617,9 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             src_embeds = node_embeddings[batch_edges[:, 0]]
             dst_embeds = node_embeddings[batch_edges[:, 1]]
             target_edge_embeds = src_embeds * dst_embeds
+            cn_target = None
             if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
-                cn_target = _common_neighbor_count(adj_for_cn, batch_edges)
-                target_edge_embeds = torch.cat([target_edge_embeds, cn_target.to(target_edge_embeds.device)], dim=-1)
+                cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
             
             # Use the unified predictor for link prediction
             if getattr(predictor, 'lp_head_type', '') == 'mplp':
@@ -639,7 +641,9 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                     target_edge_embeds,
                     context_labels.long(),
                     link_prototypes,
-                    "link_prediction"
+                    "link_prediction",
+                    lp_cn_context=cn_context,
+                    lp_cn_target=cn_target
                 )
             if len(pred_output) == 3:  # MoE case with auxiliary loss
                 batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
@@ -660,9 +664,9 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             src_embeds = node_embeddings[batch_edges[:, 0]]
             dst_embeds = node_embeddings[batch_edges[:, 1]]
             target_edge_embeds = src_embeds * dst_embeds
+            cn_target = None
             if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
-                cn_target = _common_neighbor_count(adj_for_cn, batch_edges)
-                target_edge_embeds = torch.cat([target_edge_embeds, cn_target.to(target_edge_embeds.device)], dim=-1)
+                cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
             
             # Use the unified predictor for link prediction
             if getattr(predictor, 'lp_head_type', '') == 'mplp':
@@ -684,7 +688,9 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                     target_edge_embeds,
                     context_labels.long(),
                     link_prototypes,
-                    "link_prediction"
+                    "link_prediction",
+                    lp_cn_context=cn_context,
+                    lp_cn_target=cn_target
                 )
             if len(pred_output) == 3:  # MoE case with auxiliary loss
                 batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
