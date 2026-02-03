@@ -1456,7 +1456,6 @@ def get_feature_dropout_stats(original_features, dropped_features, dropout_type=
             'actual_dropout_rate': features_dropped
         }
 
-
 def apply_random_projection_augmentation(data, hidden_dim_range=None, activation_pool=None,
                                         seed=None, verbose=False, rank=0, use_random_noise=False, max_depth=1, dropout_rate=0.0,
                                         use_feature_mixing=False, mix_ratio=0.3, mix_alpha=0.5):
@@ -1519,9 +1518,12 @@ def apply_random_projection_augmentation(data, hidden_dim_range=None, activation
     if hidden_dim_range is None:
         # Default range: 0.5x to 2.0x the input dimension
         min_dim = max(int(input_dim * 0.5), 32)  # At least 32 dimensions
-        max_dim = int(input_dim * 2.0)
+        # Ensure max_dim is not below min_dim for small input dimensions
+        max_dim = max(int(input_dim * 2.0), min_dim)
     else:
         min_dim, max_dim = hidden_dim_range
+        if max_dim < min_dim:
+            raise ValueError(f"hidden_dim_range must satisfy min_dim <= max_dim, got ({min_dim}, {max_dim})")
 
     # ABLATION: Pure random Gaussian noise (no dependence on input features)
     if use_random_noise:

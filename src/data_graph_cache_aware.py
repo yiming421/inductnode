@@ -116,7 +116,7 @@ def load_ogb_fug_dataset_minimal(name, ogb_root='./dataset/ogb', fug_root='./fug
                 if graph.y.dtype.is_floating_point:
                     graph.task_mask = (~torch.isnan(graph.y)).float()
                 else:
-                    graph.task_mask = (graph.y != -1).float()
+                    graph.task_mask = torch.ones_like(graph.y, dtype=torch.float)
         
         # Create minimal FUG mapping (without the huge embedding tensor)
         fug_mapping_minimal = {

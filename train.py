@@ -823,7 +823,10 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
     Adapted from graph_classification.py for joint training.
     """
     processed_datasets = []
-    final_num_features = args.hidden
+    if getattr(args, 'use_mlp_projection', False):
+        final_num_features = args.mlp_projection_input_dim
+    else:
+        final_num_features = args.hidden
     
     for dataset, dataset_info in zip(datasets, processed_data_list):
         # Check if this is a TSGFM dataset - if so, disable PCA caching
@@ -849,7 +852,8 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 use_random_orthogonal=args.use_random_orthogonal,
                 plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir,
                 use_quantile_normalization=args.use_quantile_normalization,
-                quantile_norm_before_padding=args.quantile_norm_before_padding
+                quantile_norm_before_padding=args.quantile_norm_before_padding,
+                use_mlp_projection=getattr(args, 'use_mlp_projection', False)
             )
         else:
             processing_info = process_graph_features(
@@ -866,7 +870,8 @@ def process_datasets_for_models(datasets, processed_data_list, args, device, tes
                 use_random_orthogonal=args.use_random_orthogonal,
                 plot_tsne=args.plot_tsne, tsne_save_dir=args.tsne_save_dir,
                 use_quantile_normalization=args.use_quantile_normalization,
-                quantile_norm_before_padding=args.quantile_norm_before_padding
+                quantile_norm_before_padding=args.quantile_norm_before_padding,
+                use_mlp_projection=getattr(args, 'use_mlp_projection', False)
             )
 
         processed_datasets.append(dataset)
@@ -913,6 +918,13 @@ def create_unified_model(args, input_dim, device):
     else:
         hidden = args.hidden
     
+    # Override input dim if using MLP projection (debug mode)
+    if getattr(args, 'use_mlp_projection', False):
+        gnn_input_dim = input_dim
+        print(f"Model Input Override: Using MLP projection input dim {gnn_input_dim} -> {hidden}")
+    else:
+        gnn_input_dim = hidden
+
     # Create GNN backbone
     # Use ParameterFreeGCN when using GraphPFN (handles arbitrary dimensions)
     if getattr(args, 'use_graphpfn', False):
@@ -926,18 +938,18 @@ def create_unified_model(args, input_dim, device):
         print(f"ParameterFreeGCN: num_layers={args.num_layers}, dropout={args.dp}, "
               f"norm={args.norm}, residual={args.res}")
     elif args.model == 'PureGCN_v1':
-        model = PureGCN_v1(hidden, args.num_layers, hidden, args.dp, args.norm,
+        model = PureGCN_v1(gnn_input_dim, args.num_layers, hidden, args.dp, args.norm,
                           args.res, args.relu, args.gnn_norm_affine,
                           activation=getattr(args, 'activation', 'relu'),
                           use_virtual_node=getattr(args, 'use_virtual_node', False))
     elif args.model == 'GCN':
-        model = GCN(hidden, hidden, args.norm, args.relu, args.num_layers, args.dp,
+        model = GCN(gnn_input_dim, hidden, args.norm, args.relu, args.num_layers, args.dp,
                    args.multilayer, args.use_gin, args.res, args.gnn_norm_affine,
                    activation=getattr(args, 'activation', 'relu'))
     elif args.model == 'UnifiedGNN':
         model = UnifiedGNN(
             model_type=getattr(args, 'unified_model_type', 'gcn'),
-            in_feats=hidden,
+            in_feats=gnn_input_dim,
             h_feats=hidden,
             prop_step=getattr(args, 'num_layers', 2),  # Reuse num_layers as prop_step
             conv=getattr(args, 'conv_type', 'GCN'),
@@ -1051,8 +1063,20 @@ def create_unified_model(args, input_dim, device):
             gc_sim=args.gc_sim,
             gc_ridge_alpha=args.gc_ridge_alpha,
             head_num_layers=getattr(args, 'head_num_layers', 2),
+            nc_head_num_layers=getattr(args, 'nc_head_num_layers', None),
+            lp_head_num_layers=getattr(args, 'lp_head_num_layers', None),
+            lp_head_type=getattr(args, 'lp_head_type', 'standard'),
+            mplp_signature_dim=getattr(args, 'mplp_signature_dim', 64),
+            mplp_num_hops=getattr(args, 'mplp_num_hops', 2),
+            mplp_feature_combine=getattr(args, 'mplp_feature_combine', 'hadamard'),
+            mplp_prop_type=getattr(args, 'mplp_prop_type', 'combine'),
+            mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
+            mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
+            mplp_use_degree=getattr(args, 'mplp_use_degree', 'none'),
+            lp_concat_common_neighbors=getattr(args, 'lp_concat_common_neighbors', False),
             # NEW: Skip token formulation option
-            skip_token_formulation=getattr(args, 'skip_token_formulation', False)
+            skip_token_formulation=getattr(args, 'skip_token_formulation', False),
+            lp_use_linear_predictor=getattr(args, 'lp_use_linear_predictor', False)
         )
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
@@ -1510,10 +1534,12 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 print("Precomputing task-filtered splits for training datasets...")
                 for dataset_info in gc_train_processed_data_list:
                     task_filtered_splits = create_task_filtered_datasets(
-                        dataset_info['dataset'], 
+                        dataset_info['dataset'],
                         dataset_info['split_idx']
                     )
                     dataset_info['task_filtered_splits'] = task_filtered_splits
+                    if getattr(args, 'gc_supervised_mlp', False):
+                        dataset_info['gc_supervised_head'] = None
         else:
             gc_train_data_list, gc_train_processed_data_list = [], []
             print("  Skipping GC training data loading (using pretrained model)")
@@ -1613,6 +1639,8 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 # For test datasets, both references point to the same test-only filtered data
                 dataset_info['task_filtered_splits'] = task_filtered_splits_test
                 dataset_info['task_filtered_splits_test_only'] = task_filtered_splits_test
+                if getattr(args, 'gc_supervised_mlp', False):
+                    dataset_info['gc_supervised_head'] = None
     else:
         print("Graph classification task disabled, skipping dataset loading...")
 
@@ -2284,6 +2312,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
 
                 # Check if TTA is enabled for final test evaluation
                 use_tta = getattr(args, 'use_test_time_augmentation', False)
+                tta_gate_by_valid = getattr(args, 'tta_gate_by_valid', True)
                 num_context_samples = max(1, int(getattr(args, 'unseen_test_context_samples', 1)))
                 if num_context_samples > 1:
                     print(f"  Averaging test metrics over {num_context_samples} random context resamples")
@@ -2310,7 +2339,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                             projector, 0, identity_projection, None, args=args
                         )
                     if use_tta:
-                        # Use TTA for final test evaluation
+                        # Use TTA for final test evaluation (gating handled inside TTA when enabled)
                         from src.engine_nc import test_all_induct_with_tta
                         return test_all_induct_with_tta(
                             model, predictor, nc_data_list, nc_split_idx_list, args.test_batch_size,
@@ -2367,7 +2396,10 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     test_metrics = _average_metric_lists(all_test_metrics)
 
                 datasets_time = time.time() - datasets_start_time
-                tta_suffix = " (with TTA)" if use_tta else ""
+                if use_tta and tta_gate_by_valid:
+                    tta_suffix = " (TTA gated)"
+                else:
+                    tta_suffix = " (with TTA)" if use_tta else ""
                 print(f"  All {len(nc_data_list)} datasets completed in {datasets_time:.2f}s{tta_suffix}")
 
                 results = {
@@ -2513,7 +2545,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                 model, predictor, data, link_data_all[split_key], context_edges,
                                 args.test_batch_size, None, None, None, identity_projection,
                                 0, True, degree=False, k_values=[20, 50, 100],
-                                use_full_adj_for_test=True, lp_metric=args.lp_metric
+                                use_full_adj_for_test=True, lp_metric=args.lp_metric,
+                                lp_concat_common_neighbors=getattr(args, 'lp_concat_common_neighbors', False)
                             )
                             return lp_results.get('default_metric', 0.0)
 
@@ -2962,8 +2995,55 @@ def run_joint_training(args, device='cuda:0'):
     
     # Create unified model
     with lp_tracker.time_operation('data_preparation') if lp_tracker else nullcontext():
+        model_input_dim = args.mlp_projection_input_dim if getattr(args, 'use_mlp_projection', False) else args.hidden
         model, predictor, identity_projection, projector = create_unified_model(
-            args, args.hidden, device)
+            args, model_input_dim, device)
+
+    # Attach supervised GC heads (if enabled) after model creation
+    if getattr(args, 'gc_supervised_mlp', False) and getattr(args, 'enable_gc', True):
+        from src.model import GraphClassificationMLPHead
+        gc_heads = []
+        gc_head_ids = set()
+        head_by_name = {}
+
+        def _gc_dataset_key(dataset_info):
+            dataset = dataset_info.get('dataset', None)
+            name = getattr(dataset, 'name', None)
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+            return None
+
+        def _attach_head(dataset_info, fallback_key):
+            out_dim = int(dataset_info.get('num_tasks', 1))
+            key = _gc_dataset_key(dataset_info) or fallback_key
+            head = head_by_name.get(key)
+            if head is not None and getattr(head, 'out_dim', None) != out_dim:
+                # Avoid shape mismatch if same name is used with different task counts.
+                key = f"{key}:{out_dim}"
+                head = None
+            if head is None:
+                head = GraphClassificationMLPHead(
+                    in_dim=args.hidden,
+                    out_dim=out_dim,
+                    num_layers=max(1, getattr(args, 'head_num_layers', 2)),
+                    dropout=args.dp,
+                    norm=args.norm,
+                    norm_affine=args.mlp_norm_affine
+                ).to(device)
+                head_by_name[key] = head
+            dataset_info['gc_supervised_head'] = head
+            if id(head) not in gc_head_ids:
+                gc_heads.append(head)
+                gc_head_ids.add(id(head))
+
+        for idx, dataset_info in enumerate(data_dict.get('gc_train', ([], []))[1]):
+            _attach_head(dataset_info, f"gc_train_{idx}")
+
+        for idx, dataset_info in enumerate(data_dict.get('gc_test', ([], []))[1]):
+            _attach_head(dataset_info, f"gc_test_{idx}")
+
+        if gc_heads:
+            print(f"Supervised GC MLP heads initialized (unique): {len(gc_heads)}")
     
     if lp_tracker:
         lp_tracker.record_memory()
@@ -2995,6 +3075,17 @@ def run_joint_training(args, device='cuda:0'):
     # Use parameter groups for DE (lower lr due to ~50x larger gradients)
     de_lr_scale = getattr(args, 'de_lr_scale', 0.02)  # DE gets 2% of base lr by default
 
+    gc_supervised_heads = []
+    if getattr(args, 'gc_supervised_mlp', False) and getattr(args, 'enable_gc', True):
+        for dataset_info in data_dict.get('gc_train', ([], []))[1]:
+            head = dataset_info.get('gc_supervised_head')
+            if head is not None:
+                gc_supervised_heads.append(head)
+        for dataset_info in data_dict.get('gc_test', ([], []))[1]:
+            head = dataset_info.get('gc_supervised_head')
+            if head is not None and head not in gc_supervised_heads:
+                gc_supervised_heads.append(head)
+
     if args.use_dynamic_encoder and hasattr(model, 'de'):
         # Separate DE parameters from main model
         de_params = list(model.de.parameters())
@@ -3009,6 +3100,8 @@ def run_joint_training(args, device='cuda:0'):
                 for p in module.parameters():
                     if id(p) not in de_param_ids:
                         other_params.append(p)
+        for head in gc_supervised_heads:
+            other_params.extend(list(head.parameters()))
 
         # Parameter groups: DE gets lower lr
         param_groups = [
@@ -3022,6 +3115,8 @@ def run_joint_training(args, device='cuda:0'):
         for module in [model, predictor, identity_projection, projector, graphcl_projection_head]:
             if module is not None:
                 parameters.extend(list(module.parameters()))
+        for head in gc_supervised_heads:
+            parameters.extend(list(head.parameters()))
 
     if args.use_separate_optimizers:
         # Separate optimizers mode: one optimizer per task

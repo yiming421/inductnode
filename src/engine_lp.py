@@ -297,6 +297,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 context_src_embeds = node_embeddings[context_edge_pairs[:, 0]]
                 context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
                 context_edge_embeds = context_src_embeds * context_dst_embeds
+                if getattr(args, 'lp_concat_common_neighbors', False) and getattr(predictor, 'lp_head_type', '') != 'mplp':
+                    cn_context = _common_neighbor_count(adj_for_gnn, context_edge_pairs)
+                    context_edge_embeds = torch.cat([context_edge_embeds, cn_context.to(context_edge_embeds.device)], dim=-1)
 
                 batch_labels = labels[batch_indices]
                 batch_edges = edge_pairs[batch_indices]
@@ -305,6 +308,9 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 src_embeds = node_embeddings[batch_edges[:, 0]]
                 dst_embeds = node_embeddings[batch_edges[:, 1]]
                 target_edge_embeds = src_embeds * dst_embeds
+                if getattr(args, 'lp_concat_common_neighbors', False) and getattr(predictor, 'lp_head_type', '') != 'mplp':
+                    cn_target = _common_neighbor_count(adj_for_gnn, batch_edges)
+                    target_edge_embeds = torch.cat([target_edge_embeds, cn_target.to(target_edge_embeds.device)], dim=-1)
 
                 # Get link prototypes (binary class embeddings)
                 link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
@@ -314,8 +320,27 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     continue
 
                 # Use unified PFNPredictorNodeCls for link prediction
-                scores, link_prototypes = predictor(data_for_gnn, context_edge_embeds, target_edge_embeds, context_labels.long(),
-                                      link_prototypes, "link_prediction")
+                if getattr(predictor, 'lp_head_type', '') == 'mplp':
+                    scores, link_prototypes = predictor(
+                        data_for_gnn,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        adj_t=adj_for_gnn,
+                        lp_edges=batch_edges.t(),
+                        node_emb=node_embeddings
+                    )
+                else:
+                    scores, link_prototypes = predictor(
+                        data_for_gnn,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction"
+                    )
 
                 # Use the train_mask to ensure loss is only calculated on non-context edges
                 # Make sure the mask is properly aligned with batch indices
@@ -327,8 +352,17 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 else:
                     mask_for_loss = train_mask[batch_indices]
 
-                # Use CrossEntropyLoss for multi-class classification (link vs no-link)
-                nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
+                if scores.dim() == 1:
+                    # Use BCEWithLogitsLoss for binary classification (link vs no-link)
+                    mask_scores = scores[mask_for_loss]
+                    if mask_scores.dim() > 1:
+                        mask_scores = mask_scores.squeeze(-1)
+                    nll_loss = F.binary_cross_entropy_with_logits(
+                        mask_scores, batch_labels[mask_for_loss].float()
+                    )
+                else:
+                    # Fallback to original two-class loss when head is disabled
+                    nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
 
                 # Compute optional orthogonal loss on prototypes
                 if orthogonal_push > 0:
@@ -382,7 +416,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         # Final synchronization to ensure all processes complete training
         if dist.is_initialized() and dist.get_world_size() > 1:
             dist.barrier()
-        
+
         # Move persistent tensors back to CPU to free GPU memory
         train_edges['edge_pairs'] = train_edges['edge_pairs'].cpu()
         train_edges['labels'] = train_edges['labels'].cpu()
@@ -414,6 +448,68 @@ def get_evaluation_metric(dataset_name, lp_metric='auto'):
     else:
         return lp_metric
 
+
+def _common_neighbor_count(adj_t, edge_pairs):
+    """
+    Compute common neighbor counts for each edge (u, v) in edge_pairs.
+    Vectorized GPU-friendly implementation using CSR adjacency lists.
+
+    Args:
+        adj_t: SparseTensor adjacency.
+        edge_pairs: Tensor [E, 2] of edge endpoints.
+    Returns:
+        Tensor [E, 1] of common neighbor counts (float, on edge_pairs.device).
+    """
+    if edge_pairs.numel() == 0:
+        return torch.zeros((0, 1), device=edge_pairs.device)
+
+    if edge_pairs.dim() == 2 and edge_pairs.size(0) == 2:
+        edge_pairs = edge_pairs.t()
+
+    device = edge_pairs.device
+    num_nodes = adj_t.size(0)
+    rowptr, col, _ = adj_t.csr()
+    rowptr = rowptr.to(device)
+    col = col.to(device)
+
+    edges = edge_pairs.to(device)
+    E = edges.size(0)
+
+    def _gather_neighbors(nodes):
+        starts = rowptr[nodes]
+        ends = rowptr[nodes + 1]
+        counts = (ends - starts).to(torch.long)
+        total = int(counts.sum().item())
+        if total == 0:
+            return (torch.empty(0, device=device, dtype=col.dtype),
+                    torch.empty(0, device=device, dtype=torch.long))
+
+        prefix = torch.cumsum(counts, dim=0)
+        base = prefix - counts
+        base_rep = torch.repeat_interleave(base, counts)
+        rel = torch.arange(total, device=device) - base_rep
+        idx = torch.repeat_interleave(starts, counts) + rel
+        neighbors = col[idx]
+        edge_idx = torch.repeat_interleave(torch.arange(E, device=device), counts)
+        return neighbors, edge_idx
+
+    u_neighbors, u_edge_idx = _gather_neighbors(edges[:, 0])
+    v_neighbors, v_edge_idx = _gather_neighbors(edges[:, 1])
+
+    if u_neighbors.numel() == 0 or v_neighbors.numel() == 0:
+        return torch.zeros((E, 1), device=device)
+
+    keys_u = u_edge_idx.to(torch.int64) * num_nodes + u_neighbors.to(torch.int64)
+    keys_v = v_edge_idx.to(torch.int64) * num_nodes + v_neighbors.to(torch.int64)
+    keys = torch.cat([keys_u, keys_v], dim=0)
+
+    uniq, cnt = torch.unique(keys, return_counts=True)
+    edge_idx = (uniq // num_nodes).to(torch.long)
+
+    cn = torch.zeros(E, device=device, dtype=torch.float32)
+    cn.scatter_add_(0, edge_idx, (cnt == 2).to(torch.float32))
+    return cn.unsqueeze(1)
+
 def compute_mrr_citation2(pos_scores, neg_scores):
     """
     Compute MRR for ogbl-citation2 dataset with special format requirement.
@@ -442,7 +538,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                              att, mlp, projector=None, identity_projection=None, rank=0,
                              normalize_class_h=False, degree=False, evaluator=None,
                              neg_edges=None, k_values=[20, 50, 100], use_full_adj_for_test=True,
-                             lp_metric='auto'):
+                             lp_metric='auto', lp_concat_common_neighbors=False):
     """
     Evaluate link prediction using the PFN methodology with Hits@K metric.
     
@@ -463,12 +559,18 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         # Get node embeddings - use full_adj_t for test evaluation if available
         node_embeddings = get_node_embeddings(model, data, projector, identity_projection, use_full_adj_for_test, args=None, rank=rank)
         
+        # Choose adjacency for LP feature computation
+        adj_for_lp = data.full_adj_t if (use_full_adj_for_test and hasattr(data, 'full_adj_t') and data.full_adj_t is not None) else data.adj_t
+
         # Get context edge embeddings for PFN predictor
         context_edge_pairs = context_edges['edge_pairs'].to(device)
         context_labels = context_edges['labels'].to(device)
         context_src_embeds = node_embeddings[context_edge_pairs[:, 0]]
         context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
         context_edge_embeds = context_src_embeds * context_dst_embeds
+        if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
+            cn_context = _common_neighbor_count(adj_for_lp, context_edge_pairs)
+            context_edge_embeds = torch.cat([context_edge_embeds, cn_context.to(context_edge_embeds.device)], dim=-1)
         
         # Generate link prototypes
         link_prototypes = get_link_prototypes(node_embeddings, context_edges, att, mlp, normalize_class_h)
@@ -513,16 +615,39 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             src_embeds = node_embeddings[batch_edges[:, 0]]
             dst_embeds = node_embeddings[batch_edges[:, 1]]
             target_edge_embeds = src_embeds * dst_embeds
+            if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
+                cn_target = _common_neighbor_count(adj_for_cn, batch_edges)
+                target_edge_embeds = torch.cat([target_edge_embeds, cn_target.to(target_edge_embeds.device)], dim=-1)
             
             # Use the unified predictor for link prediction
-            pred_output = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(),
-                                   link_prototypes, "link_prediction")
+            if getattr(predictor, 'lp_head_type', '') == 'mplp':
+                pred_output = predictor(
+                    data,
+                    context_edge_embeds,
+                    target_edge_embeds,
+                    context_labels.long(),
+                    link_prototypes,
+                    "link_prediction",
+                    adj_t=adj_for_lp,
+                    lp_edges=batch_edges.t(),
+                    node_emb=node_embeddings
+                )
+            else:
+                pred_output = predictor(
+                    data,
+                    context_edge_embeds,
+                    target_edge_embeds,
+                    context_labels.long(),
+                    link_prototypes,
+                    "link_prediction"
+                )
             if len(pred_output) == 3:  # MoE case with auxiliary loss
                 batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
             else:  # Standard case
                 batch_scores, _ = pred_output
-            # Use the positive class score (class 1) and move to CPU immediately
-            pos_scores.append(batch_scores[:, 1].cpu())
+            if batch_scores.dim() > 1:
+                batch_scores = batch_scores[:, 1]
+            pos_scores.append(batch_scores.squeeze(-1).cpu())
         
         pos_scores = torch.cat(pos_scores, dim=0)
         
@@ -535,16 +660,39 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             src_embeds = node_embeddings[batch_edges[:, 0]]
             dst_embeds = node_embeddings[batch_edges[:, 1]]
             target_edge_embeds = src_embeds * dst_embeds
+            if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
+                cn_target = _common_neighbor_count(adj_for_cn, batch_edges)
+                target_edge_embeds = torch.cat([target_edge_embeds, cn_target.to(target_edge_embeds.device)], dim=-1)
             
             # Use the unified predictor for link prediction
-            pred_output = predictor(data, context_edge_embeds, target_edge_embeds, context_labels.long(),
-                                   link_prototypes, "link_prediction")
+            if getattr(predictor, 'lp_head_type', '') == 'mplp':
+                pred_output = predictor(
+                    data,
+                    context_edge_embeds,
+                    target_edge_embeds,
+                    context_labels.long(),
+                    link_prototypes,
+                    "link_prediction",
+                    adj_t=adj_for_lp,
+                    lp_edges=batch_edges.t(),
+                    node_emb=node_embeddings
+                )
+            else:
+                pred_output = predictor(
+                    data,
+                    context_edge_embeds,
+                    target_edge_embeds,
+                    context_labels.long(),
+                    link_prototypes,
+                    "link_prediction"
+                )
             if len(pred_output) == 3:  # MoE case with auxiliary loss
                 batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
             else:  # Standard case
                 batch_scores, _ = pred_output
-            # Use the positive class score (class 1) and move to CPU immediately  
-            neg_scores.append(batch_scores[:, 1].cpu())
+            if batch_scores.dim() > 1:
+                batch_scores = batch_scores[:, 1]
+            neg_scores.append(batch_scores.squeeze(-1).cpu())
         
         neg_scores = torch.cat(neg_scores, dim=0)
         
@@ -581,14 +729,15 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             pos_labels = torch.ones(pos_scores.size(0))
             neg_labels = torch.zeros(neg_scores.size(0))
             all_labels = torch.cat([pos_labels, neg_labels]).cpu().numpy()
-            all_scores = torch.cat([pos_scores, neg_scores]).cpu().numpy()
+            all_scores = torch.cat([pos_scores, neg_scores])
+            all_probs = torch.sigmoid(all_scores).cpu().numpy()
 
             # Compute AUC
-            auc_score = roc_auc_score(all_labels, all_scores)
+            auc_score = roc_auc_score(all_labels, all_probs)
             results['auc'] = auc_score
 
             # Compute accuracy (using 0.5 as threshold)
-            predictions = (all_scores > 0.5).astype(int)
+            predictions = (all_probs > 0.5).astype(int)
             acc_score = accuracy_score(all_labels, predictions)
             results['acc'] = acc_score
 

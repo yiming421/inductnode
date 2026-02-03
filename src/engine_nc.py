@@ -173,6 +173,73 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     total_nll_loss = 0
     total_de_loss = 0
     total_contrastive_loss = 0
+    total_grad_norm = 0.0
+    max_grad_norm = 0.0
+    grad_norm_count = 0
+
+    # Train-time TTA (full-batch only): precompute augmented feature views once per epoch
+    use_train_tta = args is not None and getattr(args, 'use_train_time_augmentation', False)
+    train_tta_num_augmentations = getattr(args, 'train_tta_num_augmentations', 1) if args is not None else 0
+    train_tta_include_original = getattr(args, 'train_tta_include_original', True) if args is not None else True
+    tta_base_features_list = None
+
+    if use_train_tta:
+        # Avoid degenerate config
+        if train_tta_num_augmentations <= 0 and not train_tta_include_original:
+            if rank == 0:
+                print("[Train-TTA] Disabled (no views configured).")
+            use_train_tta = False
+        else:
+            from src.data_utils import apply_random_projection_augmentation
+
+            # Determine PCA target dimension based on args (same as test-time TTA)
+            if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
+                pca_target_dim = args.projection_small_dim
+            else:
+                pca_target_dim = args.hidden
+
+            # Start from raw features if available (same as eval TTA)
+            raw_features = data.x_original if hasattr(data, 'x_original') else data.x
+            if not hasattr(data, 'x_original') and rank == 0:
+                print(f"[Train-TTA] WARNING: x_original not found for {getattr(data, 'name', 'unknown')}, using data.x")
+
+            tta_base_features_list = []
+            if train_tta_include_original:
+                tta_base_features_list.append(data.x)
+
+            # Seed offset to vary per epoch/dataset
+            dataset_hash = hash(getattr(data, 'name', 'default')) % 1000
+            for aug_idx in range(train_tta_num_augmentations):
+                seed = epoch * 100000 + aug_idx * 1000 + dataset_hash
+                data_aug = data.clone()
+                data_aug.x = raw_features.clone()
+
+                # Apply random projection augmentation (same as eval TTA)
+                data_aug = apply_random_projection_augmentation(
+                    data_aug,
+                    hidden_dim_range=None,
+                    activation_pool=None,
+                    seed=seed,
+                    verbose=False,
+                    rank=rank
+                )
+
+                # Apply PCA to target dimension (or pad if needed)
+                if data_aug.x.shape[1] >= pca_target_dim:
+                    U, S, V = torch.pca_lowrank(data_aug.x, q=pca_target_dim)
+                    data_aug.x_pca = torch.mm(U, torch.diag(S))
+                else:
+                    U, S, V = torch.pca_lowrank(data_aug.x, q=data_aug.x.shape[1])
+                    data_aug.x_pca = torch.mm(U, torch.diag(S))
+                    pad_size = pca_target_dim - data_aug.x_pca.shape[1]
+                    padding = torch.zeros(data_aug.x_pca.shape[0], pad_size, device=data_aug.x.device)
+                    data_aug.x_pca = torch.cat([data_aug.x_pca, padding], dim=1)
+
+                tta_base_features_list.append(data_aug.x_pca)
+
+            if rank == 0:
+                print(f"[Train-TTA] Enabled: {len(tta_base_features_list)} view(s) "
+                      f"(include_original={train_tta_include_original}, num_aug={train_tta_num_augmentations})")
     for batch_idx, perm in enumerate(dataloader):
         # Batch-level context refresh for this dataset
         if args is not None:
@@ -183,78 +250,114 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         train_perm_idx = train_idx[perm]
         
         base_features = data.x
+        context_y = data.y[data.context_sample]
+        device = base_features.device
 
         # Note: GPSE embeddings are already concatenated in process_data (data_utils.py)
         # No need to concatenate again here
 
-        # Apply different projection strategies
-        # Priority: Dynamic Encoder > FUG embeddings > identity projection > standard projection > raw features
-        if hasattr(data, 'uses_dynamic_encoder') and data.uses_dynamic_encoder:
-            # Dynamic Encoder: use raw features directly, DE will project inside model forward
-            x_input = base_features
-        elif hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
-            # FUG embeddings are uniform 1024-dim, just use simple MLP projection to hidden
-            # No need for PCA or identity projection since FUG already provides consistent embeddings
-            x_input = projector(base_features)
-        elif hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
-            x_input = identity_projection(base_features)
-        elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
-            projected_features = projector(base_features)
-            # Apply final PCA to get features in proper PCA form
-            if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
-                x_input = apply_final_pca(projected_features, projected_features.size(1))
-            else:
-                x_input = projected_features
-        else:
-            x_input = base_features
-
-        # Apply feature dropout AFTER projection
-        x_input = apply_feature_dropout_if_enabled(x_input, args, rank, training=model.training)
-
-        # Apply edge dropout if enabled
+        # Apply edge dropout if enabled (shared across views)
         adj_t_input = data.adj_t
         if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):
             verbose_dropout = getattr(args, 'verbose_edge_dropout', False) and rank == 0
             adj_t_input = edge_dropout_sparse_tensor(data.adj_t, args.edge_dropout_rate, training=model.training, verbose=verbose_dropout)
 
+        # Helper: forward pass for a given base feature tensor
+        def _forward_with_features(features):
+            # Apply different projection strategies
+            # Priority: Dynamic Encoder > FUG embeddings > identity projection > standard projection > raw features
+            if hasattr(data, 'uses_dynamic_encoder') and data.uses_dynamic_encoder:
+                x_input = features
+            elif hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
+                x_input = projector(features)
+            elif hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
+                x_input = identity_projection(features)
+            elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
+                projected_features = projector(features)
+                if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
+                    x_input = apply_final_pca(projected_features, projected_features.size(1))
+                else:
+                    x_input = projected_features
+            else:
+                x_input = features
 
-        # Memory-optimized forward pass with gradient checkpointing and chunking
-        # GNN forward pass
-        if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
-            # Use gradient checkpointing to reduce memory
-            h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
+            # Apply feature dropout AFTER projection
+            x_input = apply_feature_dropout_if_enabled(x_input, args, rank, training=model.training)
+
+            # GNN forward pass
+            if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
+                h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
+            else:
+                h = model(x_input, adj_t_input)
+
+            return h, x_input
+
+        if use_train_tta and tta_base_features_list is not None:
+            view_logits = []
+            saved_context_h = None
+            saved_target_h = None
+            saved_class_h = None
+            saved_x_input = None
+
+            for view_idx, view_features in enumerate(tta_base_features_list):
+                h, x_input = _forward_with_features(view_features)
+                context_h = h[data.context_sample]
+                target_h = h[train_perm_idx]
+
+                class_h = process_node_features(
+                    context_h, data,
+                    degree_normalize=degree,
+                    attention_pool_module=att if att is not None else None,
+                    mlp_module=mlp if mlp is not None else None,
+                    normalize=normalize_class_h
+                )
+
+                pred_output = pred(data, context_h, target_h, context_y, class_h)
+                if len(pred_output) == 3:
+                    out, _, _ = pred_output
+                else:
+                    out, _ = pred_output
+                view_logits.append(out)
+
+                if view_idx == 0:
+                    saved_context_h = context_h
+                    saved_target_h = target_h
+                    saved_class_h = class_h
+                    saved_x_input = x_input
+
+            score = torch.stack(view_logits).mean(dim=0)
+            context_h = saved_context_h
+            target_h = saved_target_h
+            class_h = saved_class_h
+            x_input = saved_x_input
         else:
-            # Standard forward pass
-            h = model(x_input, adj_t_input)
+            h, x_input = _forward_with_features(base_features)
 
         # Extract DE loss if model has Dynamic Encoder
-        de_loss = torch.tensor(0.0, device=h.device)
+        de_loss = torch.tensor(0.0, device=device)
         if hasattr(model, 'get_de_loss'):
             de_loss = model.get_de_loss()
 
         # Memory optimization: Extract needed embeddings immediately and delete large tensor
-        context_h = h[data.context_sample]
-        context_y = data.y[data.context_sample]
-        
-        # Extract target embeddings for this batch
-        target_h = h[train_perm_idx]
-        
-        # Fix type safety by properly handling None values
-        class_h = process_node_features(
-            context_h, data, 
-            degree_normalize=degree,
-            attention_pool_module=att if att is not None else None, 
-            mlp_module=mlp if mlp is not None else None, 
-            normalize=normalize_class_h
-        )
+        if not use_train_tta:
+            context_h = h[data.context_sample]
+            target_h = h[train_perm_idx]
+
+            class_h = process_node_features(
+                context_h, data,
+                degree_normalize=degree,
+                attention_pool_module=att if att is not None else None,
+                mlp_module=mlp if mlp is not None else None,
+                normalize=normalize_class_h
+            )
+
+            # Enable debug printing in predictor for first batch
+            if rank == 0 and batch_idx == 0:
+                pred._debug_print = True
+
+            score, class_h = pred(data, context_h, target_h, context_y, class_h)
 
         target_y = data.y[train_perm_idx]
-
-        # Enable debug printing in predictor for first batch
-        if rank == 0 and batch_idx == 0:
-            pred._debug_print = True
-
-        score, class_h = pred(data, context_h, target_h, context_y, class_h)
 
         # Compute contrastive augmentation loss if enabled
         # This compares Transformer-generated embeddings from original vs augmented features
@@ -473,6 +576,20 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         optimizer.zero_grad()
         loss.backward()
 
+        # Track gradient norm before clipping (NC only)
+        grad_norm_sq = 0.0
+        for module in (model, pred, att, mlp, projector, identity_projection):
+            if module is None:
+                continue
+            for p in module.parameters():
+                if p.grad is not None:
+                    grad_norm_sq += p.grad.data.norm(2).item() ** 2
+        batch_grad_norm = grad_norm_sq ** 0.5
+        total_grad_norm += batch_grad_norm
+        if batch_grad_norm > max_grad_norm:
+            max_grad_norm = batch_grad_norm
+        grad_norm_count += 1
+
         # Apply gradient clipping
         if clip_grad > 0:
             nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
@@ -497,12 +614,14 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     avg_nll_loss = total_nll_loss / len(dataloader)
     avg_de_loss = total_de_loss / len(dataloader)
     avg_contrastive_loss = total_contrastive_loss / len(dataloader)
+    avg_grad_norm = total_grad_norm / max(grad_norm_count, 1)
 
     # Print breakdown if DE or contrastive loss is being used
     if rank == 0 and (avg_de_loss > 0 or avg_contrastive_loss > 0):
         print(f"[RANK {rank}] Epoch {epoch} - Loss breakdown:")
         print(f"  Total: {avg_total_loss:.4f}")
         print(f"  NLL: {avg_nll_loss:.4f}")
+        print(f"  GradNorm: avg={avg_grad_norm:.4f} max={max_grad_norm:.4f}")
         if avg_de_loss > 0:
             print(f"  DE: {avg_de_loss:.6f} (scale: {avg_de_loss/avg_nll_loss*100:.2f}% of NLL)")
         if avg_contrastive_loss > 0:
@@ -525,14 +644,17 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                 print(f"    Uniformity: mean_vec_norm={diag.get('mean_vec_norm', 0):.6f} loss={diag.get('uniformity_loss', 0):.6f}")
     else:
         loss_str = f"{avg_total_loss:.4f}" if optimizer is not None else "tensor"
-        print(f"[RANK {rank}] Completed training epoch {epoch}, loss: {loss_str}", flush=True)
+        print(f"[RANK {rank}] Completed training epoch {epoch}, loss: {loss_str}, "
+              f"grad_norm(avg/max): {avg_grad_norm:.4f}/{max_grad_norm:.4f}", flush=True)
 
     # Return dictionary with breakdown for logging
     return {
         'total': avg_total_loss,
         'nll': avg_nll_loss,
         'de': avg_de_loss,
-        'contrastive': avg_contrastive_loss
+        'contrastive': avg_contrastive_loss,
+        'grad_norm_avg': avg_grad_norm,
+        'grad_norm_max': max_grad_norm
     }
 
 def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, degree=False, att=None,
@@ -1172,6 +1294,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
     tta_num_augmentations = getattr(args, 'tta_num_augmentations', 5)
     tta_include_original = getattr(args, 'tta_include_original', True)
     tta_aggregation = getattr(args, 'tta_aggregation', 'logits')
+    tta_gate_by_valid = getattr(args, 'tta_gate_by_valid', True)
 
     if rank == 0:
         print(f"\n{'='*80}")
@@ -1179,6 +1302,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         print(f"  Number of augmentations: {tta_num_augmentations}")
         print(f"  Include original: {tta_include_original}")
         print(f"  Aggregation strategy: {tta_aggregation}")
+        print(f"  Gate by valid: {tta_gate_by_valid}")
         print(f"  Total versions per graph: {tta_num_augmentations + (1 if tta_include_original else 0)}")
         print(f"{'='*80}\n")
 
@@ -1194,6 +1318,12 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         valid_idx = split_idx['valid']
         test_idx = split_idx['test']
         external_embeddings = external_embeddings_list[dataset_idx] if external_embeddings_list else None
+
+        # Determine PCA target dimension based on args (same as in process_data)
+        if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
+            pca_target_dim = args.projection_small_dim
+        else:
+            pca_target_dim = args.hidden
 
         # Create augmented versions
         augmented_data_list = []
@@ -1224,12 +1354,6 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             )
 
             # Step 3: Apply PCA to augmented features
-            # Determine PCA target dimension based on args (same as in process_data)
-            if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
-                pca_target_dim = args.projection_small_dim
-            else:
-                pca_target_dim = args.hidden
-
             # Apply PCA to target dimension (or less if we don't have enough features)
             if data_aug.x.shape[1] >= pca_target_dim:
                 # PCA to target dimension
@@ -1348,10 +1472,6 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             valid_logits_agg = F.one_hot(valid_pred_mode, num_classes=num_classes).float() * 10.0
             test_logits_agg = F.one_hot(test_pred_mode, num_classes=num_classes).float() * 10.0
 
-        # Get base predictions from aggregated logits
-        train_score_base = train_logits_agg.argmax(dim=-1)
-        valid_score_base = valid_logits_agg.argmax(dim=-1)
-        test_score_base = test_logits_agg.argmax(dim=-1)
 
         metric_device = train_logits_agg.device
         y_device = data.y.to(metric_device)
@@ -1360,6 +1480,38 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         test_idx_dev = test_idx.to(metric_device)
         context_sample_dev = data.context_sample.to(metric_device)
 
+        # Optionally gate TTA by validation performance (per dataset)
+        train_logits_sel = train_logits_agg
+        valid_logits_sel = valid_logits_agg
+        test_logits_sel = test_logits_agg
+
+        if tta_gate_by_valid:
+            if not tta_include_original:
+                if rank == 0:
+                    print("    [TTA] Gating skipped (tta_include_original=False).")
+            else:
+                train_logits_base = all_train_logits[0]
+                valid_logits_base = all_valid_logits[0]
+                test_logits_base = all_test_logits[0]
+
+                valid_acc_base = (valid_logits_base.argmax(dim=-1) == y_device[valid_idx_dev]).float().mean().item()
+                valid_acc_tta = (valid_logits_agg.argmax(dim=-1) == y_device[valid_idx_dev]).float().mean().item()
+
+                if valid_acc_tta > valid_acc_base:
+                    if rank == 0:
+                        print(f"    [TTA] Valid improved: {valid_acc_base:.4f} → {valid_acc_tta:.4f} ✓")
+                else:
+                    train_logits_sel = train_logits_base
+                    valid_logits_sel = valid_logits_base
+                    test_logits_sel = test_logits_base
+                    if rank == 0:
+                        print(f"    [TTA] Valid not improved: {valid_acc_tta:.4f} ≤ {valid_acc_base:.4f} (using original)")
+
+        # Get base predictions from selected logits
+        train_score_base = train_logits_sel.argmax(dim=-1)
+        valid_score_base = valid_logits_sel.argmax(dim=-1)
+        test_score_base = test_logits_sel.argmax(dim=-1)
+
         # Apply C&S if enabled (Post-TTA aggregation)
         if use_cs:
             if rank == 0:
@@ -1367,9 +1519,9 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
             # Build full logits tensor for all nodes
             all_logits = torch.zeros(data.num_nodes, train_logits_agg.size(1), device=metric_device)
-            all_logits[train_idx_dev] = train_logits_agg
-            all_logits[valid_idx_dev] = valid_logits_agg
-            all_logits[test_idx_dev] = test_logits_agg
+            all_logits[train_idx_dev] = train_logits_sel
+            all_logits[valid_idx_dev] = valid_logits_sel
+            all_logits[test_idx_dev] = test_logits_sel
 
             # Get context for C&S
             context_y = y_device[context_sample_dev]

@@ -648,6 +648,29 @@ class MLPPredictor(nn.Module):
         x = self.lins[-1](x)
         return x.squeeze()
 
+
+class GraphClassificationMLPHead(nn.Module):
+    """Supervised MLP head for graph classification (multi-task or single-task)."""
+    def __init__(self, in_dim, out_dim, num_layers=2, dropout=0.2, norm=False, norm_affine=True):
+        super().__init__()
+        self.out_dim = out_dim
+        self.mlp = MLP(
+            in_channels=in_dim,
+            hidden_channels=in_dim,
+            out_channels=out_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+
+    def forward(self, x):
+        out = self.mlp(x)
+        if out.dim() == 1:
+            out = out.unsqueeze(0)
+        return out
+
 class Prodigy_Predictor(nn.Module):
     def __init__(self, norm=False):
         super().__init__()
@@ -1066,36 +1089,15 @@ class LinkPredictionHead(nn.Module):
         self.hidden_dim = hidden_dim
         self.sim = sim
         self.ridge_alpha = ridge_alpha
+        self.head_num_layers = head_num_layers
 
-        # Input normalization layers to stabilize features from transformer
-        # Separate norms for target and context since they may have different statistics
-        self.target_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
-        self.context_input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine)
-
-        # Initialize LayerNorms to identity-like (weight=1, bias=0) to avoid disrupting embeddings
-        if norm_affine:
-            nn.init.ones_(self.target_input_norm.weight)
-            nn.init.zeros_(self.target_input_norm.bias)
-            nn.init.ones_(self.context_input_norm.weight)
-            nn.init.zeros_(self.context_input_norm.bias)
-
-        # Task-specific projection MLP
-        self.proj = MLP(
-            in_channels=hidden_dim,
-            hidden_channels=hidden_dim,
-            out_channels=hidden_dim,
-            num_layers=head_num_layers,
-            dropout=dropout,
-            norm=norm,
-            tailact=False,
-            norm_affine=norm_affine
-        )
-        # Initialize to approximate identity to avoid disrupting embeddings
-        self.proj._init_identity_like()
-
-        # Optional MLP for similarity computation
-        if sim == 'mlp':
-            self.sim_mlp = MLP(
+        if head_num_layers > 0:
+            self.linear = nn.Linear(hidden_dim, 1)
+            self.proj = None
+            self.sim_mlp = None
+        else:
+            self.linear = None
+            self.proj = MLP(
                 in_channels=hidden_dim,
                 hidden_channels=hidden_dim,
                 out_channels=hidden_dim,
@@ -1105,8 +1107,19 @@ class LinkPredictionHead(nn.Module):
                 tailact=False,
                 norm_affine=norm_affine
             )
-            # Initialize to approximate identity
-            self.sim_mlp._init_identity_like()
+            self.proj._init_identity_like()
+            if sim == 'mlp':
+                self.sim_mlp = MLP(
+                    in_channels=hidden_dim,
+                    hidden_channels=hidden_dim,
+                    out_channels=hidden_dim,
+                    num_layers=head_num_layers,
+                    dropout=dropout,
+                    norm=norm,
+                    tailact=False,
+                    norm_affine=norm_affine
+                )
+                self.sim_mlp._init_identity_like()
 
     def forward(self, target_label_emb, context_label_emb, context_y, class_x,
                 attention_pool_module=None, mlp_module=None, normalize=False):
@@ -1121,76 +1134,64 @@ class LinkPredictionHead(nn.Module):
             normalize: Whether to normalize embeddings
 
         Returns:
-            logits: [num_target, 2] - scores for no-link and link
+            logits: [num_target] when head layers enabled, or [num_target, 2] when head is disabled
             class_emb: [2, hidden_dim] - link prototypes
         """
-        # Project embeddings through task-specific head (restore 9fa7dd8 behavior)
+        if self.linear is not None:
+            if target_label_emb.dim() == 1:
+                target_label_emb = target_label_emb.unsqueeze(0)
+            logits = self.linear(target_label_emb).squeeze(-1)
+            return logits, class_x
+
         target_label_emb = self.proj(target_label_emb)
         context_label_emb = self.proj(context_label_emb)
 
-        # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
         if target_label_emb.dim() == 1:
             target_label_emb = target_label_emb.unsqueeze(0)
         if context_label_emb.dim() == 1:
             context_label_emb = context_label_emb.unsqueeze(0)
 
-        # Compute link prototypes (custom pooling for link prediction)
         device = target_label_emb.device
-        num_classes = class_x.size(0)  # Should be 2 for link prediction
+        num_classes = class_x.size(0)
         actual_hidden_dim = target_label_emb.size(-1)
         class_emb = torch.zeros(num_classes, actual_hidden_dim, device=device, dtype=target_label_emb.dtype)
 
-        # Pool refined embeddings for each class
         for class_idx in range(num_classes):
             class_mask = (context_y == class_idx)
             if class_mask.any():
                 if attention_pool_module is not None:
-                    # Use attention pooling if available
                     class_embeddings = context_label_emb[class_mask]
                     class_labels = torch.zeros(class_embeddings.size(0), dtype=torch.long, device=device)
                     class_emb[class_idx] = attention_pool_module(class_embeddings, class_labels, num_classes=1).squeeze(0)
                 else:
-                    # Use mean pooling as fallback
                     class_emb[class_idx] = context_label_emb[class_mask].mean(dim=0)
 
-        # Apply MLP if specified
         if mlp_module is not None:
             class_emb = mlp_module(class_emb)
 
-        # Normalize if specified
         if normalize:
             class_emb = F.normalize(class_emb, p=2, dim=-1)
 
-        # Compute logits using similarity or ridge regression
         if self.sim == 'ridge':
-            # Ridge Regression: W = (X^T X + λI)^{-1} X^T Y
-            num_classes = 2  # Always 2 for link prediction (no-link, link)
-            
-            # Input validation
+            num_classes = 2
             if context_y.numel() == 0:
                 raise ValueError("Context labels cannot be empty for ridge regression")
             if self.ridge_alpha <= 0:
                 raise ValueError("Ridge alpha must be positive for numerical stability")
             if context_label_emb.size(0) < 2:
                 raise ValueError("Ridge regression requires at least 2 support samples")
-            
-            # One-hot encode labels
+
             support_y = F.one_hot(context_y.long(), num_classes=num_classes).float()
-            
-            # Solve ridge regression
             XtX = context_label_emb.t() @ context_label_emb
             XtY = context_label_emb.t() @ support_y
-            
-            # Add regularization
             I = torch.eye(context_label_emb.size(1), device=context_label_emb.device)
             try:
                 W = torch.linalg.solve(XtX + self.ridge_alpha * I, XtY)
             except torch.linalg.LinAlgError as e:
                 raise RuntimeError(f"Ridge regression solver failed - try increasing ridge_alpha. Error: {e}")
-            
-            # Predict
+
             logits = target_label_emb @ W
-            class_emb = None  # Not used in ridge regression
+            class_emb = None
         elif self.sim == 'dot':
             logits = torch.matmul(target_label_emb, class_emb.t())
         elif self.sim == 'cos':
@@ -1368,6 +1369,209 @@ class GraphClassificationHead(nn.Module):
         return logits, class_emb
 
 
+class MPLPPredictor(nn.Module):
+    """
+    MPLP+ Predictor that uses randomized node labeling for structural features.
+    Combines structural features (from RandomizedNodeLabeling) with node features.
+    """
+    def __init__(self, hidden_dim, dropout=0.2, signature_dim=64, num_hops=2, feature_combine='hadamard',
+                 head_num_layers=2, prop_type='combine', edge_feat_dim=None,
+                 signature_sampling='torchhd', use_subgraph=True):
+        super().__init__()
+        self.use_node_features = use_node_features
+        self.feature_combine = feature_combine
+        
+        # 1. Randomized Structural Encoding
+        from .node_label import RandomizedNodeLabeling
+        self.node_labeling = RandomizedNodeLabeling(
+            signature_dim=signature_dim,
+            num_hops=num_hops,
+            prop_type=prop_type,
+            signature_sampling=signature_sampling,
+            use_subgraph=use_subgraph
+        )
+        
+        # Structural Feature Encoder (Original MPLP+ style: 5->5, 1 layer)
+        structural_input_dim = 15 if prop_type == 'combine' else 5
+        self.struct_encode = MLP(
+            in_channels=structural_input_dim,
+            hidden_channels=structural_input_dim,
+            out_channels=structural_input_dim,
+            num_layers=1,
+            dropout=dropout,
+            norm=True,
+            tailact=True
+        )
+        
+        # Feature Encoder for the input edge embedding (refines PFN output)
+        edge_feat_dim = hidden_dim if edge_feat_dim is None else edge_feat_dim
+        self.feat_encode = MLP(
+            in_channels=edge_feat_dim,
+            hidden_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_layers=2,
+            dropout=dropout,
+            norm=True
+        )
+        
+        # Final Classifier (Struct + Feat)
+        # Using MLP to allow interaction between structure and features
+        self.classifier = MLP(
+            in_channels=hidden_dim + structural_input_dim,
+            hidden_channels=hidden_dim,
+            out_channels=1,
+            num_layers=head_num_layers,
+            dropout=dropout,
+            norm=True
+        )
+        
+    def forward(self, x, adj_t, edges):
+        """
+        Args:
+            x: Node features [num_nodes, hidden_dim]
+            adj_t: Adjacency matrix (SparseTensor)
+            edges: Target edges [2, num_edges]
+        """
+        # 1. Compute Node Weights (Adamic-Adar style: 1/log(d))
+        # This helps the random labeling capture "weighted" overlap
+        degree = adj_t.sum(dim=1)
+        # Avoid log(0) or div by zero. Add 1 to degree so log(d+1) > 0
+        node_weight = torch.sqrt(1.0 / (torch.log(degree + 1.0) + 1e-6))
+        
+        # 2. Get Randomized Structural Features
+        # Ensure edges are [2, E]
+        if edges.size(0) != 2:
+            edges = edges.t()
+            
+        struct_feats = self.node_labeling(edges, adj_t, node_weight)
+        struct_emb = self.struct_encode(struct_feats)
+        
+        # 3. Process Node Features
+        if self.use_node_features:
+            row, col = edges
+            x_u = x[row]
+            x_v = x[col]
+            
+            if self.feature_combine == 'hadamard':
+                feat_combined = x_u * x_v
+            elif self.feature_combine == 'concat':
+                feat_combined = torch.cat([x_u, x_v], dim=-1)
+                
+            feat_emb = self.feat_encode(feat_combined)
+            
+            # Combine Structural and Feature Embeddings
+            final_emb = torch.cat([struct_emb, feat_emb], dim=-1)
+        else:
+            final_emb = struct_emb
+            
+        # 4. Predict
+        return self.classifier(final_emb).squeeze(-1)
+
+
+class MPLPLinkPredictionHead(nn.Module):
+    """
+    Link Prediction Head using MPLP randomized structural features.
+    """
+    def __init__(self, hidden_dim, dropout=0.2, signature_dim=64, num_hops=2, feature_combine='hadamard',
+                 head_num_layers=2, prop_type='combine', edge_feat_dim=None,
+                 signature_sampling='torchhd', use_subgraph=True, use_degree='none'):
+        super().__init__()
+        self.feature_combine = feature_combine
+        self.use_degree = use_degree
+        
+        # Randomized Structural Encoding
+        from .node_label import RandomizedNodeLabeling
+        self.node_labeling = RandomizedNodeLabeling(
+            signature_dim=signature_dim,
+            num_hops=num_hops,
+            prop_type=prop_type,
+            signature_sampling=signature_sampling,
+            use_subgraph=use_subgraph
+        )
+        
+        # Structural Feature Encoder (Original MPLP+ style: 5->5, 1 layer)
+        structural_input_dim = 15 if prop_type == 'combine' else 5
+        self.struct_encode = MLP(
+            in_channels=structural_input_dim,
+            hidden_channels=structural_input_dim,
+            out_channels=structural_input_dim,
+            num_layers=1,
+            dropout=dropout,
+            norm=True,
+            tailact=True
+        )
+        
+        # Feature Encoder for the input edge embedding (refines PFN output)
+        edge_feat_dim = hidden_dim if edge_feat_dim is None else edge_feat_dim
+        self.feat_encode = MLP(
+            in_channels=edge_feat_dim,
+            hidden_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_layers=2,
+            dropout=dropout,
+            norm=True
+        )
+        
+        # Final Classifier (Struct + Feat)
+        # Using MLP to allow interaction between structure and features
+        self.classifier = MLP(
+            in_channels=hidden_dim + structural_input_dim,
+            hidden_channels=hidden_dim,
+            out_channels=1,
+            num_layers=head_num_layers,
+            dropout=dropout,
+            norm=True
+        )
+
+        self.node_weight_mlp = None
+        if self.use_degree == 'mlp':
+            self.node_weight_mlp = MLP(
+                in_channels=hidden_dim + 1,
+                hidden_channels=32,
+                out_channels=1,
+                num_layers=2,
+                dropout=dropout,
+                norm=True
+            )
+
+    def forward(self, edge_emb, adj_t, edges, node_emb=None):
+        """
+        Args:
+            edge_emb: Refined edge embeddings from Transformer [batch_size, hidden_dim]
+            adj_t: Adjacency matrix (SparseTensor)
+            edges: Edge indices [2, batch_size]
+        """
+        # 1. Compute Node Weights (Inverse Log Degree)
+        node_weight = None
+        if self.use_degree == 'aa':
+            degree = adj_t.sum(dim=1)
+            node_weight = torch.sqrt(1.0 / (torch.log(degree + 1.0) + 1e-6))
+        elif self.use_degree == 'ra':
+            degree = adj_t.sum(dim=1)
+            node_weight = torch.sqrt(1.0 / (degree + 1e-6))
+        elif self.use_degree == 'mlp':
+            if node_emb is None:
+                raise ValueError("use_degree='mlp' requires node_emb to be provided.")
+            degree = adj_t.sum(dim=1).view(-1, 1)
+            node_weight_feat = torch.cat([node_emb, degree], dim=1)
+            node_weight = self.node_weight_mlp(node_weight_feat).squeeze(-1) + 1.0
+        
+        # 2. Get Structural Features
+        # Ensure edges are [2, E]
+        if edges.size(0) != 2:
+            edges = edges.t()
+            
+        struct_feats = self.node_labeling(edges, adj_t, node_weight)
+        struct_emb = self.struct_encode(struct_feats)
+        
+        # 3. Process Edge Features (from PFN)
+        feat_emb = self.feat_encode(edge_emb)
+        
+        # 4. Combine and Predict
+        final_emb = torch.cat([struct_emb, feat_emb], dim=-1)
+        return self.classifier(final_emb).squeeze(-1)
+
+
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2,
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
@@ -1383,8 +1587,20 @@ class PFNPredictorNodeCls(nn.Module):
                  gc_sim='dot', gc_ridge_alpha=1.0,
                  head_num_layers=2,
                  # NEW: Option to skip token formulation
-                 skip_token_formulation=False):
+                 skip_token_formulation=False,
+                 # NEW: Simple linear baseline for LP
+                 lp_use_linear_predictor=False,
+                 # NEW: LP Head Type
+                 lp_head_type='standard',
+                 mplp_signature_dim=64, mplp_num_hops=2, mplp_feature_combine='hadamard',
+                 mplp_prop_type='combine',
+                 mplp_signature_sampling='torchhd',
+                 mplp_use_subgraph=True,
+                 mplp_use_degree='none',
+                 nc_head_num_layers=None, lp_head_num_layers=None,
+                 lp_concat_common_neighbors=False):
         super(PFNPredictorNodeCls, self).__init__()
+        self.lp_head_type = lp_head_type
         self.hidden_dim = hidden_dim
         self.d_label = hidden_dim  # Label embedding has the same dimension as node features
         self.embed_dim = hidden_dim + self.d_label  # Token dimension after concatenation
@@ -1392,6 +1608,14 @@ class PFNPredictorNodeCls(nn.Module):
         self.padding = padding
         self.use_matching_network = use_matching_network
         self.skip_token_formulation = skip_token_formulation
+        self.lp_use_linear_predictor = lp_use_linear_predictor
+        self.lp_linear_head = nn.Linear(hidden_dim, 1) if lp_use_linear_predictor else None
+        self.mplp_prop_type = mplp_prop_type
+        self.mplp_signature_sampling = mplp_signature_sampling
+        self.mplp_use_subgraph = mplp_use_subgraph
+        self.mplp_use_degree = mplp_use_degree
+        # CN concat is not applied to MPLP head
+        self.lp_concat_common_neighbors = lp_concat_common_neighbors and self.lp_head_type != 'mplp'
 
         # Separate ridge regression configurations
         # Use explicit task-specific parameters - they have proper defaults from config
@@ -1402,6 +1626,8 @@ class PFNPredictorNodeCls(nn.Module):
         self.gc_sim = gc_sim
         self.gc_ridge_alpha = gc_ridge_alpha
         self.head_num_layers = head_num_layers
+        self.nc_head_num_layers = head_num_layers if nc_head_num_layers is None else nc_head_num_layers
+        self.lp_head_num_layers = head_num_layers if lp_head_num_layers is None else lp_head_num_layers
 
         if self.padding == 'mlp':
             self.pad_mlp = MLP(
@@ -1484,18 +1710,35 @@ class PFNPredictorNodeCls(nn.Module):
             norm_affine=norm_affine,
             sim=self.nc_sim,
             ridge_alpha=self.nc_ridge_alpha,
-            head_num_layers=self.head_num_layers
+            head_num_layers=self.nc_head_num_layers
         )
 
-        self.lp_head = LinkPredictionHead(
-            hidden_dim=head_hidden_dim,
-            dropout=dropout,
-            norm=norm,
-            norm_affine=norm_affine,
-            sim=self.lp_sim,
-            ridge_alpha=self.lp_ridge_alpha,
-            head_num_layers=self.head_num_layers
-        )
+        lp_head_input_dim = head_hidden_dim + (1 if self.lp_concat_common_neighbors else 0)
+
+        if self.lp_head_type == 'mplp':
+            self.lp_head = MPLPLinkPredictionHead(
+                hidden_dim=head_hidden_dim,
+                dropout=dropout,
+                signature_dim=mplp_signature_dim,
+                num_hops=mplp_num_hops,
+                feature_combine=mplp_feature_combine,
+                head_num_layers=self.lp_head_num_layers,
+                prop_type=self.mplp_prop_type,
+                signature_sampling=self.mplp_signature_sampling,
+                use_subgraph=self.mplp_use_subgraph,
+                use_degree=self.mplp_use_degree,
+                edge_feat_dim=lp_head_input_dim
+            )
+        else:
+            self.lp_head = LinkPredictionHead(
+                hidden_dim=lp_head_input_dim,
+                dropout=dropout,
+                norm=norm,
+                norm_affine=norm_affine,
+                sim=self.lp_sim,
+                ridge_alpha=self.lp_ridge_alpha,
+                head_num_layers=self.lp_head_num_layers
+            )
 
         self.gc_head = GraphClassificationHead(
             hidden_dim=head_hidden_dim,
@@ -1507,7 +1750,7 @@ class PFNPredictorNodeCls(nn.Module):
             head_num_layers=self.head_num_layers
         )
     
-    def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification'):
+    def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification', adj_t=None, lp_edges=None, node_emb=None):
         """
         Unified forward pass supporting node classification, link prediction, and graph classification.
 
@@ -1532,6 +1775,10 @@ class PFNPredictorNodeCls(nn.Module):
         - context_y: Context graph labels
         - class_x: Class prototypes [num_classes, hidden_dim]
         """
+        if task_type == 'link_prediction' and self.lp_use_linear_predictor:
+            logits = self.lp_linear_head(target_x).squeeze(-1)
+            return logits, class_x
+
         if self.skip_token_formulation:
             # NEW PATH: Skip token formulation, use GNN embeddings directly
             # Step 1: Prepare for transformer (add sequence dimension)
@@ -1600,15 +1847,21 @@ class PFNPredictorNodeCls(nn.Module):
                 normalize=self.normalize
             )
         elif task_type == 'link_prediction':
-            logits, class_emb = self.lp_head(
-                target_label_emb=target_label_emb,
-                context_label_emb=context_label_emb,
-                context_y=context_y,
-                class_x=class_x,
-                attention_pool_module=self.att,
-                mlp_module=self.mlp_pool,
-                normalize=self.normalize
-            )
+            if self.lp_head_type == 'mplp':
+                if adj_t is None or lp_edges is None:
+                    raise ValueError("MPLP head requires adj_t and lp_edges to be passed to forward()")
+                logits = self.lp_head(target_label_emb, adj_t, lp_edges, node_emb=node_emb)
+                class_emb = class_x # Keep prototypes as is (not updated by MPLP)
+            else:
+                logits, class_emb = self.lp_head(
+                    target_label_emb=target_label_emb,
+                    context_label_emb=context_label_emb,
+                    context_y=context_y,
+                    class_x=class_x,
+                    attention_pool_module=self.att,
+                    mlp_module=self.mlp_pool,
+                    normalize=self.normalize
+                )
         elif task_type == 'graph_classification':
             logits, class_emb = self.gc_head(
                 target_label_emb=target_label_emb,

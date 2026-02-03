@@ -320,7 +320,16 @@ def create_model_from_args(args, input_dim, device):
             use_matching_network=getattr(args, 'use_matching_network', False),
             matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
             matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
-            matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True)
+            matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
+            lp_use_linear_predictor=getattr(args, 'lp_use_linear_predictor', False),
+            lp_head_type=getattr(args, 'lp_head_type', 'standard'),
+            mplp_signature_dim=getattr(args, 'mplp_signature_dim', 64),
+            mplp_num_hops=getattr(args, 'mplp_num_hops', 2),
+            mplp_feature_combine=getattr(args, 'mplp_feature_combine', 'hadamard'),
+            mplp_prop_type=getattr(args, 'mplp_prop_type', 'combine'),
+            mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
+            mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
+            mplp_use_degree=getattr(args, 'mplp_use_degree', 'none')
         ).to(device) if args.predictor == 'PFN' else None
     
     projector = MLP(args.min_pca_dim, args.hidden, args.hidden, 2, args.dp, args.norm, False, args.mlp_norm_affine).to(device) if args.use_projector else None
@@ -368,7 +377,16 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
         use_matching_network=getattr(args, 'use_matching_network', False),
         matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
         matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
-        matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True)
+        matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
+        lp_use_linear_predictor=getattr(args, 'lp_use_linear_predictor', False),
+        lp_head_type=getattr(args, 'lp_head_type', 'standard'),
+        mplp_signature_dim=getattr(args, 'mplp_signature_dim', 64),
+        mplp_num_hops=getattr(args, 'mplp_num_hops', 2),
+        mplp_feature_combine=getattr(args, 'mplp_feature_combine', 'hadamard'),
+        mplp_prop_type=getattr(args, 'mplp_prop_type', 'combine'),
+        mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
+        mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
+        mplp_use_degree=getattr(args, 'mplp_use_degree', 'none')
     ).to(device) if args.predictor == 'PFN' else None
     
     # 3. Load the saved states into the newly created objects
@@ -398,17 +416,43 @@ def load_checkpoint_states(checkpoint, model, predictor=None, optimizer=None,
     
     if predictor is not None:
         if hasattr(predictor, 'module'):
-            predictor.module.load_state_dict(checkpoint['predictor_state_dict'])
+            predictor_target = predictor.module
         else:
-            predictor.load_state_dict(checkpoint['predictor_state_dict'])
+            predictor_target = predictor
+        try:
+            predictor_target.load_state_dict(checkpoint['predictor_state_dict'], strict=True)
+        except RuntimeError as e:
+            # Backward-compat: allow extra keys from older checkpoints (e.g., deprecated LP head norms)
+            missing_keys, unexpected_keys = predictor_target.load_state_dict(
+                checkpoint['predictor_state_dict'], strict=False
+            )
+            if rank == 0:
+                print("⚠️ Predictor state mismatch; loaded with strict=False.")
+                print(f"   Missing keys: {len(missing_keys)} | Unexpected keys: {len(unexpected_keys)}")
+                if unexpected_keys:
+                    preview = ', '.join(unexpected_keys[:10])
+                    print(f"   Unexpected (first {min(10, len(unexpected_keys))}): {preview}")
+                if missing_keys:
+                    preview = ', '.join(missing_keys[:10])
+                    print(f"   Missing (first {min(10, len(missing_keys))}): {preview}")
     
     # Load optimizer state if provided
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except ValueError as e:
+            if rank == 0:
+                print("⚠️ Optimizer state mismatch; skipping optimizer load.")
+                print(f"   Reason: {e}")
+
     # Load scheduler state if available
     if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        except Exception as e:
+            if rank == 0:
+                print("⚠️ Scheduler state mismatch; skipping scheduler load.")
+                print(f"   Reason: {e}")
     
     # Load optional components
     if att is not None and 'att_state_dict' in checkpoint:

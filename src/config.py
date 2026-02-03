@@ -30,7 +30,7 @@ def parse_joint_training_args():
 
     # === Model Architecture ===
     parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN', 'UnifiedGNN'])
-    parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN'])
+    parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN', 'MPLP'])
     parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
@@ -147,6 +147,10 @@ def parse_joint_training_args():
                         help='Ridge regression regularization strength for graph classification')
 
     parser.add_argument('--head_num_layers', type=int, default=0, help='Number of MLP layers in task-specific heads')
+    parser.add_argument('--nc_head_num_layers', type=int, default=None,
+                        help='Override head_num_layers for node classification head (default: use --head_num_layers)')
+    parser.add_argument('--lp_head_num_layers', type=int, default=None,
+                        help='Override head_num_layers for link prediction head (default: use --head_num_layers)')
     parser.add_argument('--orthogonal_push', type=float, default=0, help='Orthogonal push regularization weight')
     parser.add_argument('--normalize_class_h', type=str2bool, default=True, help='Normalize class embeddings')
 
@@ -195,6 +199,8 @@ def parse_joint_training_args():
     parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
     parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
     parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
+    parser.add_argument('--use_mlp_projection', type=str2bool, default=False, help='DEBUG: Use MLP projection instead of PCA+padding (e.g., for PCBA)')
+    parser.add_argument('--mlp_projection_input_dim', type=int, default=9, help='Input dimension for MLP projection (default 9 for PCBA)')
 
     # === Dynamic Encoder (DE) Configuration ===
     parser.add_argument('--use_dynamic_encoder', type=str2bool, default=False,
@@ -282,6 +288,14 @@ def parse_joint_training_args():
                        help='TTA aggregation strategy: logits (average logits before softmax), probs (average probabilities), voting (majority vote)')
     parser.add_argument('--tta_include_original', type=str2bool, default=True,
                        help='Include original graph in TTA aggregation (True) or only use augmented versions (False)')
+    parser.add_argument('--tta_gate_by_valid', type=str2bool, default=True,
+                       help='When TTA is enabled, only trust TTA if it improves the validation metric (per dataset)')
+    parser.add_argument('--use_train_time_augmentation', type=str2bool, default=False,
+                       help='Average logits across multiple TTA-style augmented views during full-batch training (costly)')
+    parser.add_argument('--train_tta_num_augmentations', type=int, default=5,
+                       help='Number of augmented views for train-time TTA (in addition to optional original)')
+    parser.add_argument('--train_tta_include_original', type=str2bool, default=True,
+                       help='Include original view in train-time TTA averaging')
 
     # === GPSE Embeddings ===
     parser.add_argument('--use_gpse', type=str2bool, default=False,
@@ -333,6 +347,22 @@ def parse_joint_training_args():
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
     parser.add_argument('--lp_metric', type=str, default='auto', choices=['auto', 'auc', 'acc', 'hits@20', 'hits@50', 'hits@100', 'mrr'],
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
+    parser.add_argument('--lp_head_type', type=str, default='standard', choices=['standard', 'mplp'], help='Type of link prediction head')
+    
+    # === MPLP Head Configuration ===
+    parser.add_argument('--mplp_signature_dim', type=int, default=1024, help='Dimension of random signature vectors for MPLP')
+    parser.add_argument('--mplp_num_hops', type=int, default=2, help='Number of hops for MPLP structure propagation')
+    parser.add_argument('--mplp_feature_combine', type=str, default='hadamard', choices=['hadamard', 'concat'], help='Method to combine node features in MPLP')
+    parser.add_argument('--mplp_prop_type', type=str, default='combine', choices=['exact', 'combine'],
+                        help='Structural feature type for MPLP head (default: combine)')
+    parser.add_argument('--mplp_signature_sampling', type=str, default='torchhd', choices=['torchhd', 'gaussian'],
+                        help='Signature sampling method for MPLP (default: torchhd)')
+    parser.add_argument('--mplp_use_subgraph', type=str2bool, default=True,
+                        help='Use 2-hop subgraph for MPLP structural features (default: True)')
+    parser.add_argument('--mplp_use_degree', type=str, default='mlp', choices=['none', 'aa', 'ra', 'mlp'],
+                        help='Degree-based node weighting for MPLP structural features')
+    parser.add_argument('--lp_concat_common_neighbors', type=str2bool, default=False,
+                        help='Concatenate common-neighbor count to edge embeddings before LP head')
     
     # === Graph Classification Specific ===
     parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')
@@ -344,6 +374,8 @@ def parse_joint_training_args():
     parser.add_argument('--context_graph_num', type=int, default=5, help='Number of context graphs for graph classification')
     parser.add_argument('--gc_multitask_vectorized', type=str2bool, default=False,
                        help='Enable vectorized multi-task prototypical GC (single BCEWithLogits over all tasks, e.g., PCBA)')
+    parser.add_argument('--gc_supervised_mlp', type=str2bool, default=False,
+                       help='Use supervised MLP head for graph classification (bypasses PFN/transformer)')
     parser.add_argument('--gc_profile_context', type=str2bool, default=False,
                        help='Profile context prototype computation time (encode vs overhead) in vectorized GC')
     parser.add_argument('--gc_log_train_metrics', type=str2bool, default=True,

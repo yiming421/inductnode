@@ -103,7 +103,7 @@ def load_ogb_fug_dataset(name, ogb_root='./dataset/ogb', fug_root='./fug'):
             if graph.y.dtype.is_floating_point:
                 graph.task_mask = (~torch.isnan(graph.y)).float()
             else:
-                graph.task_mask = (graph.y != -1).float()
+                graph.task_mask = torch.ones_like(graph.y, dtype=torch.float)
     
     print(f"[FUG-Simple] Created external node index mapping for {len(dataset)} graphs")
     
@@ -215,7 +215,7 @@ def load_ogb_original_features(name, ogb_root='./dataset/ogb'):
             if graph.y.dtype.is_floating_point:
                 graph.task_mask = (~torch.isnan(graph.y)).float()
             else:
-                graph.task_mask = (graph.y != -1).float()
+                graph.task_mask = torch.ones_like(graph.y, dtype=torch.float)
 
     print(f"[Original-Features] Created external node index mapping for {len(dataset)} graphs")
 
@@ -307,7 +307,7 @@ def load_tu_original_features(name, tu_root='./dataset/TU'):
             if graph.y.dtype.is_floating_point:
                 graph.task_mask = (~torch.isnan(graph.y)).float()
             else:
-                graph.task_mask = (graph.y != -1).float()
+                graph.task_mask = torch.ones_like(graph.y, dtype=torch.float)
 
     print(f"[TU-Original-Features] Created external node index mapping for {len(dataset)} graphs")
 
@@ -420,7 +420,7 @@ def load_gnn_benchmark_original_features(name, gnn_benchmark_root='./dataset/GNN
             if graph.y.dtype.is_floating_point:
                 graph.task_mask = (~torch.isnan(graph.y)).float()
             else:
-                graph.task_mask = (graph.y != -1).float()
+                graph.task_mask = torch.ones_like(graph.y, dtype=torch.float)
 
     print(f"[GNNBenchmark-Original-Features] Created external node index mapping for {len(dataset)} graphs")
 
@@ -524,7 +524,7 @@ def load_mnist_superpixels_original_features(root='./dataset/MNISTSuperpixels', 
             if graph.y.dtype.is_floating_point:
                 graph.task_mask = (~torch.isnan(graph.y)).float()
             else:
-                graph.task_mask = (graph.y != -1).float()
+                graph.task_mask = torch.ones_like(graph.y, dtype=torch.float)
     
     print(f"[MNISTSuperpixels-Original-Features] Created external node index mapping for {len(dataset)} graphs")
     
@@ -647,7 +647,7 @@ def load_modelnet_original_features(name='10', modelnet_root='./dataset/ModelNet
             if graph.y.dtype.is_floating_point:
                 graph.task_mask = (~torch.isnan(graph.y)).float()
             else:
-                graph.task_mask = (graph.y != -1).float()
+                graph.task_mask = torch.ones_like(graph.y, dtype=torch.float)
 
     print(f"[ModelNet-Original-Features] Created external node index mapping for {len(dataset)} graphs")
 

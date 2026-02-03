@@ -733,9 +733,9 @@ def _create_context_embeddings_computed(model, context_structure, dataset, task_
 
 
 def _create_all_task_context_embeddings(model, context_structure, dataset, pooling_method, device, identity_projection,
-                                        dataset_info, return_timing=False, sync_cuda=False):
+                                        dataset_info, return_timing=False, sync_cuda=False, batch_size=None):
     """
-    Compute context embeddings for ALL tasks in one pass through the context structure.
+    Compute context embeddings for ALL tasks using a single (batched) encoder pass.
     Returns per-task tensors for pos/neg classes.
 
     Returns:
@@ -756,8 +756,8 @@ def _create_all_task_context_embeddings(model, context_structure, dataset, pooli
 
     task_indices = sorted(context_structure.keys())
     num_tasks = max(task_indices) + 1 if task_indices else 0
-    pos_embeddings_by_task = [None] * num_tasks
-    neg_embeddings_by_task = [None] * num_tasks
+    pos_indices_by_task = [[] for _ in range(num_tasks)]
+    neg_indices_by_task = [[] for _ in range(num_tasks)]
 
     timing = {
         'encode_time': 0.0,
@@ -769,69 +769,136 @@ def _create_all_task_context_embeddings(model, context_structure, dataset, pooli
     total_start = time.perf_counter()
     use_sync = sync_cuda and torch.cuda.is_available()
 
-    for task_idx in task_indices:
-        task_context = context_structure[task_idx]
-
-        pos_list = []
-        neg_list = []
-
-        for class_label, context_data in task_context.items():
+    # Decide if we can use indices for deduplication (required for FUG mapping)
+    use_indices = True
+    for task_context in context_structure.values():
+        for context_data in task_context.values():
             if not context_data:
                 continue
-            step_start = time.perf_counter()
+            if not (isinstance(context_data, dict) and 'graphs' in context_data and 'indices' in context_data):
+                use_indices = False
+                break
+        if not use_indices:
+            break
 
-            if isinstance(context_data, dict) and 'graphs' in context_data and 'indices' in context_data:
+    if dataset_info and 'fug_mapping' in dataset_info and not use_indices:
+        raise ValueError("Context indices required for FUG mapping but not found in context_structure")
+
+    prep_start = time.perf_counter()
+    flat_graphs = []
+    flat_indices = []
+    index_to_pos = {}
+
+    if use_indices:
+        for task_idx in task_indices:
+            task_context = context_structure[task_idx]
+            for class_label, context_data in task_context.items():
+                if not context_data:
+                    continue
                 graphs = context_data['graphs']
-                graph_indices = context_data['indices']
-            else:
-                graphs = context_data
-                graph_indices = None
+                indices = context_data['indices']
+                positions = []
+                for graph, idx in zip(graphs, indices):
+                    idx_int = idx.item() if torch.is_tensor(idx) else int(idx)
+                    if idx_int not in index_to_pos:
+                        index_to_pos[idx_int] = len(flat_graphs)
+                        flat_graphs.append(graph)
+                        flat_indices.append(idx_int)
+                    positions.append(index_to_pos[idx_int])
+                if int(class_label) == 1:
+                    pos_indices_by_task[task_idx] = positions
+                else:
+                    neg_indices_by_task[task_idx] = positions
+    else:
+        for task_idx in task_indices:
+            task_context = context_structure[task_idx]
+            for class_label, context_data in task_context.items():
+                if not context_data:
+                    continue
+                if isinstance(context_data, dict) and 'graphs' in context_data:
+                    graphs = context_data['graphs']
+                else:
+                    graphs = context_data
+                start = len(flat_graphs)
+                flat_graphs.extend(graphs)
+                positions = list(range(start, start + len(graphs)))
+                if int(class_label) == 1:
+                    pos_indices_by_task[task_idx] = positions
+                else:
+                    neg_indices_by_task[task_idx] = positions
 
-            batch_data = create_graph_batch(graphs, device)
-            if graph_indices is not None:
-                batch_data.original_graph_indices = torch.tensor(graph_indices, dtype=torch.long)
+    prep_end = time.perf_counter()
+    timing['overhead_time'] += prep_end - prep_start
 
-            node_emb_table = _get_node_embedding_table(dataset, task_idx, device, dataset_info)
-            if node_emb_table is not None:
-                batch_data.x = _safe_lookup_node_embeddings(
-                    node_emb_table, batch_data.x,
-                    context=f"vec_context_task{task_idx}", batch_data=batch_data, dataset_info=dataset_info
-                )
-            else:
-                raise ValueError("Expected node embedding table under unified setting")
+    if not flat_graphs:
+        empty_pos = [None] * num_tasks
+        empty_neg = [None] * num_tasks
+        timing['total_time'] = time.perf_counter() - total_start
+        if return_timing:
+            return empty_pos, empty_neg, timing
+        return empty_pos, empty_neg
 
-            if dataset_info and dataset_info.get('needs_identity_projection', False) and identity_projection is not None:
-                x_input = identity_projection(batch_data.x)
-            else:
-                x_input = batch_data.x
+    if batch_size is None or batch_size <= 0:
+        batch_size = len(flat_graphs)
 
-            batch_data.adj_t = SparseTensor.from_edge_index(
-                batch_data.edge_index,
-                sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
-            ).to_symmetric().coalesce()
+    node_emb_table = _get_node_embedding_table(dataset, 0, device, dataset_info)
+    if node_emb_table is None:
+        raise ValueError("Expected node embedding table under unified setting")
 
-            if use_sync:
-                torch.cuda.synchronize()
-            encode_start = time.perf_counter()
-            node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
-            graph_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
-            if use_sync:
-                torch.cuda.synchronize()
-            encode_end = time.perf_counter()
-            timing['encode_time'] += encode_end - encode_start
+    context_embeddings = []
+    for start in range(0, len(flat_graphs), batch_size):
+        end = min(start + batch_size, len(flat_graphs))
+        step_start = time.perf_counter()
 
-            if class_label == 1:
-                pos_list.append(graph_embeddings)
-            else:
-                neg_list.append(graph_embeddings)
-            step_end = time.perf_counter()
-            timing['overhead_time'] += (step_end - step_start) - (encode_end - encode_start)
-            timing['num_context_batches'] += 1
+        batch_graphs = flat_graphs[start:end]
+        batch_data = create_graph_batch(batch_graphs, device)
+        if use_indices:
+            batch_data.original_graph_indices = torch.tensor(flat_indices[start:end], dtype=torch.long)
 
-        concat_start = time.perf_counter()
-        pos_embeddings_by_task[task_idx] = torch.cat(pos_list, dim=0) if pos_list else None
-        neg_embeddings_by_task[task_idx] = torch.cat(neg_list, dim=0) if neg_list else None
-        timing['concat_time'] += time.perf_counter() - concat_start
+        batch_data.x = _safe_lookup_node_embeddings(
+            node_emb_table, batch_data.x,
+            context="vec_context_all", batch_data=batch_data, dataset_info=dataset_info
+        )
+
+        if dataset_info and dataset_info.get('needs_identity_projection', False) and identity_projection is not None:
+            x_input = identity_projection(batch_data.x)
+        else:
+            x_input = batch_data.x
+
+        batch_data.adj_t = SparseTensor.from_edge_index(
+            batch_data.edge_index,
+            sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
+        ).to_symmetric().coalesce()
+
+        if use_sync:
+            torch.cuda.synchronize()
+        encode_start = time.perf_counter()
+        node_embeddings = model(x_input, batch_data.adj_t, batch_data.batch)
+        graph_embeddings = pool_graph_embeddings(node_embeddings, batch_data.batch, pooling_method)
+        if use_sync:
+            torch.cuda.synchronize()
+        encode_end = time.perf_counter()
+
+        timing['encode_time'] += encode_end - encode_start
+        timing['overhead_time'] += (time.perf_counter() - step_start) - (encode_end - encode_start)
+        timing['num_context_batches'] += 1
+        context_embeddings.append(graph_embeddings)
+
+    concat_start = time.perf_counter()
+    context_embeddings = torch.cat(context_embeddings, dim=0) if context_embeddings else torch.empty((0, 0), device=device)
+
+    pos_embeddings_by_task = [None] * num_tasks
+    neg_embeddings_by_task = [None] * num_tasks
+    for t in range(num_tasks):
+        pos_idx = pos_indices_by_task[t]
+        neg_idx = neg_indices_by_task[t]
+        if pos_idx:
+            pos_tensor = torch.as_tensor(pos_idx, device=context_embeddings.device, dtype=torch.long)
+            pos_embeddings_by_task[t] = context_embeddings.index_select(0, pos_tensor)
+        if neg_idx:
+            neg_tensor = torch.as_tensor(neg_idx, device=context_embeddings.device, dtype=torch.long)
+            neg_embeddings_by_task[t] = context_embeddings.index_select(0, neg_tensor)
+    timing['concat_time'] += time.perf_counter() - concat_start
 
     timing['total_time'] = time.perf_counter() - total_start
     if return_timing:
@@ -928,7 +995,7 @@ def _extract_multitask_labels_and_masks(graphs):
             if y.dtype.is_floating_point:
                 mask = ~torch.isnan(y)
             else:
-                mask = (y != -1)
+                mask = torch.ones_like(y, dtype=torch.bool)
 
         if y.dtype.is_floating_point:
             y = torch.where(mask, y, torch.zeros_like(y))
@@ -949,6 +1016,64 @@ def _extract_multitask_labels_and_masks(graphs):
         masks = torch.empty((0, num_tasks), dtype=torch.bool)
 
     return labels, masks
+
+
+def _compute_multitask_pos_weight(dataset_info):
+    """
+    Compute per-task positive-class weights from the training split.
+    pos_weight[t] = (#neg / #pos) for task t, with safeguards for empty positives.
+    """
+    dataset = dataset_info['dataset']
+    split_idx = dataset_info['split_idx']
+    train_indices = split_idx.get('train', [])
+
+    if len(train_indices) == 0:
+        return None
+
+    sample_graph = dataset[0]
+    num_tasks = sample_graph.y.numel()
+
+    # Fast path: use dataset.data.y if available and aligned with graph indices
+    if hasattr(dataset, 'data') and hasattr(dataset.data, 'y') and dataset.data.y is not None:
+        y_all = dataset.data.y
+        if y_all.dim() == 1 and y_all.numel() == len(dataset) * num_tasks:
+            y_all = y_all.view(len(dataset), num_tasks)
+        if y_all.dim() == 2 and y_all.size(1) == num_tasks:
+            train_idx = torch.as_tensor(train_indices, dtype=torch.long)
+            y_train = y_all[train_idx]
+            if y_train.dtype.is_floating_point:
+                mask = ~torch.isnan(y_train)
+            else:
+                mask = torch.ones_like(y_train, dtype=torch.bool)
+            pos_counts = (mask & (y_train == 1)).sum(dim=0).to(torch.float32)
+            neg_counts = (mask & (y_train == 0)).sum(dim=0).to(torch.float32)
+            pos_weight = torch.ones(num_tasks, dtype=torch.float32)
+            valid_pos = pos_counts > 0
+            pos_weight[valid_pos] = neg_counts[valid_pos] / pos_counts[valid_pos]
+            return pos_weight
+
+    # Fallback: iterate graphs
+    pos_counts = torch.zeros(num_tasks, dtype=torch.long)
+    neg_counts = torch.zeros(num_tasks, dtype=torch.long)
+    for idx in train_indices:
+        idx_int = idx.item() if torch.is_tensor(idx) else idx
+        graph = dataset[idx_int]
+        y = graph.y.view(-1)
+        if hasattr(graph, 'task_mask') and graph.task_mask is not None:
+            mask = graph.task_mask.view(-1)
+            mask = mask.bool() if mask.dtype == torch.bool else (mask > 0.5)
+        else:
+            if y.dtype.is_floating_point:
+                mask = ~torch.isnan(y)
+            else:
+                mask = torch.ones_like(y, dtype=torch.bool)
+        pos_counts += (mask & (y == 1)).long()
+        neg_counts += (mask & (y == 0)).long()
+
+    pos_weight = torch.ones(num_tasks, dtype=torch.float32)
+    valid_pos = pos_counts > 0
+    pos_weight[valid_pos] = (neg_counts[valid_pos].float() / pos_counts[valid_pos].float())
+    return pos_weight
 
 
 def _build_multitask_support_mask(context_structure, graphs, graph_indices):
@@ -1170,18 +1295,181 @@ def _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim='d
     return pos_scores - neg_scores
 
 
+def _multitask_rank_loss(logits, labels, task_mask, max_pairs=1024):
+    """
+    Pairwise ranking loss (BPR/RankNet style) across tasks.
+
+    Args:
+        logits: [B, T]
+        labels: [B, T] float in {0,1} (invalid already masked to 0)
+        task_mask: [B, T] bool
+        max_pairs: max sampled pairs per task (<=0 uses all pairs)
+    """
+    num_tasks = logits.size(1)
+    losses = []
+    for t in range(num_tasks):
+        mask_t = task_mask[:, t]
+        if mask_t.sum() == 0:
+            continue
+        labels_t = labels[:, t]
+        pos_mask = (labels_t > 0.5) & mask_t
+        neg_mask = (labels_t <= 0.5) & mask_t
+        if pos_mask.sum() == 0 or neg_mask.sum() == 0:
+            continue
+        pos_logits = logits[pos_mask, t]
+        neg_logits = logits[neg_mask, t]
+
+        if max_pairs is not None and max_pairs > 0:
+            pair_count = min(max_pairs, pos_logits.numel() * neg_logits.numel())
+            if pair_count == 0:
+                continue
+            pos_idx = torch.randint(0, pos_logits.numel(), (pair_count,), device=logits.device)
+            neg_idx = torch.randint(0, neg_logits.numel(), (pair_count,), device=logits.device)
+            diffs = pos_logits[pos_idx] - neg_logits[neg_idx]
+        else:
+            diffs = pos_logits[:, None] - neg_logits[None, :]
+
+        loss_t = F.softplus(-diffs).mean()
+        losses.append(loss_t)
+
+    if not losses:
+        return torch.tensor(0.0, device=logits.device)
+    return torch.stack(losses).mean()
+
+
+def _vectorized_multitask_pfn_logits(predictor, target_embeddings, pos_embeds_by_task, neg_embeds_by_task,
+                                     normalize_class_h=True, device=None):
+    """
+    Compute per-task logits using PFN predictor. Runs PFN once per task.
+
+    Returns:
+        logits: [B, T]
+        task_context_mask: [T] bool (True if task has both pos/neg context)
+    """
+    if device is None:
+        device = target_embeddings.device
+    num_tasks = len(pos_embeds_by_task)
+    logits_by_task = []
+    task_context_mask = torch.zeros(num_tasks, dtype=torch.bool, device=device)
+
+    for t in range(num_tasks):
+        pos_e = pos_embeds_by_task[t]
+        neg_e = neg_embeds_by_task[t]
+        if pos_e is None or neg_e is None or pos_e.numel() == 0 or neg_e.numel() == 0:
+            logits_by_task.append(torch.zeros(target_embeddings.size(0), device=device))
+            continue
+
+        context_embeddings = torch.cat([pos_e, neg_e], dim=0)
+        context_labels = torch.cat([
+            torch.ones(pos_e.size(0), device=device),
+            torch.zeros(neg_e.size(0), device=device)
+        ], dim=0).long()
+
+        pfn_data = prepare_pfn_data_structure(context_embeddings, context_labels, num_classes=2, device=device)
+        class_h = process_node_features(
+            context_embeddings, pfn_data,
+            degree_normalize=False,
+            attention_pool_module=None,
+            mlp_module=None,
+            normalize=normalize_class_h
+        )
+
+        pred_output = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h,
+                                task_type='graph_classification')
+        if isinstance(pred_output, (tuple, list)):
+            scores = pred_output[0]
+        else:
+            scores = pred_output
+
+        # Convert 2-class scores to a single logit for positive class
+        if scores.dim() == 2 and scores.size(1) == 2:
+            logits_t = scores[:, 1] - scores[:, 0]
+        else:
+            logits_t = scores.view(-1)
+
+        logits_by_task.append(logits_t)
+        task_context_mask[t] = True
+
+    logits = torch.stack(logits_by_task, dim=1) if logits_by_task else torch.empty(
+        (target_embeddings.size(0), 0), device=device
+    )
+    return logits, task_context_mask
+
+
+def _multitask_aucpr_loss(logits, labels, task_mask, tau=0.1, max_samples=512):
+    """
+    Differentiable AUPRC/SoftAP-style surrogate.
+
+    Computes a soft precision-at-rank for positives using sigmoid-smoothed ranks:
+        rank_i = 0.5 + sum_j sigmoid((s_j - s_i)/tau)
+        pos_rank_i = 0.5 + sum_{j in pos} sigmoid((s_j - s_i)/tau)
+        AP ~= mean_i pos_rank_i / rank_i
+    Loss = 1 - AP, averaged across tasks.
+    """
+    num_tasks = logits.size(1)
+    losses = []
+    for t in range(num_tasks):
+        mask_t = task_mask[:, t]
+        if mask_t.sum() == 0:
+            continue
+        labels_t = labels[:, t]
+        pos_idx = torch.where((labels_t > 0.5) & mask_t)[0]
+        neg_idx = torch.where((labels_t <= 0.5) & mask_t)[0]
+        if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+            continue
+
+        # Sample to keep O(P*N) tractable
+        if max_samples is not None and max_samples > 0:
+            max_samples = int(max_samples)
+            if pos_idx.numel() > max_samples:
+                perm = torch.randperm(pos_idx.numel(), device=pos_idx.device)
+                pos_idx = pos_idx[perm[:max_samples]]
+            remaining = max_samples - pos_idx.numel()
+            if remaining <= 0:
+                neg_idx = neg_idx[:0]
+            elif neg_idx.numel() > remaining:
+                perm = torch.randperm(neg_idx.numel(), device=neg_idx.device)
+                neg_idx = neg_idx[perm[:remaining]]
+
+        idx = torch.cat([pos_idx, neg_idx], dim=0)
+        scores = logits[idx, t]
+        y = labels_t[idx]
+        pos_mask = y > 0.5
+        if pos_mask.sum() == 0:
+            continue
+
+        s_pos = scores[pos_mask]  # [P]
+        s_all = scores  # [N]
+        diffs = (s_all.unsqueeze(0) - s_pos.unsqueeze(1)) / max(tau, 1e-6)
+        sm = torch.sigmoid(diffs)
+        rank = sm.sum(dim=1) + 0.5
+        sm_pos = sm[:, pos_mask]
+        pos_rank = sm_pos.sum(dim=1) + 0.5
+        precision = pos_rank / rank
+        ap = precision.mean()
+        losses.append(1.0 - ap)
+
+    if not losses:
+        return torch.tensor(0.0, device=logits.device)
+    return torch.stack(losses).mean()
+
+
 def train_graph_classification_multitask_vectorized(model, predictor, dataset_info, data_loaders, optimizer,
                                                    pooling_method='mean', device='cuda', clip_grad=1.0,
                                                    orthogonal_push=0.0, normalize_class_h=True,
                                                    identity_projection=None, args=None, lambda_=1.0):
     """
     Vectorized multi-task training: single forward, build per-task pos/neg prototypes (or ridge weights),
-    compute logits [B, T], and apply BCEWithLogits with task_mask.
+    compute logits [B, T], and apply BCEWithLogits, rank loss, or aucpr surrogate with task_mask.
     """
     model.train()
     predictor.train()
     if identity_projection is not None:
         identity_projection.train()
+    use_supervised = bool(getattr(args, 'gc_supervised_mlp', False) and dataset_info.get('gc_supervised_head') is not None)
+    gc_supervised_head = dataset_info.get('gc_supervised_head')
+    if use_supervised:
+        gc_supervised_head.train()
 
     dataset = dataset_info['dataset']
     sample_graph = dataset[0]
@@ -1205,9 +1493,12 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
     use_ridge = sim_type == 'ridge'
     ridge_alpha = getattr(args, 'gc_ridge_alpha', 1.0) if args is not None else 1.0
     context_batch_size = getattr(args, 'gc_batch_size', 1024) if args is not None else 1024
+    pos_weight = None
+
+    supervised_debug_printed = False
 
     for batch in data_loaders['train']:
-        if use_ridge:
+        if not use_supervised and use_ridge:
             if profile_context:
                 context_embeddings, context_labels, context_masks, timing = _create_multitask_context_embeddings(
                     model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
@@ -1229,7 +1520,7 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
             ridge_start = time.perf_counter()
             W = _compute_multitask_ridge_weights(context_embeddings, context_labels, context_masks, ridge_alpha=ridge_alpha)
             proto_time_total += time.perf_counter() - ridge_start
-        else:
+        elif not use_supervised:
             if profile_context:
                 # Recompute prototypes EVERY batch (expensive, but requested)
                 pos_embeds_by_task, neg_embeds_by_task, timing = _create_all_task_context_embeddings(
@@ -1248,33 +1539,8 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
                 pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
                     model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
                 )
-
-            # Compute prototypes (mean) for each task, fallback to zeros if missing
-            proto_dim = None
-            pos_proto = []
-            neg_proto = []
-            for t in range(num_tasks):
-                pos_e = pos_embeds_by_task[t]
-                neg_e = neg_embeds_by_task[t]
-                if pos_e is None or neg_e is None:
-                    if proto_dim is None:
-                        for e in pos_embeds_by_task + neg_embeds_by_task:
-                            if e is not None:
-                                proto_dim = e.size(-1)
-                                break
-                    if proto_dim is None:
-                        proto_dim = 256
-                    pos_proto.append(torch.zeros(proto_dim, device=device))
-                    neg_proto.append(torch.zeros(proto_dim, device=device))
-                    continue
-                proto_dim = pos_e.size(-1)
-                pos_proto.append(pos_e.mean(dim=0))
-                neg_proto.append(neg_e.mean(dim=0))
-
-            pos_proto = torch.stack(pos_proto, dim=0)
-            neg_proto = torch.stack(neg_proto, dim=0)
             proto_time_total += time.perf_counter() - proto_start
-
+        
         batch_start = time.perf_counter()
         optimizer.zero_grad()
         batch_data = batch.to(device)
@@ -1321,17 +1587,23 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
             if batch_labels.dtype.is_floating_point:
                 task_mask = ~torch.isnan(batch_labels)
             else:
-                task_mask = batch_labels != -1
+                task_mask = torch.ones_like(batch_labels, dtype=torch.bool)
+        task_mask = task_mask.bool()
 
         # Replace invalid labels with 0 to keep BCE stable
         labels = batch_labels.float()
         labels = torch.where(task_mask, labels, torch.zeros_like(labels))
-
         # Vectorized logits [B, T]
-        if use_ridge:
+        if use_supervised:
+            logits = gc_supervised_head(target_embeddings)
+        elif use_ridge:
             logits = target_embeddings @ W
         else:
-            logits = _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim=sim_type)
+            logits, _ = _vectorized_multitask_pfn_logits(
+                predictor, target_embeddings, pos_embeds_by_task, neg_embeds_by_task,
+                normalize_class_h=normalize_class_h, device=device
+            )
+
         if logits is None:
             continue
 
@@ -1339,12 +1611,29 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
         valid = task_mask.float()
         loss = (loss_matrix * valid).sum() / valid.sum().clamp_min(1.0)
 
+        if use_supervised and not supervised_debug_printed:
+            head_params = [p for p in gc_supervised_head.parameters() if p.requires_grad]
+            opt_param_ids = {id(p) for g in optimizer.param_groups for p in g['params']}
+            in_opt = sum(1 for p in head_params if id(p) in opt_param_ids)
+            print(f"[GC-VEC] supervised head params in optimizer: {in_opt}/{len(head_params)}")
+
         loss.backward()
+
+        if use_supervised and not supervised_debug_printed:
+            grad_norms = [p.grad.norm().item() for p in gc_supervised_head.parameters() if p.grad is not None]
+            if grad_norms:
+                print(f"[GC-VEC] supervised head grad: mean={sum(grad_norms)/len(grad_norms):.3e} max={max(grad_norms):.3e}")
+            else:
+                print("[GC-VEC] supervised head grad: None (no grads)")
+            supervised_debug_printed = True
+
         if clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
             torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
             if identity_projection:
                 torch.nn.utils.clip_grad_norm_(identity_projection.parameters(), clip_grad)
+            if use_supervised:
+                torch.nn.utils.clip_grad_norm_(gc_supervised_head.parameters(), clip_grad)
 
         optimizer.step()
         total_loss += loss.item()
@@ -1355,7 +1644,10 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
     avg_batch_time = batch_time_total / max(batch_count, 1)
     avg_proto_time = proto_time_total / max(batch_count, 1)
     avg_loss = total_loss / batch_count if batch_count > 0 else 0.0
-    method_name = "ridge" if use_ridge else "proto"
+    if use_supervised:
+        method_name = "supervised-mlp"
+    else:
+        method_name = "ridge" if use_ridge else "pfn"
     print(f"[GC-VEC] train ({method_name}): avg_loss={avg_loss:.4f} ctx_avg={avg_proto_time:.2f}s batches={batch_count} avg_batch={avg_batch_time:.3f}s total={total_time:.2f}s")
     if profile_context:
         avg_encode = proto_encode_time_total / max(batch_count, 1)
@@ -1379,6 +1671,10 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
     predictor.eval()
     if identity_projection is not None:
         identity_projection.eval()
+    use_supervised = bool(getattr(args, 'gc_supervised_mlp', False) and dataset_info.get('gc_supervised_head') is not None)
+    gc_supervised_head = dataset_info.get('gc_supervised_head')
+    if use_supervised:
+        gc_supervised_head.eval()
 
     dataset = dataset_info['dataset']
     sample_graph = dataset[0]
@@ -1396,40 +1692,17 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
 
     eval_start = time.perf_counter()
     proto_start = time.perf_counter()
-    if use_ridge:
+    if not use_supervised and use_ridge:
         context_embeddings, context_labels, context_masks = _create_multitask_context_embeddings(
             model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
             batch_size=context_batch_size
         )
         W = _compute_multitask_ridge_weights(context_embeddings, context_labels, context_masks, ridge_alpha=ridge_alpha)
-    else:
+    elif not use_supervised:
         pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
             model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
         )
 
-        proto_dim = None
-        pos_proto = []
-        neg_proto = []
-        for t in range(num_tasks):
-            pos_e = pos_embeds_by_task[t]
-            neg_e = neg_embeds_by_task[t]
-            if pos_e is None or neg_e is None:
-                if proto_dim is None:
-                    for e in pos_embeds_by_task + neg_embeds_by_task:
-                        if e is not None:
-                            proto_dim = e.size(-1)
-                            break
-                if proto_dim is None:
-                    proto_dim = 256
-                pos_proto.append(torch.zeros(proto_dim, device=device))
-                neg_proto.append(torch.zeros(proto_dim, device=device))
-                continue
-            proto_dim = pos_e.size(-1)
-            pos_proto.append(pos_e.mean(dim=0))
-            neg_proto.append(neg_e.mean(dim=0))
-
-        pos_proto = torch.stack(pos_proto, dim=0)
-        neg_proto = torch.stack(neg_proto, dim=0)
     proto_time = time.perf_counter() - proto_start
 
     split_results = {}
@@ -1485,15 +1758,21 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
                 if batch_labels.dtype.is_floating_point:
                     task_mask = ~torch.isnan(batch_labels)
                 else:
-                    task_mask = batch_labels != -1
+                    task_mask = torch.ones_like(batch_labels, dtype=torch.bool)
+            task_mask = task_mask.bool()
 
             labels = batch_labels.float()
             labels = torch.where(task_mask, labels, torch.zeros_like(labels))
 
-            if use_ridge:
+            if use_supervised:
+                logits = gc_supervised_head(target_embeddings)
+            elif use_ridge:
                 logits = target_embeddings @ W
             else:
-                logits = _vectorized_multitask_logits(target_embeddings, pos_proto, neg_proto, sim=sim_type)
+                logits, _ = _vectorized_multitask_pfn_logits(
+                    predictor, target_embeddings, pos_embeds_by_task, neg_embeds_by_task,
+                    normalize_class_h=normalize_class_h, device=device
+                )
             if logits is None:
                 continue
 
@@ -1512,6 +1791,9 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
         all_logits = torch.cat(all_logits, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         all_masks = torch.cat(all_masks, dim=0)
+
+        if not use_ridge:
+            print(f"[GC-VEC] {split_name} PFN logits: mean={all_logits.mean().item():.3f} std={all_logits.std().item():.3f} min={all_logits.min().item():.3f} max={all_logits.max().item():.3f}")
 
         # Compute per-task metrics using mask
         task_metrics = []
@@ -1532,7 +1814,10 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
         split_results[split_name] = aggregate_task_metrics(task_metrics) if task_metrics else 0.0
         split_time = time.perf_counter() - split_start
         avg_batch_time = split_batch_time / max(len(data_loaders[split_name]), 1)
-        method_name = "ridge" if use_ridge else "proto"
+        if use_supervised:
+            method_name = "supervised-mlp"
+        else:
+            method_name = "ridge" if use_ridge else "pfn"
         print(f"[GC-VEC] eval {split_name} ({method_name}): ctx={proto_time:.2f}s split_time={split_time:.2f}s avg_batch={avg_batch_time:.3f}s")
 
     total_time = time.perf_counter() - eval_start
@@ -1730,7 +2015,10 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
                         task_labels = batch_labels
                 
                 # Filter valid labels for this task
-                valid_mask = ~torch.isnan(task_labels)
+                if task_labels.dtype.is_floating_point:
+                    valid_mask = ~torch.isnan(task_labels)
+                else:
+                    valid_mask = torch.ones_like(task_labels, dtype=torch.bool)
                 if valid_mask.sum() == 0:
                     continue
                 
@@ -1865,7 +2153,10 @@ def train_graph_classification_single_task_no_update(model, predictor, dataset_i
             batch_labels = batch_labels.squeeze()
     
     # Filter valid labels  
-    valid_mask = ~torch.isnan(batch_labels)
+    if batch_labels.dtype.is_floating_point:
+        valid_mask = ~torch.isnan(batch_labels)
+    else:
+        valid_mask = torch.ones_like(batch_labels, dtype=torch.bool)
     if valid_mask.sum() <= 1:
         return 0.0
     

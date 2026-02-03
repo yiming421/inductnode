@@ -993,7 +993,7 @@ def prepare_graph_data_for_pfn(dataset, split_idx, context_k=32, device='cuda'):
                 if graph.y.dtype.is_floating_point:
                     mask = ~torch.isnan(graph.y)
                 else:
-                    mask = (graph.y != -1)
+                    mask = torch.ones_like(graph.y, dtype=torch.bool)
             else:
                 mask = graph.task_mask
                 
@@ -1395,11 +1395,9 @@ def create_task_filtered_datasets(dataset, split_idx, filter_split=None):
         # Create task_mask on-the-fly if missing
         if not hasattr(graph, 'task_mask'):
             if graph.y.dtype.is_floating_point:
-                # Check for NaN for floating point labels
                 mask = ~torch.isnan(graph.y)
             else:
-                # Check for -1 for integer labels
-                mask = (graph.y != -1)
+                mask = torch.ones_like(graph.y, dtype=torch.bool)
         else:
             mask = graph.task_mask
 
@@ -1759,7 +1757,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
                          processed_data=None, pcba_context_only_pca=False,
                          use_pca_cache=False, pca_cache_dir="./pca_cache", use_random_orthogonal=False,
                          plot_tsne=False, tsne_save_dir="./tsne_plots", use_quantile_normalization=False,
-                         quantile_norm_before_padding=True):
+                         quantile_norm_before_padding=True, use_mlp_projection=False):
     """
     Process graph features using PCA directly on embedding table for maximum memory efficiency.
     
@@ -1885,9 +1883,18 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
     # Standard unified processing: apply PCA to node embeddings
     print("Unified setting: applying PCA to node_embs")
     
+    processed_features = None
+    target_dim = hidden_dim
+    needs_identity_projection = False
+
+    if use_mlp_projection:
+        print(f"Dataset {dataset_name}: Using MLP projection - skipping PCA/padding (keeping {original_dim}D raw features)")
+        processed_features = node_embs.float().to(device)
+        target_dim = original_dim
+
     # Apply PCA/projection to node embeddings
     # PCBA-specific: optionally use only context + test graphs for PCA
-    if (dataset_name and dataset_name.lower() == 'pcba' and 
+    elif (dataset_name and dataset_name.lower() == 'pcba' and 
         pcba_context_only_pca and processed_data is not None):
         print("PCBA mode: Using context + test graphs for PCA fitting")
         
@@ -1931,7 +1938,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         # Standard: use all embeddings
         stacked_features = node_embs
     
-    if use_identity_projection:
+    if processed_features is None and use_identity_projection:
         # Identity projection pathway: PCA to small_dim, then project to large_dim
         print(f"Using identity projection: {original_dim}D -> PCA to {projection_small_dim}D -> Project to {projection_large_dim}D")
 
@@ -1972,7 +1979,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
         target_dim = projection_large_dim
         needs_identity_projection = True
 
-    else:
+    elif processed_features is None:
         # Standard PCA pathway
 
         original_dim = min(original_dim, stacked_features.size(0))
