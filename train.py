@@ -953,6 +953,7 @@ def create_unified_model(args, input_dim, device):
             h_feats=hidden,
             prop_step=getattr(args, 'num_layers', 2),  # Reuse num_layers as prop_step
             conv=getattr(args, 'conv_type', 'GCN'),
+            gin_aggr=getattr(args, 'gin_aggr', 'sum'),
             multilayer=getattr(args, 'multilayer', False),
             norm=getattr(args, 'norm', False),
             relu=getattr(args, 'relu', False),
@@ -1073,6 +1074,8 @@ def create_unified_model(args, input_dim, device):
             mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
             mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
             mplp_use_degree=getattr(args, 'mplp_use_degree', 'none'),
+            ncn_beta=getattr(args, 'ncn_beta', 1.0),
+            ncn_cndeg=getattr(args, 'ncn_cndeg', -1),
             lp_concat_common_neighbors=getattr(args, 'lp_concat_common_neighbors', False),
             # NEW: Skip token formulation option
             skip_token_formulation=getattr(args, 'skip_token_formulation', False),

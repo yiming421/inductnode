@@ -203,6 +203,8 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         if identity_projection: identity_projection.train()
         device = data.x.device
         train_mask = train_mask.to(device)
+        head_type = getattr(predictor, 'lp_head_type', '')
+        use_lp_cn = getattr(args, 'lp_concat_common_neighbors', False) and head_type == 'standard'
 
         edge_pairs = train_edges['edge_pairs'].to(device)
         labels = train_edges['labels'].to(device)
@@ -298,7 +300,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
                 context_edge_embeds = context_src_embeds * context_dst_embeds
                 cn_context = None
-                if getattr(args, 'lp_concat_common_neighbors', False) and getattr(predictor, 'lp_head_type', '') != 'mplp':
+                if use_lp_cn:
                     cn_context = _common_neighbor_count(adj_for_gnn, context_edge_pairs)
 
                 batch_labels = labels[batch_indices]
@@ -309,7 +311,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 dst_embeds = node_embeddings[batch_edges[:, 1]]
                 target_edge_embeds = src_embeds * dst_embeds
                 cn_target = None
-                if getattr(args, 'lp_concat_common_neighbors', False) and getattr(predictor, 'lp_head_type', '') != 'mplp':
+                if use_lp_cn:
                     cn_target = _common_neighbor_count(adj_for_gnn, batch_edges)
 
                 # Get link prototypes (binary class embeddings)
@@ -320,7 +322,19 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     continue
 
                 # Use unified PFNPredictorNodeCls for link prediction
-                if getattr(predictor, 'lp_head_type', '') == 'mplp':
+                if head_type == 'mplp':
+                    scores, link_prototypes = predictor(
+                        data_for_gnn,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        adj_t=adj_for_gnn,
+                        lp_edges=batch_edges.t(),
+                        node_emb=node_embeddings
+                    )
+                elif head_type == 'ncn':
                     scores, link_prototypes = predictor(
                         data_for_gnn,
                         context_edge_embeds,
@@ -557,6 +571,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         if identity_projection: identity_projection.eval()
         
         device = data.x.device
+        head_type = getattr(predictor, 'lp_head_type', '')
+        use_lp_cn = lp_concat_common_neighbors and head_type == 'standard'
         
         # Get node embeddings - use full_adj_t for test evaluation if available
         node_embeddings = get_node_embeddings(model, data, projector, identity_projection, use_full_adj_for_test, args=None, rank=rank)
@@ -571,7 +587,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         context_dst_embeds = node_embeddings[context_edge_pairs[:, 1]]
         context_edge_embeds = context_src_embeds * context_dst_embeds
         cn_context = None
-        if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
+        if use_lp_cn:
             cn_context = _common_neighbor_count(adj_for_lp, context_edge_pairs)
         
         # Generate link prototypes
@@ -618,11 +634,23 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             dst_embeds = node_embeddings[batch_edges[:, 1]]
             target_edge_embeds = src_embeds * dst_embeds
             cn_target = None
-            if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
+            if use_lp_cn:
                 cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
             
             # Use the unified predictor for link prediction
-            if getattr(predictor, 'lp_head_type', '') == 'mplp':
+            if head_type == 'mplp':
+                pred_output = predictor(
+                    data,
+                    context_edge_embeds,
+                    target_edge_embeds,
+                    context_labels.long(),
+                    link_prototypes,
+                    "link_prediction",
+                    adj_t=adj_for_lp,
+                    lp_edges=batch_edges.t(),
+                    node_emb=node_embeddings
+                )
+            elif head_type == 'ncn':
                 pred_output = predictor(
                     data,
                     context_edge_embeds,
@@ -665,11 +693,23 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             dst_embeds = node_embeddings[batch_edges[:, 1]]
             target_edge_embeds = src_embeds * dst_embeds
             cn_target = None
-            if lp_concat_common_neighbors and getattr(predictor, 'lp_head_type', '') != 'mplp':
+            if use_lp_cn:
                 cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
             
             # Use the unified predictor for link prediction
-            if getattr(predictor, 'lp_head_type', '') == 'mplp':
+            if head_type == 'mplp':
+                pred_output = predictor(
+                    data,
+                    context_edge_embeds,
+                    target_edge_embeds,
+                    context_labels.long(),
+                    link_prototypes,
+                    "link_prediction",
+                    adj_t=adj_for_lp,
+                    lp_edges=batch_edges.t(),
+                    node_emb=node_embeddings
+                )
+            elif head_type == 'ncn':
                 pred_output = predictor(
                     data,
                     context_edge_embeds,

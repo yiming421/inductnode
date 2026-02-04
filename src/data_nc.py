@@ -6,6 +6,8 @@ from ogb.nodeproppred import PygNodePropPredDataset
 from torch_sparse import SparseTensor
 import torch
 from collections import defaultdict
+from pathlib import Path
+import numpy as np
 # Fix for PyTorch 2.6+ weights_only compatibility with PyG
 import torch.serialization
 from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr, TensorAttr
@@ -166,6 +168,72 @@ def get_project_root():
     """Get the project root directory"""
     # The root is 'inductnode', which is one level up from 'inductnode/src'
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def _is_graphpfn_xy_name(name: str) -> bool:
+    return name.lower() in {"graphpfn-xy", "graphpfn_xy", "graphpfnxy"}
+
+
+def _get_graphpfn_xy_root() -> str:
+    """Resolve default path for GraphPFN XY exports."""
+    env = os.getenv("GRAPHPFN_XY_DIR")
+    if env:
+        return env
+    # default: sibling repo ../graphpfn/data/graphpfn-xy
+    root = os.path.abspath(os.path.join(get_project_root(), "..", "graphpfn", "data", "graphpfn-xy"))
+    if os.path.exists(root):
+        return root
+    # fallback: inductnode/dataset/graphpfn-xy
+    return os.path.join(get_project_root(), "dataset", "graphpfn-xy")
+
+
+def load_graphpfn_xy_dataset(root_dir: str, max_graphs: int | None = None):
+    """
+    Load GraphPFN synthetic graphs exported by graphpfn/bin/prior/export_xy.py.
+
+    Expects files named graph_*.npz containing:
+      edge_index (2, E), x (N, F), y (N,), train_size (int).
+    Returns list of PyG Data objects and split_idx list.
+    """
+    root = Path(root_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
+
+    files = sorted(root.glob("graph_*.npz"))
+    if max_graphs is not None:
+        files = files[: max_graphs]
+    if not files:
+        raise FileNotFoundError(f"No graph_*.npz files found in {root}")
+
+    data_list = []
+    split_idx_list = []
+
+    for f in files:
+        npz = np.load(f)
+        edge_index = torch.from_numpy(npz["edge_index"]).long()
+        x = torch.from_numpy(npz["x"]).float()
+        y = torch.from_numpy(npz["y"]).long()
+        train_size = int(npz["train_size"])
+
+        num_nodes = x.size(0)
+        if train_size <= 0 or train_size >= num_nodes:
+            raise ValueError(f"Invalid train_size {train_size} for {f} (num_nodes={num_nodes})")
+
+        train_idx = torch.arange(0, train_size, dtype=torch.long)
+        test_idx = torch.arange(train_size, num_nodes, dtype=torch.long)
+        split_idx = {"train": train_idx, "valid": test_idx, "test": test_idx}
+
+        data = Data(x=x, edge_index=edge_index, y=y)
+        data.adj_t = SparseTensor.from_edge_index(
+            edge_index, sparse_sizes=(num_nodes, num_nodes)
+        ).to_symmetric().coalesce()
+        data.name = f"graphpfn_xy_{f.stem}"
+        data.is_synthetic = True
+
+        data_list.append(data)
+        split_idx_list.append(split_idx)
+
+    return data_list, split_idx_list
 
 def rebalance_splits_for_pretraining(split_idx, strategy='smallest_for_valid'):
     """
@@ -602,6 +670,14 @@ def load_all_data(train_datasets):
     split_idx_list = []
     for dataset in train_datasets:
         print(dataset, flush=True)
+        if _is_graphpfn_xy_name(dataset):
+            root = _get_graphpfn_xy_root()
+            max_graphs_env = os.getenv("GRAPHPFN_XY_MAX_GRAPHS")
+            max_graphs = int(max_graphs_env) if max_graphs_env else None
+            data_ext, split_ext = load_graphpfn_xy_dataset(root, max_graphs=max_graphs)
+            data_list.extend(data_ext)
+            split_idx_list.extend(split_ext)
+            continue
         if dataset.startswith('ogbn-'):
             data, split_edge = load_ogbn_data(dataset)
         else:
@@ -650,6 +726,14 @@ def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
     split_idx_list = []
     for dataset in expanded_datasets:
         print(dataset, flush=True)
+        if _is_graphpfn_xy_name(dataset):
+            root = _get_graphpfn_xy_root()
+            max_graphs_env = os.getenv("GRAPHPFN_XY_MAX_GRAPHS")
+            max_graphs = int(max_graphs_env) if max_graphs_env else None
+            data_ext, split_ext = load_graphpfn_xy_dataset(root, max_graphs=max_graphs)
+            data_list.extend(data_ext)
+            split_idx_list.extend(split_ext)
+            continue
         if dataset.startswith('ogbn-'):
             data, split_edge = load_ogbn_data_train(dataset, split_strategy=split_strategy)
         else:

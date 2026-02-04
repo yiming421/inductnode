@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GINConv, MessagePassing, SAGEConv, GATConv
 from torch_geometric.utils import degree
 from torch_sparse.matmul import spmm_add
+from torch_sparse import SparseTensor
 from torch_scatter import scatter_softmax
 from .utils import process_node_features
 
@@ -1082,6 +1083,88 @@ class NodeClassificationHead(nn.Module):
         return logits, class_emb
 
 
+def _ncn_elem2spm(element: torch.Tensor, sizes):
+    if element.numel() == 0:
+        empty = torch.empty(0, dtype=torch.long, device=element.device)
+        return SparseTensor(row=empty, col=empty, sparse_sizes=sizes).to_device(element.device)
+    col = torch.bitwise_and(element, 0xffffffff)
+    row = torch.bitwise_right_shift(element, 32)
+    return SparseTensor(row=row, col=col, sparse_sizes=sizes).to_device(
+        element.device).fill_value_(1.0)
+
+
+def _ncn_spm2elem(spm: SparseTensor) -> torch.Tensor:
+    elem = torch.bitwise_left_shift(spm.storage.row(), 32).add_(spm.storage.col())
+    return elem
+
+
+def _ncn_spmoverlap(adj1: SparseTensor, adj2: SparseTensor) -> SparseTensor:
+    assert adj1.sizes() == adj2.sizes()
+    element1 = _ncn_spm2elem(adj1)
+    element2 = _ncn_spm2elem(adj2)
+
+    if element1.numel() == 0 or element2.numel() == 0:
+        return _ncn_elem2spm(element1.new_empty((0,), dtype=element1.dtype), adj1.sizes())
+
+    if element2.numel() > element1.numel():
+        element1, element2 = element2, element1
+
+    idx = torch.searchsorted(element1[:-1], element2)
+    mask = (element1[idx] == element2)
+    retelem = element2[mask]
+    return _ncn_elem2spm(retelem, adj1.sizes())
+
+
+def _ncn_sparsesample_reweight(adj: SparseTensor, deg: int) -> SparseTensor:
+    if deg <= 0:
+        return adj
+    rowptr, col, _ = adj.csr()
+    rowcount = adj.storage.rowcount()
+    mask = rowcount > deg
+    if mask.sum().item() == 0:
+        return adj
+
+    rowcount_masked = rowcount[mask]
+    rowptr_masked = rowptr[:-1][mask]
+
+    rand = torch.rand((rowcount_masked.size(0), deg), device=col.device)
+    rand.mul_(rowcount_masked.to(rand.dtype).reshape(-1, 1))
+    rand = rand.to(torch.long)
+    rand.add_(rowptr_masked.reshape(-1, 1))
+
+    samplecol = col[rand].flatten()
+
+    samplerow = torch.arange(adj.size(0), device=adj.device())[mask].reshape(
+        -1, 1).expand(-1, deg).flatten()
+    samplevalue = (rowcount_masked * (1 / deg)).reshape(-1, 1).expand(-1, deg).flatten()
+
+    mask_inv = torch.logical_not(mask)
+    nosamplerow, nosamplecol = adj[mask_inv].coo()[:2]
+    nosamplerow = torch.arange(adj.size(0), device=adj.device())[mask_inv][nosamplerow]
+
+    ret = SparseTensor(row=torch.cat((samplerow, nosamplerow)),
+                       col=torch.cat((samplecol, nosamplecol)),
+                       value=torch.cat((samplevalue,
+                                        torch.ones_like(nosamplerow, dtype=samplevalue.dtype))),
+                       sparse_sizes=adj.sparse_sizes()).to_device(
+                           adj.device()).coalesce()
+    return ret
+
+
+def _ncn_adjoverlap(adj1: SparseTensor,
+                    adj2: SparseTensor,
+                    tar_ei: torch.Tensor,
+                    cnsampledeg: int = -1) -> SparseTensor:
+    if tar_ei.dim() == 2 and tar_ei.size(0) != 2:
+        tar_ei = tar_ei.t()
+    adj1 = adj1[tar_ei[0]]
+    adj2 = adj2[tar_ei[1]]
+    adjoverlap = _ncn_spmoverlap(adj1, adj2)
+    if cnsampledeg > 0:
+        adjoverlap = _ncn_sparsesample_reweight(adjoverlap, cnsampledeg)
+    return adjoverlap
+
+
 class LinkPredictionHead(nn.Module):
     """Task-specific head for link prediction."""
     def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot', ridge_alpha=1.0, head_num_layers=2):
@@ -1209,6 +1292,91 @@ class LinkPredictionHead(nn.Module):
             raise ValueError(f"Invalid similarity type: {self.sim}")
 
         return logits, class_emb
+
+
+class NCNLinkPredictionHead(nn.Module):
+    """
+    Link Prediction Head using NCN-style common-neighbor pooling.
+    Combines pooled common-neighbor node features with refined edge embeddings.
+    """
+    def __init__(self, node_dim, edge_dim, hidden_dim, dropout=0.2, norm=True, norm_affine=True,
+                 head_num_layers=2, beta=1.0, cndeg=-1):
+        super().__init__()
+        self.cndeg = cndeg
+        self.register_parameter("beta", nn.Parameter(beta * torch.ones((1))))
+
+        self.xcnlin = MLP(
+            in_channels=node_dim,
+            hidden_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_layers=2,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+        self.xijlin = MLP(
+            in_channels=edge_dim,
+            hidden_channels=hidden_dim,
+            out_channels=hidden_dim,
+            num_layers=2,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+
+        if head_num_layers <= 1:
+            self.lin = nn.Linear(hidden_dim, 1)
+            self.lin_mlp = None
+        else:
+            self.lin = None
+            self.lin_mlp = MLP(
+                in_channels=hidden_dim,
+                hidden_channels=hidden_dim,
+                out_channels=1,
+                num_layers=head_num_layers,
+                dropout=dropout,
+                norm=norm,
+                tailact=False,
+                norm_affine=norm_affine
+            )
+
+    def forward(self, edge_emb, adj_t, edges, node_emb=None):
+        """
+        Args:
+            edge_emb: Refined edge embeddings from Transformer [E, edge_dim]
+            adj_t: Adjacency matrix (SparseTensor)
+            edges: Edge indices [2, E] or [E, 2]
+            node_emb: Node embeddings [N, node_dim]
+        """
+        if node_emb is None:
+            raise ValueError("NCN head requires node_emb to be provided.")
+        if edges.dim() == 2 and edges.size(0) != 2:
+            edges = edges.t()
+
+        cn = _ncn_adjoverlap(adj_t, adj_t, edges, cnsampledeg=self.cndeg)
+        xcn = spmm_add(cn, node_emb)
+        xcn = self.xcnlin(xcn)
+        if xcn.dim() == 1:
+            xcn = xcn.unsqueeze(0)
+
+        xij = self.xijlin(edge_emb)
+        if xij.dim() == 1:
+            xij = xij.unsqueeze(0)
+
+        h = xcn * self.beta + xij
+        if self.lin_mlp is not None:
+            logits = self.lin_mlp(h)
+        else:
+            logits = self.lin(h).squeeze(-1)
+
+        if logits.dim() == 0:
+            logits = logits.unsqueeze(0)
+        elif logits.dim() > 1:
+            logits = logits.squeeze(-1)
+
+        return logits
 
 
 class GraphClassificationHead(nn.Module):
@@ -1597,6 +1765,8 @@ class PFNPredictorNodeCls(nn.Module):
                  mplp_signature_sampling='torchhd',
                  mplp_use_subgraph=True,
                  mplp_use_degree='none',
+                 ncn_beta=1.0,
+                 ncn_cndeg=-1,
                  nc_head_num_layers=None, lp_head_num_layers=None,
                  lp_concat_common_neighbors=False):
         super(PFNPredictorNodeCls, self).__init__()
@@ -1614,8 +1784,10 @@ class PFNPredictorNodeCls(nn.Module):
         self.mplp_signature_sampling = mplp_signature_sampling
         self.mplp_use_subgraph = mplp_use_subgraph
         self.mplp_use_degree = mplp_use_degree
-        # CN concat is not applied to MPLP head
-        self.lp_concat_common_neighbors = lp_concat_common_neighbors and self.lp_head_type != 'mplp'
+        self.ncn_beta = ncn_beta
+        self.ncn_cndeg = ncn_cndeg
+        # CN concat is not applied to MPLP/NCN heads
+        self.lp_concat_common_neighbors = lp_concat_common_neighbors and self.lp_head_type not in ('mplp', 'ncn')
 
         # Separate ridge regression configurations
         # Use explicit task-specific parameters - they have proper defaults from config
@@ -1729,6 +1901,18 @@ class PFNPredictorNodeCls(nn.Module):
                 use_degree=self.mplp_use_degree,
                 edge_feat_dim=lp_head_input_dim
             )
+        elif self.lp_head_type == 'ncn':
+            self.lp_head = NCNLinkPredictionHead(
+                node_dim=self.hidden_dim,
+                edge_dim=head_hidden_dim,
+                hidden_dim=head_hidden_dim,
+                dropout=dropout,
+                norm=norm,
+                norm_affine=norm_affine,
+                head_num_layers=self.lp_head_num_layers,
+                beta=self.ncn_beta,
+                cndeg=self.ncn_cndeg
+            )
         else:
             self.lp_head = LinkPredictionHead(
                 hidden_dim=lp_head_input_dim,
@@ -1767,6 +1951,7 @@ class PFNPredictorNodeCls(nn.Module):
         - target_x: Target edge embeddings
         - context_y: Context edge labels (0: no-link, 1: link)
         - class_x: Link prototypes [2, hidden_dim]
+        - adj_t/lp_edges/node_emb: Required for MPLP/NCN heads
 
         For graph classification:
         - data: PFN data structure (prepared for graph classification)
@@ -1863,6 +2048,11 @@ class PFNPredictorNodeCls(nn.Module):
                     raise ValueError("MPLP head requires adj_t and lp_edges to be passed to forward()")
                 logits = self.lp_head(target_label_emb, adj_t, lp_edges, node_emb=node_emb)
                 class_emb = class_x # Keep prototypes as is (not updated by MPLP)
+            elif self.lp_head_type == 'ncn':
+                if adj_t is None or lp_edges is None or node_emb is None:
+                    raise ValueError("NCN head requires adj_t, lp_edges, and node_emb to be passed to forward()")
+                logits = self.lp_head(target_label_emb, adj_t, lp_edges, node_emb=node_emb)
+                class_emb = class_x
             else:
                 logits, class_emb = self.lp_head(
                     target_label_emb=target_label_emb,
@@ -2306,6 +2496,7 @@ class UnifiedGNN(nn.Module):
         h_feats: Hidden feature dimension  
         prop_step: Number of propagation steps
         conv: Convolution type ('GCN', 'SAGE', 'GAT', 'GIN')
+        gin_aggr: Aggregation for GIN ('sum' or 'mean')
         multilayer: Use separate conv layers for each step
         norm: Apply layer normalization
         relu: Apply ReLU activation
@@ -2319,13 +2510,14 @@ class UnifiedGNN(nn.Module):
         no_parameters: Use parameter-free convolutions
     """
     def __init__(self, model_type='gcn', in_feats=128, h_feats=128, prop_step=2,
-                 conv='GCN', multilayer=False, norm=False, relu=False, dropout=0.2,
+                 conv='GCN', gin_aggr='sum', multilayer=False, norm=False, relu=False, dropout=0.2,
                  residual=1.0, linear=False, alpha=0.5, exp=False, res=False,
                  supports_edge_weight=False, no_parameters=False, input_norm=False, activation='relu'):
         super(UnifiedGNN, self).__init__()
         
         self.model_type = model_type.lower()
         self.conv_type = conv
+        self.gin_aggr = 'add' if gin_aggr == 'sum' else gin_aggr
         self.multilayer = multilayer
         self.norm = norm
         self.relu = relu
@@ -2364,8 +2556,8 @@ class UnifiedGNN(nn.Module):
             for _ in range(1, prop_step):
                 self.norms.append(nn.LayerNorm(h_feats))
         
-        # Linear transformations
-        if linear:
+        # Linear transformations (skip for GIN because it already includes an MLP)
+        if linear and self.conv_type != 'GIN':
             # All models use the same MLP structure: h_feats -> h_feats
             self.mlps = nn.ModuleList([MLP(h_feats, h_feats, h_feats, 2, dropout) for _ in range(prop_step)])
 
@@ -2394,9 +2586,15 @@ class UnifiedGNN(nn.Module):
             return GATConv(in_dim, out_dim, heads=1, concat=False)
         elif self.conv_type == 'GIN':
             mlp = MLP(in_dim, out_dim, out_dim, 2, dropout, self.norm)
-            return GINConv(mlp)
+            return GINConv(mlp, aggr=self.gin_aggr)
         else:
             raise ValueError(f"Unsupported convolution type: {self.conv_type}")
+
+    def _apply_input_norm(self, x, i):
+        """Apply input normalization only (no activation or dropout)."""
+        if self.norm:
+            x = self.norms[i](x)
+        return x
 
     def _apply_norm_and_activation(self, x, i):
         """Apply normalization and activation."""
@@ -2410,6 +2608,10 @@ class UnifiedGNN(nn.Module):
     
     def _apply_conv(self, conv_layer, adj_t, x, e_feat):
         """Apply convolution layer with conditional edge weight support."""
+        if self.conv_type == 'GAT' and isinstance(adj_t, SparseTensor):
+            row, col, _ = adj_t.coo()
+            edge_index = torch.stack([row, col], dim=0)
+            return conv_layer(x, edge_index).flatten(1)
         if self.conv_type == 'GCN' and e_feat is not None:
             # Only GCN supports edge_weight parameter
             return conv_layer(x, adj_t, edge_weight=e_feat).flatten(1)
@@ -2430,7 +2632,7 @@ class UnifiedGNN(nn.Module):
         """LightGCN forward pass matching original implementation exactly."""
         alpha = F.softmax(self.alphas, dim=0)
         if self.input_norm:
-            in_feat = self._apply_norm_and_activation(in_feat, 0)
+            in_feat = self._apply_input_norm(in_feat, 0)
         
         if self.multilayer:
             # Use separate conv layers for each step
@@ -2457,7 +2659,7 @@ class UnifiedGNN(nn.Module):
 
     def _forward_gcn(self, adj_t, in_feat, e_feat):
         if self.input_norm:
-            in_feat = self._apply_norm_and_activation(in_feat, 0)
+            in_feat = self._apply_input_norm(in_feat, 0)
         """Standard GCN forward pass."""
         ori = in_feat
         if self.multilayer:

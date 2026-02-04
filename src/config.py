@@ -347,7 +347,7 @@ def parse_joint_training_args():
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
     parser.add_argument('--lp_metric', type=str, default='auto', choices=['auto', 'auc', 'acc', 'hits@20', 'hits@50', 'hits@100', 'mrr'],
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
-    parser.add_argument('--lp_head_type', type=str, default='standard', choices=['standard', 'mplp'], help='Type of link prediction head')
+    parser.add_argument('--lp_head_type', type=str, default='standard', choices=['standard', 'mplp', 'ncn'], help='Type of link prediction head')
     
     # === MPLP Head Configuration ===
     parser.add_argument('--mplp_signature_dim', type=int, default=1024, help='Dimension of random signature vectors for MPLP')
@@ -363,6 +363,10 @@ def parse_joint_training_args():
                         help='Degree-based node weighting for MPLP structural features')
     parser.add_argument('--lp_concat_common_neighbors', type=str2bool, default=False,
                         help='Concatenate common-neighbor count to edge embeddings before LP head')
+    parser.add_argument('--ncn_cndeg', type=int, default=-1,
+                        help='Sample degree for NCN common-neighbor pooling (-1 = no sampling)')
+    parser.add_argument('--ncn_beta', type=float, default=1.0,
+                        help='Scaling factor for NCN common-neighbor features')
     
     # === Graph Classification Specific ===
     parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')

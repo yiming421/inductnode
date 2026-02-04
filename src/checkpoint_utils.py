@@ -329,7 +329,9 @@ def create_model_from_args(args, input_dim, device):
             mplp_prop_type=getattr(args, 'mplp_prop_type', 'combine'),
             mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
             mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
-            mplp_use_degree=getattr(args, 'mplp_use_degree', 'none')
+            mplp_use_degree=getattr(args, 'mplp_use_degree', 'none'),
+            ncn_beta=getattr(args, 'ncn_beta', 1.0),
+            ncn_cndeg=getattr(args, 'ncn_cndeg', -1)
         ).to(device) if args.predictor == 'PFN' else None
     
     projector = MLP(args.min_pca_dim, args.hidden, args.hidden, 2, args.dp, args.norm, False, args.mlp_norm_affine).to(device) if args.use_projector else None
@@ -386,7 +388,9 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
         mplp_prop_type=getattr(args, 'mplp_prop_type', 'combine'),
         mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
         mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
-        mplp_use_degree=getattr(args, 'mplp_use_degree', 'none')
+        mplp_use_degree=getattr(args, 'mplp_use_degree', 'none'),
+        ncn_beta=getattr(args, 'ncn_beta', 1.0),
+        ncn_cndeg=getattr(args, 'ncn_cndeg', -1)
     ).to(device) if args.predictor == 'PFN' else None
     
     # 3. Load the saved states into the newly created objects
