@@ -414,7 +414,7 @@ class MultiApr:
         self.targets = []
 
 
-def get_dataset_metric(dataset_name, num_classes=None, is_multitask=None):
+def get_dataset_metric(dataset_name, num_classes=None, is_multitask=None, metric_override=None):
     """
     Get the appropriate evaluation metric(s) for a given dataset.
     Uses intelligent defaults based on task type with specific overrides.
@@ -423,11 +423,15 @@ def get_dataset_metric(dataset_name, num_classes=None, is_multitask=None):
         dataset_name (str): Name of the dataset
         num_classes (int, optional): Number of classes in the dataset
         is_multitask (bool, optional): Whether this is a multi-task dataset
+        metric_override (str, optional): Force a specific metric ('auc', 'ap', 'accuracy', 'auto')
         
     Returns:
         str or list: Metric name(s) ('auc', 'ap', 'accuracy') or list of metrics for PCBA
     """
     dataset_name = dataset_name.lower()
+
+    if metric_override and metric_override != 'auto':
+        return metric_override
     
     # Specific overrides for known datasets
     if 'chemhiv' in dataset_name or 'hiv' in dataset_name:
@@ -1683,7 +1687,13 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
         raise ValueError("Vectorized GC eval expects a multi-task dataset (e.g., PCBA)")
 
     num_tasks = sample_graph.y.numel()
-    metric_type = get_dataset_metric(dataset_name, num_classes=dataset_info.get('num_classes', None), is_multitask=True)
+    metric_override = getattr(args, 'gc_metric', 'auto') if args is not None else None
+    metric_type = get_dataset_metric(
+        dataset_name,
+        num_classes=dataset_info.get('num_classes', None),
+        is_multitask=True,
+        metric_override=metric_override
+    )
     sim_type = getattr(args, 'gc_sim', 'dot') if args is not None else 'dot'
     use_ridge = sim_type == 'ridge'
     ridge_alpha = getattr(args, 'gc_ridge_alpha', 1.0) if args is not None else 1.0
@@ -1942,7 +1952,13 @@ def evaluate_graph_classification_full_batch(model, predictor, dataset_info, dat
     # Determine the appropriate metric for this dataset
     is_multitask = sample_graph.y.numel() > 1
     num_classes = dataset_info.get('num_classes', None)
-    metric_type = get_dataset_metric(dataset_name, num_classes=num_classes, is_multitask=is_multitask) if dataset_name else 'accuracy'
+    metric_override = getattr(args, 'gc_metric', 'auto') if args is not None else None
+    metric_type = get_dataset_metric(
+        dataset_name,
+        num_classes=num_classes,
+        is_multitask=is_multitask,
+        metric_override=metric_override
+    ) if dataset_name else 'accuracy'
     
     split_results = {}
     
@@ -2474,7 +2490,13 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
     sample_graph = dataset_info['dataset'][0]
     is_multitask = sample_graph.y.numel() > 1
     num_classes = dataset_info.get('num_classes', None)
-    metric_type = get_dataset_metric(dataset_name, num_classes=num_classes, is_multitask=is_multitask) if dataset_name else 'accuracy'
+    metric_override = getattr(args, 'gc_metric', 'auto') if args is not None else None
+    metric_type = get_dataset_metric(
+        dataset_name,
+        num_classes=num_classes,
+        is_multitask=is_multitask,
+        metric_override=metric_override
+    ) if dataset_name else 'accuracy'
 
     # Check if meta-graph C&S is enabled
     use_graph_cs = getattr(args, 'use_graph_cs', False) if args is not None else False
@@ -2906,7 +2928,13 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                 
                 sample_graph = train_dataset_info['dataset'][0]
                 is_multitask = sample_graph.y.numel() > 1
-                metric_type = get_dataset_metric(dataset_name, num_classes=train_dataset_info.get("num_classes", None), is_multitask=is_multitask)
+                metric_override = getattr(args, 'gc_metric', 'auto') if args is not None else None
+                metric_type = get_dataset_metric(
+                    dataset_name,
+                    num_classes=train_dataset_info.get("num_classes", None),
+                    is_multitask=is_multitask,
+                    metric_override=metric_override
+                )
                 
                 if isinstance(metric_type, list):
                     # Multiple metrics (e.g., PCBA with AUC and AP)
@@ -2972,7 +3000,13 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                 # Check if this is a multi-task dataset
                 sample_graph = train_dataset_info['dataset'][0]
                 is_multitask = sample_graph.y.numel() > 1
-                metric_type = get_dataset_metric(dataset_name, num_classes=train_dataset_info.get("num_classes", None), is_multitask=is_multitask)
+                metric_override = getattr(args, 'gc_metric', 'auto') if args is not None else None
+                metric_type = get_dataset_metric(
+                    dataset_name,
+                    num_classes=train_dataset_info.get("num_classes", None),
+                    is_multitask=is_multitask,
+                    metric_override=metric_override
+                )
                 
                 if isinstance(metric_type, list):
                     # Multiple metrics (e.g., PCBA with AUC and AP)
@@ -3069,7 +3103,13 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         
                         test_sample_graph = test_dataset_info['dataset'][0]
                         test_is_multitask = test_sample_graph.y.numel() > 1
-                        test_metric_type = get_dataset_metric(test_name, num_classes=test_dataset_info.get("num_classes", None), is_multitask=test_is_multitask)
+                        metric_override = getattr(args, 'gc_metric', 'auto') if args is not None else None
+                        test_metric_type = get_dataset_metric(
+                            test_name,
+                            num_classes=test_dataset_info.get("num_classes", None),
+                            is_multitask=test_is_multitask,
+                            metric_override=metric_override
+                        )
                         
                         if isinstance(test_metric_type, list):
                             # Multiple metrics (e.g., PCBA with AUC and AP)
@@ -3171,7 +3211,13 @@ def train_and_evaluate_graph_classification(model, predictor, train_datasets, tr
                         # Check if this is a multi-task dataset for label only
                         test_sample_graph = test_dataset_info['dataset'][0]
                         test_is_multitask = test_sample_graph.y.numel() > 1
-                        test_metric_type = get_dataset_metric(test_name, num_classes=test_dataset_info.get("num_classes", None), is_multitask=test_is_multitask)
+                        metric_override = getattr(args, 'gc_metric', 'auto') if args is not None else None
+                        test_metric_type = get_dataset_metric(
+                            test_name,
+                            num_classes=test_dataset_info.get("num_classes", None),
+                            is_multitask=test_is_multitask,
+                            metric_override=metric_override
+                        )
                         
                         if isinstance(test_metric_type, list):
                             # Multiple metrics (e.g., PCBA with AUC and AP)

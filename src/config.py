@@ -374,6 +374,8 @@ def parse_joint_training_args():
     parser.add_argument('--gc_batch_size', type=int, default=1024, help='Graph classification batch size')
     parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
     parser.add_argument('--graph_pooling', type=str, default='max', choices=['mean', 'max', 'sum'], help='Graph pooling method')
+    parser.add_argument('--gc_metric', type=str, default='auc', choices=['auto', 'auc', 'ap', 'accuracy'],
+                       help='Graph classification metric override (auto=dataset default)')
     parser.add_argument('--lambda_gc', type=float, default=0.41834063194474214, help='Weight for graph classification loss')
     parser.add_argument('--context_graph_num', type=int, default=5, help='Number of context graphs for graph classification')
     parser.add_argument('--gc_multitask_vectorized', type=str2bool, default=False,

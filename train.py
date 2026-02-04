@@ -55,6 +55,18 @@ from src.config import parse_joint_training_args
 from src.checkpoint_utils import load_checkpoint_config, override_args_from_checkpoint, load_checkpoint_states, save_checkpoint
 
 
+def _select_primary_metric(metric_dict, override=None, prefer='auc'):
+    if not isinstance(metric_dict, dict):
+        return metric_dict
+    if not metric_dict:
+        return 0.0
+    if override and override != 'auto':
+        return metric_dict.get(override, metric_dict.get(prefer, metric_dict.get('ap', next(iter(metric_dict.values())))))
+    if prefer == 'ap':
+        return metric_dict.get('ap', metric_dict.get('auc', next(iter(metric_dict.values()))))
+    return metric_dict.get('auc', metric_dict.get('ap', next(iter(metric_dict.values()))))
+
+
 # Memory and time tracking utilities for Link Prediction
 class LinkPredictionTracker:
     """Comprehensive memory and time tracker for link prediction operations."""
@@ -2814,8 +2826,12 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                         
                         # Handle both numeric and dict results for display
                         if isinstance(split_result, dict):
-                            # Extract primary metric for display
-                            display_metric = split_result.get('ap', split_result.get('auc', 0.0))
+                            # Extract primary metric for display (respect GC metric override)
+                            display_metric = _select_primary_metric(
+                                split_result,
+                                override=getattr(args, 'gc_metric', 'auto'),
+                                prefer='ap'
+                            )
                             print(f"      Task {task_idx}: {display_metric:.4f} (eval: {eval_time:.2f}s)")
                         else:
                             print(f"      Task {task_idx}: {split_result:.4f} (eval: {eval_time:.2f}s)")
@@ -2830,7 +2846,11 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                     dataset_avg = aggregate_task_metrics(task_results)
                     # For averaging across datasets, extract primary metric if multiple metrics
                     if isinstance(dataset_avg, dict):
-                        primary_metric = dataset_avg.get('ap', dataset_avg.get('auc', 0.0))
+                        primary_metric = _select_primary_metric(
+                            dataset_avg,
+                            override=getattr(args, 'gc_metric', 'auto'),
+                            prefer='ap'
+                        )
                         all_dataset_results.append(primary_metric)
                         individual_results.append(primary_metric)  # Store primary metric for averaging
                     else:
@@ -3247,7 +3267,11 @@ def run_joint_training(args, device='cuda:0'):
             if isinstance(lp_test_metric, dict):
                 lp_test_metric = lp_test_metric.get('auc', lp_test_metric.get('ap', list(lp_test_metric.values())[0] if lp_test_metric else 0.0))
             if isinstance(gc_test_metric, dict):
-                gc_test_metric = gc_test_metric.get('auc', gc_test_metric.get('ap', list(gc_test_metric.values())[0] if gc_test_metric else 0.0))
+                gc_test_metric = _select_primary_metric(
+                    gc_test_metric,
+                    override=getattr(args, 'gc_metric', 'auto'),
+                    prefer='auc'
+                )
             
             final_results_msg = f"Node Classification Test: {nc_test_metric:.4f}\n"
             
@@ -3624,7 +3648,11 @@ def run_joint_training(args, device='cuda:0'):
     if isinstance(lp_test_metric, dict):
         lp_test_metric = lp_test_metric.get('auc', lp_test_metric.get('ap', list(lp_test_metric.values())[0] if lp_test_metric else 0.0))
     if isinstance(gc_test_metric, dict):
-        gc_test_metric = gc_test_metric.get('auc', gc_test_metric.get('ap', list(gc_test_metric.values())[0] if gc_test_metric else 0.0))
+        gc_test_metric = _select_primary_metric(
+            gc_test_metric,
+            override=getattr(args, 'gc_metric', 'auto'),
+            prefer='auc'
+        )
     
     final_results_msg = (f"Node Classification Test: {nc_test_metric:.4f}\n"
                         f"Link Prediction Test: {lp_test_metric:.4f}\n"
@@ -3883,7 +3911,11 @@ def main():
             for metric in dataset_metrics:
                 if isinstance(metric, dict):
                     # Multiple metrics (e.g., PCBA with AUC and AP) - prioritize AUC
-                    primary_metric = metric.get('auc', metric.get('ap', next(iter(metric.values()))))
+                    primary_metric = _select_primary_metric(
+                        metric,
+                        override=getattr(args, 'gc_metric', 'auto'),
+                        prefer='auc'
+                    )
                     primary_metrics.append(primary_metric)
                 else:
                     primary_metrics.append(metric)
