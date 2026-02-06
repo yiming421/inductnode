@@ -330,6 +330,12 @@ def create_model_from_args(args, input_dim, device):
             mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
             mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
             mplp_use_degree=getattr(args, 'mplp_use_degree', 'none'),
+            mplp_context_calibrate=getattr(args, 'mplp_context_calibrate', True),
+            mplp_calib_train_static=getattr(args, 'mplp_calib_train_static', False),
+            mplp_calib_shuffle_labels=getattr(args, 'mplp_calib_shuffle_labels', False),
+            mplp_calib_w_min=getattr(args, 'mplp_calib_w_min', 0.1),
+            mplp_calib_w_max=getattr(args, 'mplp_calib_w_max', 10.0),
+            mplp_calib_reg=getattr(args, 'mplp_calib_reg', 1e-3),
             ncn_beta=getattr(args, 'ncn_beta', 1.0),
             ncn_cndeg=getattr(args, 'ncn_cndeg', -1)
         ).to(device) if args.predictor == 'PFN' else None
@@ -389,6 +395,12 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
         mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
         mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
         mplp_use_degree=getattr(args, 'mplp_use_degree', 'none'),
+        mplp_context_calibrate=getattr(args, 'mplp_context_calibrate', True),
+        mplp_calib_train_static=getattr(args, 'mplp_calib_train_static', False),
+        mplp_calib_shuffle_labels=getattr(args, 'mplp_calib_shuffle_labels', False),
+        mplp_calib_w_min=getattr(args, 'mplp_calib_w_min', 0.1),
+        mplp_calib_w_max=getattr(args, 'mplp_calib_w_max', 10.0),
+        mplp_calib_reg=getattr(args, 'mplp_calib_reg', 1e-3),
         ncn_beta=getattr(args, 'ncn_beta', 1.0),
         ncn_cndeg=getattr(args, 'ncn_cndeg', -1)
     ).to(device) if args.predictor == 'PFN' else None

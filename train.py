@@ -1086,6 +1086,12 @@ def create_unified_model(args, input_dim, device):
             mplp_signature_sampling=getattr(args, 'mplp_signature_sampling', 'torchhd'),
             mplp_use_subgraph=getattr(args, 'mplp_use_subgraph', True),
             mplp_use_degree=getattr(args, 'mplp_use_degree', 'none'),
+            mplp_context_calibrate=getattr(args, 'mplp_context_calibrate', True),
+            mplp_calib_train_static=getattr(args, 'mplp_calib_train_static', False),
+            mplp_calib_shuffle_labels=getattr(args, 'mplp_calib_shuffle_labels', False),
+            mplp_calib_w_min=getattr(args, 'mplp_calib_w_min', 0.1),
+            mplp_calib_w_max=getattr(args, 'mplp_calib_w_max', 10.0),
+            mplp_calib_reg=getattr(args, 'mplp_calib_reg', 1e-3),
             ncn_beta=getattr(args, 'ncn_beta', 1.0),
             ncn_cndeg=getattr(args, 'ncn_cndeg', -1),
             lp_concat_common_neighbors=getattr(args, 'lp_concat_common_neighbors', False),
@@ -1778,6 +1784,12 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     nc_count = 0
     lp_count = 0
     gc_count = 0
+    lp_gate_sum = 0.0
+    lp_gate_count = 0
+    lp_gate_calib_sum = 0.0
+    lp_gate_calib_count = 0
+    lp_struct_loss_sum = 0.0
+    lp_struct_loss_count = 0
     # Initialize loss breakdown variables
     nc_nll_loss = 0.0
     nc_de_loss = 0.0
@@ -1944,15 +1956,16 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     nc_loaders.extend(new_augmented_loaders)
                     nc_split_idx_list = new_augmented_split_idx_list
 
-            if use_augmentation and include_original:
-                # In preprocessing mode with original graphs included
+            if use_augmentation and augmentation_mode in ('preprocessing', 'per_epoch') and include_original:
+                # Original + regenerated augmented loaders
                 num_original_graphs = len(nc_loaders) // (1 + num_augmentations)
                 num_augmented_graphs = len(nc_loaders) - num_original_graphs
-            elif use_augmentation and not include_original:
-                # Only augmented graphs
+            elif use_augmentation and augmentation_mode in ('preprocessing', 'per_epoch') and not include_original:
+                # Training only on regenerated augmented loaders
                 num_original_graphs = 0
                 num_augmented_graphs = len(nc_loaders)
             else:
+                # per_step mode augments inside engine_nc/train; loader counts stay original
                 num_original_graphs = len(nc_loaders)
                 num_augmented_graphs = 0
 
@@ -1969,7 +1982,8 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     identity_projection=identity_projection,
                     projector=projector,
                     external_embeddings=external_emb,
-                    optimizer=opt_nc
+                    optimizer=opt_nc,
+                    epoch=epoch
                 )
                 # Handle dict return
                 if isinstance(nc_loss_result, dict):
@@ -2108,6 +2122,18 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                         lp_loss_sum += lp_loss
                         lp_count += 1
                         lp_tracker.operation_counts['training_steps'] += 1
+                        gate_val = getattr(getattr(predictor, 'lp_head', None), 'last_gate_mean_train', None)
+                        if gate_val is not None:
+                            lp_gate_sum += float(gate_val)
+                            lp_gate_count += 1
+                        calib_val = getattr(getattr(predictor, 'lp_head', None), 'last_gate_calib_ms_train', None)
+                        if calib_val is not None:
+                            lp_gate_calib_sum += float(calib_val)
+                            lp_gate_calib_count += 1
+                        struct_loss_val = getattr(getattr(predictor, 'lp_head', None), 'last_struct_loss_train', None)
+                        if struct_loss_val is not None:
+                            lp_struct_loss_sum += float(struct_loss_val)
+                            lp_struct_loss_count += 1
         
         if lp_count > 0:
             total_lp_loss = lp_loss_sum / lp_count
@@ -2288,7 +2314,16 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
         'nc_num_original': nc_num_original if 'nc_num_original' in locals() else 0,
         'nc_num_augmented': nc_num_augmented if 'nc_num_augmented' in locals() else 0,
         # Per-dataset metrics
-        'nc_dataset_losses': nc_dataset_losses if 'nc_dataset_losses' in locals() else {}
+        'nc_dataset_losses': nc_dataset_losses if 'nc_dataset_losses' in locals() else {},
+        'lp_gate_mean_train': (lp_gate_sum / lp_gate_count) if lp_gate_count > 0 else None,
+        'lp_gate_calib_ms_train': (lp_gate_calib_sum / lp_gate_calib_count) if lp_gate_calib_count > 0 else None,
+        'lp_struct_only_loss_train': (lp_struct_loss_sum / lp_struct_loss_count) if lp_struct_loss_count > 0 else None,
+        'lp_struct_score_mean_train': getattr(getattr(predictor, 'lp_head', None), 'last_struct_score_mean_train', None),
+        'lp_struct_score_std_train': getattr(getattr(predictor, 'lp_head', None), 'last_struct_score_std_train', None),
+        'lp_feat_score_mean_train': getattr(getattr(predictor, 'lp_head', None), 'last_feat_score_mean_train', None),
+        'lp_feat_score_std_train': getattr(getattr(predictor, 'lp_head', None), 'last_feat_score_std_train', None),
+        'lp_logit_mean_train': getattr(getattr(predictor, 'lp_head', None), 'last_logit_mean_train', None),
+        'lp_logit_std_train': getattr(getattr(predictor, 'lp_head', None), 'last_logit_std_train', None)
     }
 
     # Debug print to verify return values
@@ -2537,10 +2572,21 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
             
         if len(lp_data_list) > 0:
             lp_results_list = []
+            lp_gate_values = []
+            lp_gate_calib_values = []
+            lp_struct_values = []
+            lp_feat_values = []
+            lp_gate_ratio_values = []
+            lp_feat_abs_values = []
+            lp_gate_abs_struct_values = []
+            lp_gate_by_dataset = {}
+            lp_struct_by_dataset = {}
+            lp_feat_by_dataset = {}
             
             for i, (data, split_idx) in enumerate(zip(lp_data_list, lp_split_idx_list)):
                 link_data_all = lp_link_data_all[i]
                 context_data = lp_context_data[i]
+                dataset_name = getattr(data, 'name', f'dataset_{i}')
                 
                 split_key = split if split in link_data_all else 'test'
                 if split_key in link_data_all and link_data_all[split_key]['edge_pairs'].size(0) > 0:
@@ -2560,18 +2606,35 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                 model, predictor, data, link_data_all[split_key], context_edges,
                                 args.test_batch_size, None, None, None, identity_projection,
                                 0, True, degree=False, k_values=[20, 50, 100],
-                                use_full_adj_for_test=True, lp_metric=args.lp_metric,
+                                use_full_adj_for_test=(split == 'test'), lp_metric=args.lp_metric,
                                 lp_concat_common_neighbors=getattr(args, 'lp_concat_common_neighbors', False)
                             )
-                            return lp_results.get('default_metric', 0.0)
+                            return (
+                                lp_results.get('default_metric', 0.0),
+                                lp_results.get('mplp_gate_mean', None),
+                                lp_results.get('mplp_gate_calib_ms', None),
+                                lp_results.get('mplp_feat_only_metric', None),
+                                lp_results.get('mplp_gate_struct_abs_ratio', None),
+                                lp_results.get('mplp_feat_abs_mean', None),
+                                lp_results.get('mplp_gate_abs_struct_mean', None),
+                                lp_results.get('mplp_struct_only_metric', None)
+                            )
 
                         if num_context_samples == 1:
-                            lp_metric_value = _eval_with_context(context_data)
+                            (lp_metric_value, lp_gate_value, lp_gate_calib, lp_feat_value, lp_gate_ratio,
+                             lp_feat_abs_mean, lp_gate_abs_struct_mean, lp_struct_value) = _eval_with_context(context_data)
                         else:
                             context_source = link_data_all.get('train', None)
                             context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
                             base_seed = int(getattr(args, 'seed', 42))
                             sample_metrics = []
+                            sample_gates = []
+                            sample_struct = []
+                            sample_feat = []
+                            sample_gate_ratio = []
+                            sample_feat_abs = []
+                            sample_gate_abs_struct = []
+                            sample_calib = []
                             for sample_idx in range(num_context_samples):
                                 torch.manual_seed(base_seed + i * 1000 + sample_idx)
                                 if context_source is not None and context_source['edge_pairs'].size(0) > 0:
@@ -2581,9 +2644,32 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                 else:
                                     context_data_sample = context_data
 
-                                sample_metrics.append(_eval_with_context(context_data_sample))
+                                (metric_val, gate_val, calib_val, feat_val, gate_ratio_val,
+                                 feat_abs_val, gate_abs_struct_val, struct_val) = _eval_with_context(context_data_sample)
+                                sample_metrics.append(metric_val)
+                                if gate_val is not None:
+                                    sample_gates.append(gate_val)
+                                if calib_val is not None:
+                                    sample_calib.append(calib_val)
+                                if feat_val is not None:
+                                    sample_feat.append(feat_val)
+                                if gate_ratio_val is not None:
+                                    sample_gate_ratio.append(gate_ratio_val)
+                                if feat_abs_val is not None:
+                                    sample_feat_abs.append(feat_abs_val)
+                                if gate_abs_struct_val is not None:
+                                    sample_gate_abs_struct.append(gate_abs_struct_val)
+                                if struct_val is not None:
+                                    sample_struct.append(struct_val)
 
                             lp_metric_value = sum(sample_metrics) / len(sample_metrics) if sample_metrics else 0.0
+                            lp_gate_value = (sum(sample_gates) / len(sample_gates)) if sample_gates else None
+                            lp_gate_calib = (sum(sample_calib) / len(sample_calib)) if sample_calib else None
+                            lp_feat_value = (sum(sample_feat) / len(sample_feat)) if sample_feat else None
+                            lp_gate_ratio = (sum(sample_gate_ratio) / len(sample_gate_ratio)) if sample_gate_ratio else None
+                            lp_feat_abs_mean = (sum(sample_feat_abs) / len(sample_feat_abs)) if sample_feat_abs else None
+                            lp_gate_abs_struct_mean = (sum(sample_gate_abs_struct) / len(sample_gate_abs_struct)) if sample_gate_abs_struct else None
+                            lp_struct_value = (sum(sample_struct) / len(sample_struct)) if sample_struct else None
                         
                         # Move all data back to CPU to free GPU memory
                         data.x = data.x.cpu()
@@ -2603,16 +2689,64 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                         lp_tracker.operation_counts['evaluation_steps'] += 1
                         
                     lp_results_list.append(lp_metric_value)
+                    lp_gate_values.append(lp_gate_value)
+                    lp_gate_calib_values.append(lp_gate_calib)
+                    lp_struct_values.append(lp_struct_value)
+                    lp_gate_ratio_values.append(lp_gate_ratio)
+                    lp_feat_values.append(lp_feat_value)
+                    lp_feat_abs_values.append(lp_feat_abs_mean)
+                    lp_gate_abs_struct_values.append(lp_gate_abs_struct_mean)
+                    lp_gate_by_dataset[dataset_name] = lp_gate_value
+                    lp_struct_by_dataset[dataset_name] = lp_struct_value
+                    lp_feat_by_dataset[dataset_name] = lp_feat_value
                 else:
                     lp_results_list.append(0.0)
+                    lp_gate_values.append(None)
+                    lp_gate_calib_values.append(None)
+                    lp_gate_ratio_values.append(None)
+                    lp_feat_values.append(None)
+                    lp_feat_abs_values.append(None)
+                    lp_gate_abs_struct_values.append(None)
+                    lp_struct_values.append(None)
             
             if lp_results_list:
                 avg_result = sum(lp_results_list) / len(lp_results_list)
+                gate_values = [v for v in lp_gate_values if v is not None]
+                avg_gate = (sum(gate_values) / len(gate_values)) if gate_values else None
+                gate_calib_values = [v for v in lp_gate_calib_values if v is not None]
+                avg_gate_calib = (sum(gate_calib_values) / len(gate_calib_values)) if gate_calib_values else None
+                struct_values = [v for v in lp_struct_values if v is not None]
+                avg_struct = (sum(struct_values) / len(struct_values)) if struct_values else None
+                feat_values = [v for v in lp_feat_values if v is not None]
+                avg_feat = (sum(feat_values) / len(feat_values)) if feat_values else None
+                gate_ratio_values = [v for v in lp_gate_ratio_values if v is not None]
+                avg_gate_ratio = (sum(gate_ratio_values) / len(gate_ratio_values)) if gate_ratio_values else None
+                feat_abs_values = [v for v in lp_feat_abs_values if v is not None]
+                avg_feat_abs = (sum(feat_abs_values) / len(feat_abs_values)) if feat_abs_values else None
+                gate_abs_struct_values = [v for v in lp_gate_abs_struct_values if v is not None]
+                avg_gate_abs_struct = (sum(gate_abs_struct_values) / len(gate_abs_struct_values)) if gate_abs_struct_values else None
                 results = {
                     'train': avg_result,  # For consistency with NC format
                     'valid': avg_result,
                     'test': avg_result,
-                    'individual_test_metrics': lp_results_list
+                    'individual_test_metrics': lp_results_list,
+                    'mplp_gate_mean': avg_gate,
+                    'individual_gate_means': lp_gate_values,
+                    'mplp_gate_mean_by_dataset': lp_gate_by_dataset,
+                    'mplp_struct_only_metric_by_dataset': lp_struct_by_dataset,
+                    'mplp_feat_only_metric_by_dataset': lp_feat_by_dataset,
+                    'mplp_gate_calib_ms': avg_gate_calib,
+                    'individual_gate_calib_ms': lp_gate_calib_values,
+                    'mplp_feat_only_metric': avg_feat,
+                    'individual_feat_only_metrics': lp_feat_values,
+                    'mplp_gate_struct_abs_ratio': avg_gate_ratio,
+                    'individual_gate_struct_abs_ratio': lp_gate_ratio_values,
+                    'mplp_feat_abs_mean': avg_feat_abs,
+                    'individual_feat_abs_mean': lp_feat_abs_values,
+                    'mplp_gate_abs_struct_mean': avg_gate_abs_struct,
+                    'individual_gate_abs_struct_mean': lp_gate_abs_struct_values,
+                    'mplp_struct_only_metric': avg_struct,
+                    'individual_struct_only_metrics': lp_struct_values
                 }
     
     return results
@@ -3481,6 +3615,60 @@ def run_joint_training(args, device='cuda:0'):
                 'test_unseen/gc_metric': gc_test_unseen,
                 'test_unseen/combined_score': combined_test_unseen
             }
+            lp_gate_unseen = lp_unseen_results.get('mplp_gate_mean', None)
+            if lp_gate_unseen is not None:
+                unseen_metrics['test_unseen/lp_mplp_gate_mean'] = lp_gate_unseen
+            lp_gate_unseen_by_dataset = lp_unseen_results.get('mplp_gate_mean_by_dataset', None)
+            if isinstance(lp_gate_unseen_by_dataset, dict):
+                for ds_name, gate_val in lp_gate_unseen_by_dataset.items():
+                    if gate_val is not None:
+                        unseen_metrics[f'test_unseen/lp_mplp_gate_mean/{ds_name}'] = gate_val
+            lp_struct_unseen_by_dataset = lp_unseen_results.get('mplp_struct_only_metric_by_dataset', None)
+            if isinstance(lp_struct_unseen_by_dataset, dict):
+                for ds_name, struct_val in lp_struct_unseen_by_dataset.items():
+                    if struct_val is not None:
+                        unseen_metrics[f'test_unseen/lp_struct_only_metric/{ds_name}'] = struct_val
+            lp_feat_unseen_by_dataset = lp_unseen_results.get('mplp_feat_only_metric_by_dataset', None)
+            if isinstance(lp_feat_unseen_by_dataset, dict):
+                for ds_name, feat_val in lp_feat_unseen_by_dataset.items():
+                    if feat_val is not None:
+                        unseen_metrics[f'test_unseen/lp_feat_only_metric/{ds_name}'] = feat_val
+            lp_gate_calib_unseen = lp_unseen_results.get('mplp_gate_calib_ms', None)
+            if lp_gate_calib_unseen is not None:
+                unseen_metrics['test_unseen/lp_mplp_gate_calib_ms'] = lp_gate_calib_unseen
+            lp_feat_only_unseen = lp_unseen_results.get('mplp_feat_only_metric', None)
+            if lp_feat_only_unseen is not None:
+                unseen_metrics['test_unseen/lp_feat_only_metric'] = lp_feat_only_unseen
+            lp_gate_ratio_unseen = lp_unseen_results.get('mplp_gate_struct_abs_ratio', None)
+            if lp_gate_ratio_unseen is not None:
+                unseen_metrics['test_unseen/lp_gate_struct_abs_ratio'] = lp_gate_ratio_unseen
+            lp_feat_abs_unseen = lp_unseen_results.get('mplp_feat_abs_mean', None)
+            if lp_feat_abs_unseen is not None:
+                unseen_metrics['test_unseen/lp_feat_abs_mean'] = lp_feat_abs_unseen
+            lp_gate_abs_struct_unseen = lp_unseen_results.get('mplp_gate_abs_struct_mean', None)
+            if lp_gate_abs_struct_unseen is not None:
+                unseen_metrics['test_unseen/lp_gate_abs_struct_mean'] = lp_gate_abs_struct_unseen
+            lp_struct_unseen = lp_unseen_results.get('mplp_struct_only_metric', None)
+            if lp_struct_unseen is not None:
+                unseen_metrics['test_unseen/lp_struct_only_metric'] = lp_struct_unseen
+            lp_struct_mean_unseen = lp_unseen_results.get('mplp_struct_score_mean', None)
+            lp_struct_std_unseen = lp_unseen_results.get('mplp_struct_score_std', None)
+            lp_feat_mean_unseen = lp_unseen_results.get('mplp_feat_score_mean', None)
+            lp_feat_std_unseen = lp_unseen_results.get('mplp_feat_score_std', None)
+            lp_std_ratio_unseen = lp_unseen_results.get('mplp_struct_feat_std_ratio', None)
+            lp_mean_ratio_unseen = lp_unseen_results.get('mplp_struct_feat_absmean_ratio', None)
+            if lp_struct_mean_unseen is not None:
+                unseen_metrics['test_unseen/lp_struct_score_mean'] = lp_struct_mean_unseen
+            if lp_struct_std_unseen is not None:
+                unseen_metrics['test_unseen/lp_struct_score_std'] = lp_struct_std_unseen
+            if lp_feat_mean_unseen is not None:
+                unseen_metrics['test_unseen/lp_feat_score_mean'] = lp_feat_mean_unseen
+            if lp_feat_std_unseen is not None:
+                unseen_metrics['test_unseen/lp_feat_score_std'] = lp_feat_std_unseen
+            if lp_std_ratio_unseen is not None:
+                unseen_metrics['test_unseen/lp_struct_feat_std_ratio'] = lp_std_ratio_unseen
+            if lp_mean_ratio_unseen is not None:
+                unseen_metrics['test_unseen/lp_struct_feat_absmean_ratio'] = lp_mean_ratio_unseen
             
             # Add individual dataset metrics to wandb
             for i, (dataset_name, metric) in enumerate(zip(nc_test_datasets, nc_individual)):
@@ -3563,6 +3751,94 @@ def run_joint_training(args, device='cuda:0'):
                 'valid_seen/combined_score': combined_valid_seen,
                 'lr': optimizer.param_groups[0]['lr']
             }
+
+            lp_gate_train = train_results.get('lp_gate_mean_train', None)
+            if lp_gate_train is not None:
+                wandb_log['train/lp_mplp_gate_mean'] = lp_gate_train
+            lp_gate_calib_train = train_results.get('lp_gate_calib_ms_train', None)
+            if lp_gate_calib_train is not None:
+                wandb_log['train/lp_mplp_gate_calib_ms'] = lp_gate_calib_train
+            lp_struct_loss_train = train_results.get('lp_struct_only_loss_train', None)
+            if lp_struct_loss_train is not None:
+                wandb_log['train/lp_struct_only_loss'] = lp_struct_loss_train
+
+            lp_struct_mean_train = train_results.get('lp_struct_score_mean_train', None)
+            lp_struct_std_train = train_results.get('lp_struct_score_std_train', None)
+            lp_feat_mean_train = train_results.get('lp_feat_score_mean_train', None)
+            lp_feat_std_train = train_results.get('lp_feat_score_std_train', None)
+            lp_logit_mean_train = train_results.get('lp_logit_mean_train', None)
+            lp_logit_std_train = train_results.get('lp_logit_std_train', None)
+            if lp_struct_mean_train is not None:
+                wandb_log['train/lp_struct_score_mean'] = lp_struct_mean_train
+            if lp_struct_std_train is not None:
+                wandb_log['train/lp_struct_score_std'] = lp_struct_std_train
+            if lp_feat_mean_train is not None:
+                wandb_log['train/lp_feat_score_mean'] = lp_feat_mean_train
+            if lp_feat_std_train is not None:
+                wandb_log['train/lp_feat_score_std'] = lp_feat_std_train
+            if lp_logit_mean_train is not None:
+                wandb_log['train/lp_logit_mean'] = lp_logit_mean_train
+            if lp_logit_std_train is not None:
+                wandb_log['train/lp_logit_std'] = lp_logit_std_train
+            if lp_struct_std_train is not None and lp_feat_std_train is not None:
+                wandb_log['train/lp_struct_feat_std_ratio'] = lp_struct_std_train / (lp_feat_std_train + 1e-8)
+            if lp_struct_mean_train is not None and lp_feat_mean_train is not None:
+                wandb_log['train/lp_struct_feat_absmean_ratio'] = abs(lp_struct_mean_train) / (abs(lp_feat_mean_train) + 1e-8)
+
+            lp_gate_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_mean', None)
+            if lp_gate_valid is not None:
+                wandb_log['valid_seen/lp_mplp_gate_mean'] = lp_gate_valid
+            lp_gate_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_mean_by_dataset', None)
+            if isinstance(lp_gate_valid_by_dataset, dict):
+                for ds_name, gate_val in lp_gate_valid_by_dataset.items():
+                    if gate_val is not None:
+                        wandb_log[f'valid_seen/lp_mplp_gate_mean/{ds_name}'] = gate_val
+            lp_struct_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_only_metric_by_dataset', None)
+            if isinstance(lp_struct_valid_by_dataset, dict):
+                for ds_name, struct_val in lp_struct_valid_by_dataset.items():
+                    if struct_val is not None:
+                        wandb_log[f'valid_seen/lp_struct_only_metric/{ds_name}'] = struct_val
+            lp_feat_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_only_metric_by_dataset', None)
+            if isinstance(lp_feat_valid_by_dataset, dict):
+                for ds_name, feat_val in lp_feat_valid_by_dataset.items():
+                    if feat_val is not None:
+                        wandb_log[f'valid_seen/lp_feat_only_metric/{ds_name}'] = feat_val
+            lp_gate_calib_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_calib_ms', None)
+            if lp_gate_calib_valid is not None:
+                wandb_log['valid_seen/lp_mplp_gate_calib_ms'] = lp_gate_calib_valid
+            lp_feat_only_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_only_metric', None)
+            if lp_feat_only_valid is not None:
+                wandb_log['valid_seen/lp_feat_only_metric'] = lp_feat_only_valid
+            lp_gate_ratio_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_struct_abs_ratio', None)
+            if lp_gate_ratio_valid is not None:
+                wandb_log['valid_seen/lp_gate_struct_abs_ratio'] = lp_gate_ratio_valid
+            lp_feat_abs_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_abs_mean', None)
+            if lp_feat_abs_valid is not None:
+                wandb_log['valid_seen/lp_feat_abs_mean'] = lp_feat_abs_valid
+            lp_gate_abs_struct_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_abs_struct_mean', None)
+            if lp_gate_abs_struct_valid is not None:
+                wandb_log['valid_seen/lp_gate_abs_struct_mean'] = lp_gate_abs_struct_valid
+            lp_struct_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_only_metric', None)
+            if lp_struct_valid is not None:
+                wandb_log['valid_seen/lp_struct_only_metric'] = lp_struct_valid
+            lp_struct_mean_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_score_mean', None)
+            lp_struct_std_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_score_std', None)
+            lp_feat_mean_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_score_mean', None)
+            lp_feat_std_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_score_std', None)
+            lp_std_ratio_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_feat_std_ratio', None)
+            lp_mean_ratio_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_feat_absmean_ratio', None)
+            if lp_struct_mean_valid is not None:
+                wandb_log['valid_seen/lp_struct_score_mean'] = lp_struct_mean_valid
+            if lp_struct_std_valid is not None:
+                wandb_log['valid_seen/lp_struct_score_std'] = lp_struct_std_valid
+            if lp_feat_mean_valid is not None:
+                wandb_log['valid_seen/lp_feat_score_mean'] = lp_feat_mean_valid
+            if lp_feat_std_valid is not None:
+                wandb_log['valid_seen/lp_feat_score_std'] = lp_feat_std_valid
+            if lp_std_ratio_valid is not None:
+                wandb_log['valid_seen/lp_struct_feat_std_ratio'] = lp_std_ratio_valid
+            if lp_mean_ratio_valid is not None:
+                wandb_log['valid_seen/lp_struct_feat_absmean_ratio'] = lp_mean_ratio_valid
 
             if gc_train_seen is not None:
                 if isinstance(gc_train_seen, dict):

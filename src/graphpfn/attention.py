@@ -16,6 +16,8 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from .config import GraphPFNConfig
 
+TRACE_ATTN = False
+
 
 class MultiHeadAttention(nn.Module):
     """Multi-head attention with optional KV caching.
@@ -138,8 +140,9 @@ class MultiHeadAttention(nn.Module):
         # Compute Q, K, V
         # Q: [B, L_q, d_model] @ [nhead, d_model, d_k] -> [B, L_q, nhead, d_k]
         q = torch.einsum('bld,hdk->blhk', x, self.w_q)
-        print(f"[ATTN TRACE] Step 1 - Input x: norm={x.norm().item():.2f}")
-        print(f"[ATTN TRACE] Step 2 - After Q projection: norm={q.norm().item():.2f}")
+        if TRACE_ATTN:
+            print(f"[ATTN TRACE] Step 1 - Input x: norm={x.norm().item():.2f}")
+            print(f"[ATTN TRACE] Step 2 - After Q projection: norm={q.norm().item():.2f}")
 
         if use_cached_kv and self.has_cached_kv:
             # Use cached K, V
@@ -149,8 +152,9 @@ class MultiHeadAttention(nn.Module):
             # Compute K, V
             k = torch.einsum('bld,hdk->blhk', x_kv, self.w_k)  # [B, L_kv, nhead, d_k]
             v = torch.einsum('bld,hdv->blhv', x_kv, self.w_v)  # [B, L_kv, nhead, d_v]
-            print(f"[ATTN TRACE] Step 3 - After K projection: norm={k.norm().item():.2f}")
-            print(f"[ATTN TRACE] Step 4 - After V projection: norm={v.norm().item():.2f}")
+            if TRACE_ATTN:
+                print(f"[ATTN TRACE] Step 3 - After K projection: norm={k.norm().item():.2f}")
+                print(f"[ATTN TRACE] Step 4 - After V projection: norm={v.norm().item():.2f}")
 
             if cache_kv:
                 # Cache K, V
@@ -169,7 +173,8 @@ class MultiHeadAttention(nn.Module):
                 q, k, v,
                 dropout_p=self.dropout_p if self.training else 0.0,
             )  # [B, nhead, L_q, d_v]
-            print(f"[ATTN TRACE] Step 5 - After attention: norm={attn_output.norm().item():.2f}")
+            if TRACE_ATTN:
+                print(f"[ATTN TRACE] Step 5 - After attention: norm={attn_output.norm().item():.2f}")
         else:
             # Manual implementation
             scale = 1.0 / math.sqrt(self.d_k)
@@ -178,14 +183,16 @@ class MultiHeadAttention(nn.Module):
             if self.training and self.dropout_p > 0:
                 attn_weights = F.dropout(attn_weights, p=self.dropout_p)
             attn_output = torch.einsum('bhqk,bhkv->bhqv', attn_weights, v)  # [B, nhead, L_q, d_v]
-            print(f"[ATTN TRACE] Step 5 - After attention: norm={attn_output.norm().item():.2f}")
+            if TRACE_ATTN:
+                print(f"[ATTN TRACE] Step 5 - After attention: norm={attn_output.norm().item():.2f}")
 
         # Transpose back: [B, nhead, L_q, d_v] -> [B, L_q, nhead, d_v]
         attn_output = attn_output.transpose(1, 2)
 
         # Output projection: [B, L_q, nhead, d_v] @ [nhead, d_v, d_model] -> [B, L_q, d_model]
         output = torch.einsum('blhv,hvo->blo', attn_output, self.w_out)
-        print(f"[ATTN TRACE] Step 6 - After output projection: norm={output.norm().item():.2f}")
+        if TRACE_ATTN:
+            print(f"[ATTN TRACE] Step 6 - After output projection: norm={output.norm().item():.2f}")
 
         # Reshape back to original shape
         output = output.reshape(input_shape)

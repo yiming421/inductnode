@@ -14,6 +14,8 @@ import torch
 from torch import nn
 
 from .attention import MultiHeadAttention
+
+TRACE_PRENORM = False
 from .mlp import MLP
 
 if TYPE_CHECKING:
@@ -235,7 +237,7 @@ class PerFeatureEncoderLayer(nn.Module):
         # Pre-norm: LayerNorm -> Sublayer -> Add residual
         for idx, (sublayer, layer_norm) in enumerate(zip(sublayers, self.layer_norms)):
             normalized = layer_norm(state)
-            if idx == 0:  # Only print for first sublayer to avoid spam
+            if TRACE_PRENORM and idx == 0:  # Only print for first sublayer to avoid spam
                 print(f"[PRE-NORM] Before LayerNorm: norm={state.norm().item():.2f}, After LayerNorm: norm={normalized.norm().item():.2f}")
             sublayer_output = sublayer(normalized)
             state = state + sublayer_output  # Add residual

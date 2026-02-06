@@ -1,4 +1,5 @@
 import torch
+import math
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -242,6 +243,21 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         
         total_loss = 0
         batch_count = 0
+        gate_sum = 0.0
+        gate_count = 0
+        calib_sum = 0.0
+        calib_count = 0
+        struct_sum = 0.0
+        struct_sumsq = 0.0
+        struct_count = 0
+        feat_sum = 0.0
+        feat_sumsq = 0.0
+        feat_count = 0
+        logit_sum = 0.0
+        logit_sumsq = 0.0
+        logit_count = 0
+        struct_loss_sum = 0.0
+        struct_loss_count = 0
         
         for batch_indices in dataloader:
             # Batch-level context refresh for this LP dataset
@@ -332,8 +348,18 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                         "link_prediction",
                         adj_t=adj_for_gnn,
                         lp_edges=batch_edges.t(),
-                        node_emb=node_embeddings
+                        node_emb=node_embeddings,
+                        lp_context_edges=context_edge_pairs.t()
                     )
+                    if getattr(predictor, 'lp_head', None) is not None:
+                        gate_val = getattr(predictor.lp_head, 'last_gate_mean', None)
+                        if gate_val is not None:
+                            gate_sum += float(gate_val.item())
+                            gate_count += 1
+                        calib_val = getattr(predictor.lp_head, 'last_gate_calib_ms', None)
+                        if calib_val is not None:
+                            calib_sum += float(calib_val)
+                            calib_count += 1
                 elif head_type == 'ncn':
                     scores, link_prototypes = predictor(
                         data_for_gnn,
@@ -373,9 +399,34 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     mask_scores = scores[mask_for_loss]
                     if mask_scores.dim() > 1:
                         mask_scores = mask_scores.squeeze(-1)
+                    if mask_scores.numel() > 0:
+                        logit_sum += mask_scores.sum().item()
+                        logit_sumsq += (mask_scores ** 2).sum().item()
+                        logit_count += mask_scores.numel()
                     nll_loss = F.binary_cross_entropy_with_logits(
                         mask_scores, batch_labels[mask_for_loss].float()
                     )
+                    # Optional struct-only debug loss (no backprop)
+                    if head_type == 'mplp' and getattr(predictor, 'lp_head', None) is not None:
+                        struct_scores = getattr(predictor.lp_head, 'last_struct_score', None)
+                        if struct_scores is not None:
+                            struct_scores = struct_scores.to(mask_scores.device)
+                            struct_scores = struct_scores[mask_for_loss]
+                            struct_sum += struct_scores.sum().item()
+                            struct_sumsq += (struct_scores ** 2).sum().item()
+                            struct_count += struct_scores.numel()
+                            struct_loss = F.binary_cross_entropy_with_logits(
+                                struct_scores, batch_labels[mask_for_loss].float()
+                            )
+                            struct_loss_sum += float(struct_loss.item())
+                            struct_loss_count += 1
+                        feat_scores = getattr(predictor.lp_head, 'last_feat_score', None)
+                        if feat_scores is not None:
+                            feat_scores = feat_scores.to(mask_scores.device)
+                            feat_scores = feat_scores[mask_for_loss]
+                            feat_sum += feat_scores.sum().item()
+                            feat_sumsq += (feat_scores ** 2).sum().item()
+                            feat_count += feat_scores.numel()
                 else:
                     # Fallback to original two-class loss when head is disabled
                     nll_loss = F.cross_entropy(scores[mask_for_loss], batch_labels[mask_for_loss].long())
@@ -428,6 +479,44 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         if rank == 0:
             loss_str = f"{total_loss:.4f}" if optimizer is not None else "tensor"
             print(f"Rank {rank}: Epoch {epoch} training complete. Total loss: {loss_str}, Batch count: {batch_count}")
+
+        if getattr(predictor, 'lp_head', None) is not None:
+            if gate_count > 0:
+                predictor.lp_head.last_gate_mean_train = gate_sum / gate_count
+            else:
+                predictor.lp_head.last_gate_mean_train = None
+            if calib_count > 0:
+                predictor.lp_head.last_gate_calib_ms_train = calib_sum / calib_count
+            else:
+                predictor.lp_head.last_gate_calib_ms_train = None
+            if struct_loss_count > 0:
+                predictor.lp_head.last_struct_loss_train = struct_loss_sum / struct_loss_count
+            else:
+                predictor.lp_head.last_struct_loss_train = None
+            if struct_count > 0:
+                mean = struct_sum / struct_count
+                var = max(struct_sumsq / struct_count - mean * mean, 0.0)
+                predictor.lp_head.last_struct_score_mean_train = mean
+                predictor.lp_head.last_struct_score_std_train = math.sqrt(var)
+            else:
+                predictor.lp_head.last_struct_score_mean_train = None
+                predictor.lp_head.last_struct_score_std_train = None
+            if feat_count > 0:
+                mean = feat_sum / feat_count
+                var = max(feat_sumsq / feat_count - mean * mean, 0.0)
+                predictor.lp_head.last_feat_score_mean_train = mean
+                predictor.lp_head.last_feat_score_std_train = math.sqrt(var)
+            else:
+                predictor.lp_head.last_feat_score_mean_train = None
+                predictor.lp_head.last_feat_score_std_train = None
+            if logit_count > 0:
+                mean = logit_sum / logit_count
+                var = max(logit_sumsq / logit_count - mean * mean, 0.0)
+                predictor.lp_head.last_logit_mean_train = mean
+                predictor.lp_head.last_logit_std_train = math.sqrt(var)
+            else:
+                predictor.lp_head.last_logit_mean_train = None
+                predictor.lp_head.last_logit_std_train = None
         
         # Final synchronization to ensure all processes complete training
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -624,124 +713,217 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                 print("Warning: Insufficient positive or negative edges for evaluation")
             return {f'hits@{k}': 0.0 for k in k_values}
 
-        # Compute predictions for positive edges
-        pos_scores = []
-        pos_dataloader = DataLoader(range(pos_edges.size(0)), batch_size, shuffle=False)
-        for batch_idx in pos_dataloader:
-            batch_edges = pos_edges[batch_idx]
-            
-            src_embeds = node_embeddings[batch_edges[:, 0]]
-            dst_embeds = node_embeddings[batch_edges[:, 1]]
-            target_edge_embeds = src_embeds * dst_embeds
-            cn_target = None
-            if use_lp_cn:
-                cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
-            
-            # Use the unified predictor for link prediction
-            if head_type == 'mplp':
-                pred_output = predictor(
-                    data,
-                    context_edge_embeds,
-                    target_edge_embeds,
-                    context_labels.long(),
-                    link_prototypes,
-                    "link_prediction",
-                    adj_t=adj_for_lp,
-                    lp_edges=batch_edges.t(),
-                    node_emb=node_embeddings
-                )
-            elif head_type == 'ncn':
-                pred_output = predictor(
-                    data,
-                    context_edge_embeds,
-                    target_edge_embeds,
-                    context_labels.long(),
-                    link_prototypes,
-                    "link_prediction",
-                    adj_t=adj_for_lp,
-                    lp_edges=batch_edges.t(),
-                    node_emb=node_embeddings
-                )
-            else:
-                pred_output = predictor(
-                    data,
-                    context_edge_embeds,
-                    target_edge_embeds,
-                    context_labels.long(),
-                    link_prototypes,
-                    "link_prediction",
-                    lp_cn_context=cn_context,
-                    lp_cn_target=cn_target
-                )
-            if len(pred_output) == 3:  # MoE case with auxiliary loss
-                batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
-            else:  # Standard case
-                batch_scores, _ = pred_output
-            if batch_scores.dim() > 1:
-                batch_scores = batch_scores[:, 1]
-            pos_scores.append(batch_scores.squeeze(-1).cpu())
-        
-        pos_scores = torch.cat(pos_scores, dim=0)
-        
-        # Compute predictions for negative edges
-        neg_scores = []
-        neg_dataloader = DataLoader(range(neg_edges_to_use.size(0)), batch_size, shuffle=False)
-        for batch_idx in neg_dataloader:
-            batch_edges = neg_edges_to_use[batch_idx]
-            
-            src_embeds = node_embeddings[batch_edges[:, 0]]
-            dst_embeds = node_embeddings[batch_edges[:, 1]]
-            target_edge_embeds = src_embeds * dst_embeds
-            cn_target = None
-            if use_lp_cn:
-                cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
-            
-            # Use the unified predictor for link prediction
-            if head_type == 'mplp':
-                pred_output = predictor(
-                    data,
-                    context_edge_embeds,
-                    target_edge_embeds,
-                    context_labels.long(),
-                    link_prototypes,
-                    "link_prediction",
-                    adj_t=adj_for_lp,
-                    lp_edges=batch_edges.t(),
-                    node_emb=node_embeddings
-                )
-            elif head_type == 'ncn':
-                pred_output = predictor(
-                    data,
-                    context_edge_embeds,
-                    target_edge_embeds,
-                    context_labels.long(),
-                    link_prototypes,
-                    "link_prediction",
-                    adj_t=adj_for_lp,
-                    lp_edges=batch_edges.t(),
-                    node_emb=node_embeddings
-                )
-            else:
-                pred_output = predictor(
-                    data,
-                    context_edge_embeds,
-                    target_edge_embeds,
-                    context_labels.long(),
-                    link_prototypes,
-                    "link_prediction",
-                    lp_cn_context=cn_context,
-                    lp_cn_target=cn_target
-                )
-            if len(pred_output) == 3:  # MoE case with auxiliary loss
-                batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
-            else:  # Standard case
-                batch_scores, _ = pred_output
-            if batch_scores.dim() > 1:
-                batch_scores = batch_scores[:, 1]
-            neg_scores.append(batch_scores.squeeze(-1).cpu())
-        
-        neg_scores = torch.cat(neg_scores, dim=0)
-        
+        gate_sum = 0.0
+        gate_count = 0
+        calib_sum = 0.0
+        calib_count = 0
+        gate_values = []
+        struct_pos_scores = []
+        struct_neg_scores = []
+        feat_pos_scores = []
+        feat_neg_scores = []
+        struct_sum = 0.0
+        struct_sumsq = 0.0
+        struct_count = 0
+        feat_sum = 0.0
+        feat_sumsq = 0.0
+        feat_count = 0
+        gate_struct_abs_sum = 0.0
+        gate_struct_abs_count = 0
+        feat_abs_sum = 0.0
+        feat_abs_count = 0
+        try:
+            # Compute predictions for positive edges
+            pos_scores = []
+            pos_dataloader = DataLoader(range(pos_edges.size(0)), batch_size, shuffle=False)
+            for batch_idx in pos_dataloader:
+                batch_edges = pos_edges[batch_idx]
+
+                src_embeds = node_embeddings[batch_edges[:, 0]]
+                dst_embeds = node_embeddings[batch_edges[:, 1]]
+                target_edge_embeds = src_embeds * dst_embeds
+                cn_target = None
+                if use_lp_cn:
+                    cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
+
+                # Use the unified predictor for link prediction
+                if head_type == 'mplp':
+                    pred_output = predictor(
+                        data,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        adj_t=adj_for_lp,
+                        lp_edges=batch_edges.t(),
+                        node_emb=node_embeddings,
+                        lp_context_edges=context_edge_pairs.t()
+                    )
+                    if getattr(predictor, 'lp_head', None) is not None:
+                        gate_val = getattr(predictor.lp_head, 'last_gate_mean', None)
+                        gate_weight = getattr(predictor.lp_head, 'last_gate_value', None)
+                        if gate_val is not None:
+                            gate_sum += float(gate_val.item())
+                            gate_count += 1
+                            gate_values.append(float(gate_val.item()))
+                        calib_val = getattr(predictor.lp_head, 'last_gate_calib_ms', None)
+                        if calib_val is not None:
+                            calib_sum += float(calib_val)
+                            calib_count += 1
+                        struct_scores = getattr(predictor.lp_head, 'last_struct_score', None)
+                        feat_scores = getattr(predictor.lp_head, 'last_feat_score', None)
+                        if (struct_scores is None or feat_scores is None) and getattr(predictor.lp_head, 'struct_score', None) is not None:
+                            struct_scores, feat_scores = predictor.lp_head.score_components(
+                                target_edge_embeds, adj_for_lp, batch_edges.t(), node_emb=node_embeddings
+                            )
+                        if struct_scores is not None:
+                            struct_pos_scores.append(struct_scores.detach().cpu())
+                            struct_sum += struct_scores.sum().item()
+                            struct_sumsq += (struct_scores ** 2).sum().item()
+                            struct_count += struct_scores.numel()
+                        if feat_scores is not None:
+                            feat_sum += feat_scores.sum().item()
+                            feat_sumsq += (feat_scores ** 2).sum().item()
+                            feat_count += feat_scores.numel()
+                            feat_pos_scores.append(feat_scores.detach().cpu())
+                            feat_abs_sum += feat_scores.abs().sum().item()
+                            feat_abs_count += feat_scores.numel()
+                        if gate_weight is None:
+                            gate_weight = gate_val
+                        if gate_weight is not None and struct_scores is not None:
+                            gate_struct_abs_sum += (struct_scores.abs() * gate_weight.abs()).sum().item()
+                            gate_struct_abs_count += struct_scores.numel()
+                elif head_type == 'ncn':
+                    pred_output = predictor(
+                        data,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        adj_t=adj_for_lp,
+                        lp_edges=batch_edges.t(),
+                        node_emb=node_embeddings,
+                        lp_context_edges=context_edge_pairs.t()
+                    )
+                else:
+                    pred_output = predictor(
+                        data,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        lp_cn_context=cn_context,
+                        lp_cn_target=cn_target
+                    )
+                if len(pred_output) == 3:  # MoE case with auxiliary loss
+                    batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
+                else:  # Standard case
+                    batch_scores, _ = pred_output
+                if batch_scores.dim() > 1:
+                    batch_scores = batch_scores[:, 1]
+                pos_scores.append(batch_scores.squeeze(-1).cpu())
+
+            pos_scores = torch.cat(pos_scores, dim=0)
+
+            # Compute predictions for negative edges
+            neg_scores = []
+            neg_dataloader = DataLoader(range(neg_edges_to_use.size(0)), batch_size, shuffle=False)
+            for batch_idx in neg_dataloader:
+                batch_edges = neg_edges_to_use[batch_idx]
+
+                src_embeds = node_embeddings[batch_edges[:, 0]]
+                dst_embeds = node_embeddings[batch_edges[:, 1]]
+                target_edge_embeds = src_embeds * dst_embeds
+                cn_target = None
+                if use_lp_cn:
+                    cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
+
+                # Use the unified predictor for link prediction
+                if head_type == 'mplp':
+                    pred_output = predictor(
+                        data,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        adj_t=adj_for_lp,
+                        lp_edges=batch_edges.t(),
+                        node_emb=node_embeddings,
+                        lp_context_edges=context_edge_pairs.t()
+                    )
+                    if getattr(predictor, 'lp_head', None) is not None:
+                        gate_val = getattr(predictor.lp_head, 'last_gate_mean', None)
+                        gate_weight = getattr(predictor.lp_head, 'last_gate_value', None)
+                        if gate_val is not None:
+                            gate_sum += float(gate_val.item())
+                            gate_count += 1
+                            gate_values.append(float(gate_val.item()))
+                        calib_val = getattr(predictor.lp_head, 'last_gate_calib_ms', None)
+                        if calib_val is not None:
+                            calib_sum += float(calib_val)
+                            calib_count += 1
+                        struct_scores = getattr(predictor.lp_head, 'last_struct_score', None)
+                        feat_scores = getattr(predictor.lp_head, 'last_feat_score', None)
+                        if (struct_scores is None or feat_scores is None) and getattr(predictor.lp_head, 'struct_score', None) is not None:
+                            struct_scores, feat_scores = predictor.lp_head.score_components(
+                                target_edge_embeds, adj_for_lp, batch_edges.t(), node_emb=node_embeddings
+                            )
+                        if struct_scores is not None:
+                            struct_neg_scores.append(struct_scores.detach().cpu())
+                            struct_sum += struct_scores.sum().item()
+                            struct_sumsq += (struct_scores ** 2).sum().item()
+                            struct_count += struct_scores.numel()
+                        if feat_scores is not None:
+                            feat_sum += feat_scores.sum().item()
+                            feat_sumsq += (feat_scores ** 2).sum().item()
+                            feat_count += feat_scores.numel()
+                            feat_neg_scores.append(feat_scores.detach().cpu())
+                            feat_abs_sum += feat_scores.abs().sum().item()
+                            feat_abs_count += feat_scores.numel()
+                        if gate_weight is None:
+                            gate_weight = gate_val
+                        if gate_weight is not None and struct_scores is not None:
+                            gate_struct_abs_sum += (struct_scores.abs() * gate_weight.abs()).sum().item()
+                            gate_struct_abs_count += struct_scores.numel()
+                elif head_type == 'ncn':
+                    pred_output = predictor(
+                        data,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        adj_t=adj_for_lp,
+                        lp_edges=batch_edges.t(),
+                        node_emb=node_embeddings
+                    )
+                else:
+                    pred_output = predictor(
+                        data,
+                        context_edge_embeds,
+                        target_edge_embeds,
+                        context_labels.long(),
+                        link_prototypes,
+                        "link_prediction",
+                        lp_cn_context=cn_context,
+                        lp_cn_target=cn_target
+                    )
+                if len(pred_output) == 3:  # MoE case with auxiliary loss
+                    batch_scores, _, _ = pred_output  # Discard auxiliary loss during evaluation
+                else:  # Standard case
+                    batch_scores, _ = pred_output
+                if batch_scores.dim() > 1:
+                    batch_scores = batch_scores[:, 1]
+                neg_scores.append(batch_scores.squeeze(-1).cpu())
+
+            neg_scores = torch.cat(neg_scores, dim=0)
+        finally:
+            pass
+
         # Compute Hits@K using OGB evaluator
         dataset_name = getattr(data, 'name', 'unknown')
         # Use user-specified metric or dataset default
@@ -756,6 +938,66 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                 evaluator = Evaluator(name='ogbl-collab')
             else:
                 evaluator = Evaluator(name='ogbl-ppa')  # Use as default
+
+        def _has_scores(scores):
+            if isinstance(scores, torch.Tensor):
+                return scores.numel() > 0
+            return len(scores) > 0
+
+        struct_results = {}
+        if _has_scores(struct_pos_scores) and _has_scores(struct_neg_scores):
+            if not isinstance(struct_pos_scores, torch.Tensor):
+                struct_pos_scores = torch.cat(struct_pos_scores, dim=0)
+            if not isinstance(struct_neg_scores, torch.Tensor):
+                struct_neg_scores = torch.cat(struct_neg_scores, dim=0)
+            for k in k_values:
+                evaluator.K = k
+                hits_k = evaluator.eval({
+                    'y_pred_pos': struct_pos_scores.cpu(),
+                    'y_pred_neg': struct_neg_scores.cpu(),
+                })[f'hits@{k}']
+                struct_results[f'hits@{k}'] = hits_k
+            try:
+                from sklearn.metrics import roc_auc_score, accuracy_score
+                pos_labels = torch.ones(struct_pos_scores.size(0))
+                neg_labels = torch.zeros(struct_neg_scores.size(0))
+                all_labels = torch.cat([pos_labels, neg_labels]).cpu().numpy()
+                all_scores = torch.cat([struct_pos_scores, struct_neg_scores])
+                all_probs = torch.sigmoid(all_scores).cpu().numpy()
+                struct_results['auc'] = roc_auc_score(all_labels, all_probs)
+                struct_results['acc'] = accuracy_score(all_labels, (all_probs > 0.5).astype(int))
+            except Exception:
+                pass
+
+            if dataset_name == 'ogbl-citation2':
+                struct_results['mrr'] = compute_mrr_citation2(struct_pos_scores, struct_neg_scores)
+
+        feat_results = {}
+        if _has_scores(feat_pos_scores) and _has_scores(feat_neg_scores):
+            if not isinstance(feat_pos_scores, torch.Tensor):
+                feat_pos_scores = torch.cat(feat_pos_scores, dim=0)
+            if not isinstance(feat_neg_scores, torch.Tensor):
+                feat_neg_scores = torch.cat(feat_neg_scores, dim=0)
+            for k in k_values:
+                evaluator.K = k
+                hits_k = evaluator.eval({
+                    'y_pred_pos': feat_pos_scores.cpu(),
+                    'y_pred_neg': feat_neg_scores.cpu(),
+                })[f'hits@{k}']
+                feat_results[f'hits@{k}'] = hits_k
+            try:
+                from sklearn.metrics import roc_auc_score, accuracy_score
+                pos_labels = torch.ones(feat_pos_scores.size(0))
+                neg_labels = torch.zeros(feat_neg_scores.size(0))
+                all_labels = torch.cat([pos_labels, neg_labels]).cpu().numpy()
+                all_scores = torch.cat([feat_pos_scores, feat_neg_scores])
+                all_probs = torch.sigmoid(all_scores).cpu().numpy()
+                feat_results['auc'] = roc_auc_score(all_labels, all_probs)
+                feat_results['acc'] = accuracy_score(all_labels, (all_probs > 0.5).astype(int))
+            except Exception:
+                pass
+            if dataset_name == 'ogbl-citation2':
+                feat_results['mrr'] = compute_mrr_citation2(feat_pos_scores, feat_neg_scores)
         
         results = {}
         for k in k_values:
@@ -830,7 +1072,94 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                 results['default_metric_name'] = 'unavailable'
                 if rank == 0:
                     print(f"Warning: No suitable metric available, setting to 0.0")
-        
+
+        if struct_results:
+            struct_metric_name = None
+            if evaluation_metric in struct_results:
+                struct_metric_name = evaluation_metric
+            elif default_metric in struct_results:
+                struct_metric_name = default_metric
+            elif 'hits@100' in struct_results:
+                struct_metric_name = 'hits@100'
+            if struct_metric_name is not None:
+                results['mplp_struct_only_metric'] = struct_results[struct_metric_name]
+                results['mplp_struct_only_metric_name'] = struct_metric_name
+            for k in k_values:
+                key = f'hits@{k}'
+                if key in struct_results:
+                    results[f'mplp_struct_only_{key}'] = struct_results[key]
+        else:
+            results['mplp_struct_only_metric'] = None
+            results['mplp_struct_only_metric_name'] = None
+
+        if feat_results:
+            feat_metric_name = None
+            if evaluation_metric in feat_results:
+                feat_metric_name = evaluation_metric
+            elif default_metric in feat_results:
+                feat_metric_name = default_metric
+            elif 'hits@100' in feat_results:
+                feat_metric_name = 'hits@100'
+            if feat_metric_name is not None:
+                results['mplp_feat_only_metric'] = feat_results[feat_metric_name]
+                results['mplp_feat_only_metric_name'] = feat_metric_name
+            for k in k_values:
+                key = f'hits@{k}'
+                if key in feat_results:
+                    results[f'mplp_feat_only_{key}'] = feat_results[key]
+        else:
+            results['mplp_feat_only_metric'] = None
+            results['mplp_feat_only_metric_name'] = None
+
+        if struct_count > 0:
+            mean = struct_sum / struct_count
+            var = max(struct_sumsq / struct_count - mean * mean, 0.0)
+            results['mplp_struct_score_mean'] = mean
+            results['mplp_struct_score_std'] = math.sqrt(var)
+        else:
+            results['mplp_struct_score_mean'] = None
+            results['mplp_struct_score_std'] = None
+
+        if feat_count > 0:
+            mean = feat_sum / feat_count
+            var = max(feat_sumsq / feat_count - mean * mean, 0.0)
+            results['mplp_feat_score_mean'] = mean
+            results['mplp_feat_score_std'] = math.sqrt(var)
+        else:
+            results['mplp_feat_score_mean'] = None
+            results['mplp_feat_score_std'] = None
+
+        if results.get('mplp_struct_score_std') is not None and results.get('mplp_feat_score_std') is not None:
+            results['mplp_struct_feat_std_ratio'] = results['mplp_struct_score_std'] / (results['mplp_feat_score_std'] + 1e-8)
+        else:
+            results['mplp_struct_feat_std_ratio'] = None
+
+        if results.get('mplp_struct_score_mean') is not None and results.get('mplp_feat_score_mean') is not None:
+            results['mplp_struct_feat_absmean_ratio'] = abs(results['mplp_struct_score_mean']) / (abs(results['mplp_feat_score_mean']) + 1e-8)
+        else:
+            results['mplp_struct_feat_absmean_ratio'] = None
+
+        if gate_count > 0:
+            results['mplp_gate_mean'] = gate_sum / gate_count
+        else:
+            results['mplp_gate_mean'] = None
+        if calib_count > 0:
+            results['mplp_gate_calib_ms'] = calib_sum / calib_count
+        else:
+            results['mplp_gate_calib_ms'] = None
+        if gate_struct_abs_count > 0:
+            results['mplp_gate_abs_struct_mean'] = gate_struct_abs_sum / gate_struct_abs_count
+        else:
+            results['mplp_gate_abs_struct_mean'] = None
+        if feat_abs_count > 0:
+            results['mplp_feat_abs_mean'] = feat_abs_sum / feat_abs_count
+        else:
+            results['mplp_feat_abs_mean'] = None
+        if results.get('mplp_gate_abs_struct_mean') is not None and results.get('mplp_feat_abs_mean') is not None:
+            results['mplp_gate_struct_abs_ratio'] = results['mplp_gate_abs_struct_mean'] / (results['mplp_feat_abs_mean'] + 1e-8)
+        else:
+            results['mplp_gate_struct_abs_ratio'] = None
+
         # Move persistent tensors back to CPU to free GPU memory
         test_edges['edge_pairs'] = test_edges['edge_pairs'].cpu()
         test_edges['labels'] = test_edges['labels'].cpu()
@@ -846,4 +1175,4 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             print(f"Error during evaluation: {e}")
             import traceback
             print(f"Full traceback: {traceback.format_exc()}")
-        return {f'hits@{k}': 0.0 for k in k_values}
+        raise

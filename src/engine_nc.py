@@ -177,6 +177,33 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
     max_grad_norm = 0.0
     grad_norm_count = 0
 
+    use_augmentation = args is not None and getattr(args, 'use_random_projection_augmentation', False)
+    augmentation_mode = getattr(args, 'augmentation_mode', 'preprocessing') if use_augmentation else None
+    use_per_step_augmentation = use_augmentation and augmentation_mode == 'per_step'
+    per_step_regen_interval = max(1, int(getattr(args, 'augmentation_regenerate_interval', 1))) if use_per_step_augmentation else 1
+
+    if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
+        pca_target_dim = args.projection_small_dim if args is not None else data.x.shape[1]
+    else:
+        pca_target_dim = args.hidden if args is not None else data.x.shape[1]
+
+    def _pca_or_pad(features, target_dim):
+        target_dim = int(target_dim)
+        q = min(target_dim, features.shape[0], features.shape[1])
+        if q > 0:
+            U, S, _ = torch.pca_lowrank(features, q=q)
+            projected = torch.mm(U, torch.diag(S))
+        else:
+            projected = features.new_zeros((features.shape[0], 0))
+
+        if projected.shape[1] < target_dim:
+            pad = torch.zeros(projected.shape[0], target_dim - projected.shape[1],
+                              device=projected.device, dtype=projected.dtype)
+            projected = torch.cat([projected, pad], dim=1)
+        elif projected.shape[1] > target_dim:
+            projected = projected[:, :target_dim]
+        return projected
+
     # Train-time TTA (full-batch only): precompute augmented feature views once per epoch
     use_train_tta = args is not None and getattr(args, 'use_train_time_augmentation', False)
     train_tta_num_augmentations = getattr(args, 'train_tta_num_augmentations', 1) if args is not None else 0
@@ -191,12 +218,6 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             use_train_tta = False
         else:
             from src.data_utils import apply_random_projection_augmentation
-
-            # Determine PCA target dimension based on args (same as test-time TTA)
-            if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
-                pca_target_dim = args.projection_small_dim
-            else:
-                pca_target_dim = args.hidden
 
             # Start from raw features if available (same as eval TTA)
             raw_features = data.x_original if hasattr(data, 'x_original') else data.x
@@ -224,22 +245,23 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                     rank=rank
                 )
 
-                # Apply PCA to target dimension (or pad if needed)
-                if data_aug.x.shape[1] >= pca_target_dim:
-                    U, S, V = torch.pca_lowrank(data_aug.x, q=pca_target_dim)
-                    data_aug.x_pca = torch.mm(U, torch.diag(S))
-                else:
-                    U, S, V = torch.pca_lowrank(data_aug.x, q=data_aug.x.shape[1])
-                    data_aug.x_pca = torch.mm(U, torch.diag(S))
-                    pad_size = pca_target_dim - data_aug.x_pca.shape[1]
-                    padding = torch.zeros(data_aug.x_pca.shape[0], pad_size, device=data_aug.x.device)
-                    data_aug.x_pca = torch.cat([data_aug.x_pca, padding], dim=1)
-
+                data_aug.x_pca = _pca_or_pad(data_aug.x, pca_target_dim)
                 tta_base_features_list.append(data_aug.x_pca)
 
             if rank == 0:
                 print(f"[Train-TTA] Enabled: {len(tta_base_features_list)} view(s) "
                       f"(include_original={train_tta_include_original}, num_aug={train_tta_num_augmentations})")
+
+    if use_per_step_augmentation and use_train_tta:
+        if rank == 0:
+            print("[Per-Step Augmentation] Disabling train-time TTA because augmentation_mode='per_step'.")
+        use_train_tta = False
+        tta_base_features_list = None
+
+    if use_per_step_augmentation and rank == 0 and epoch == 0:
+        print(f"[Per-Step Augmentation] Enabled: NC features are regenerated every {per_step_regen_interval} train step(s).")
+
+    cached_step_features = None
     for batch_idx, perm in enumerate(dataloader):
         # Batch-level context refresh for this dataset
         if args is not None:
@@ -250,6 +272,42 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         train_perm_idx = train_idx[perm]
         
         base_features = data.x
+        if use_per_step_augmentation and not use_train_tta:
+            if cached_step_features is None or (batch_idx % per_step_regen_interval == 0):
+                from src.data_utils import apply_random_projection_augmentation
+
+                data_for_aug = data.clone()
+                if hasattr(data, 'x_original'):
+                    data_for_aug.x = data.x_original.clone()
+                else:
+                    data_for_aug.x = data.x.clone()
+                    if rank == 0 and epoch == 0 and batch_idx == 0:
+                        print(f"[Per-Step Augmentation] WARNING: x_original missing for {getattr(data, 'name', 'unknown')}, using current data.x")
+
+                augmentation_activation = getattr(args, 'augmentation_activation', 'random')
+                activation_pool_to_use = None if augmentation_activation == 'random' else [augmentation_activation]
+                dataset_hash = hash(getattr(data, 'name', 'default')) % 1000
+                regen_step = batch_idx // per_step_regen_interval
+                seed = epoch * 100000 + regen_step * 1000 + dataset_hash
+
+                data_aug = apply_random_projection_augmentation(
+                    data_for_aug,
+                    hidden_dim_range=None,
+                    activation_pool=activation_pool_to_use,
+                    seed=seed,
+                    verbose=False,
+                    rank=rank,
+                    use_random_noise=getattr(args, 'augmentation_use_random_noise', False),
+                    max_depth=getattr(args, 'augmentation_max_depth', 1),
+                    dropout_rate=getattr(args, 'augmentation_dropout_rate', 0.0),
+                    use_feature_mixing=getattr(args, 'augmentation_use_feature_mixing', False),
+                    mix_ratio=getattr(args, 'augmentation_mix_ratio', 0.3),
+                    mix_alpha=getattr(args, 'augmentation_mix_alpha', 0.5),
+                )
+                cached_step_features = _pca_or_pad(data_aug.x, pca_target_dim)
+
+            base_features = cached_step_features
+
         context_y = data.y[data.context_sample]
         device = base_features.device
 

@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +19,42 @@ def get_activation_fn(activation_name):
         return F.silu
     else:
         raise ValueError(f"Unsupported activation function: {activation_name}")
+
+
+def _fit_mplp_calib_sgd(
+    ctx_feat,
+    ctx_struct,
+    labels,
+    w_min=0.1,
+    w_max=10.0,
+    reg=1e-3,
+    steps=5,
+    lr=0.1,
+):
+    """
+    Fit w_f, w_s, b on context edges with a tiny SGD loop.
+    """
+    x_feat = ctx_feat.view(-1)
+    x_struct = ctx_struct.view(-1)
+    y = labels.view(-1).float()
+    X = torch.stack([x_feat, x_struct], dim=1)  # [N, 2]
+
+    w = torch.zeros(2, device=X.device, dtype=X.dtype, requires_grad=True)
+    b = torch.zeros(1, device=X.device, dtype=X.dtype, requires_grad=True)
+    opt = torch.optim.SGD([w, b], lr=lr)
+    w_min = max(0.0, w_min)
+    for _ in range(steps):
+        opt.zero_grad()
+        logits = X @ w + b
+        loss = F.binary_cross_entropy_with_logits(logits.squeeze(-1), y)
+        loss = loss + reg * ((w - 1.0) ** 2).sum()
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            w.clamp_(w_min, w_max)
+            b.clamp_(-w_max, w_max)
+    return w.detach(), b.detach()
+
 
 
 class BankOfTags(nn.Module):
@@ -1582,8 +1619,7 @@ class MPLPPredictor(nn.Module):
             norm=True
         )
         
-        # Final Classifier (Struct + Feat)
-        # Using MLP to allow interaction between structure and features
+        # Final Classifier (Struct + Feat) when not using score-gated MPLP
         self.classifier = MLP(
             in_channels=hidden_dim + structural_input_dim,
             hidden_channels=hidden_dim,
@@ -1592,6 +1628,27 @@ class MPLPPredictor(nn.Module):
             dropout=dropout,
             norm=True
         )
+
+        # Score heads for gated combination
+        self.struct_score = None
+        self.feat_score = None
+        if self.use_struct_gate:
+            self.struct_score = MLP(
+                in_channels=structural_input_dim,
+                hidden_channels=structural_input_dim,
+                out_channels=1,
+                num_layers=head_num_layers,
+                dropout=dropout,
+                norm=True
+            )
+            self.feat_score = MLP(
+                in_channels=hidden_dim,
+                hidden_channels=hidden_dim,
+                out_channels=1,
+                num_layers=head_num_layers,
+                dropout=dropout,
+                norm=True
+            )
         
     def forward(self, x, adj_t, edges):
         """
@@ -1642,10 +1699,12 @@ class MPLPLinkPredictionHead(nn.Module):
     """
     def __init__(self, hidden_dim, dropout=0.2, signature_dim=64, num_hops=2, feature_combine='hadamard',
                  head_num_layers=2, prop_type='combine', edge_feat_dim=None,
-                 signature_sampling='torchhd', use_subgraph=True, use_degree='none'):
+                 signature_sampling='torchhd', use_subgraph=True, use_degree='none',
+                 use_context_calibrate=False):
         super().__init__()
         self.feature_combine = feature_combine
         self.use_degree = use_degree
+        self.use_context_calibrate = use_context_calibrate
         
         # Randomized Structural Encoding
         from .node_label import RandomizedNodeLabeling
@@ -1690,6 +1749,25 @@ class MPLPLinkPredictionHead(nn.Module):
             dropout=dropout,
             norm=True
         )
+        self.struct_score = None
+        self.feat_score = None
+        if self.use_context_calibrate:
+            self.struct_score = MLP(
+                in_channels=structural_input_dim,
+                hidden_channels=structural_input_dim,
+                out_channels=1,
+                num_layers=head_num_layers,
+                dropout=dropout,
+                norm=True
+            )
+            self.feat_score = MLP(
+                in_channels=hidden_dim,
+                hidden_channels=hidden_dim,
+                out_channels=1,
+                num_layers=head_num_layers,
+                dropout=dropout,
+                norm=True
+            )
 
         self.node_weight_mlp = None
         if self.use_degree == 'mlp':
@@ -1702,7 +1780,20 @@ class MPLPLinkPredictionHead(nn.Module):
                 norm=True
             )
 
-    def forward(self, edge_emb, adj_t, edges, node_emb=None):
+        self.last_gate_mean = None
+        self.last_struct_score = None
+        self.last_feat_score = None
+        self.last_gate_value = None
+        self.last_gate_calib_ms = None
+        self.last_w_struct = None
+        self.last_w_feat = None
+        self.last_w_bias = None
+
+    def score_components(self, edge_emb, adj_t, edges, node_emb=None):
+        """
+        Returns:
+            struct_score, feat_score
+        """
         """
         Args:
             edge_emb: Refined edge embeddings from Transformer [batch_size, hidden_dim]
@@ -1734,8 +1825,45 @@ class MPLPLinkPredictionHead(nn.Module):
         
         # 3. Process Edge Features (from PFN)
         feat_emb = self.feat_encode(edge_emb)
-        
-        # 4. Combine and Predict
+
+        if self.struct_score is None or self.feat_score is None:
+            raise RuntimeError("score_components requires use_context_calibrate=True to initialize score heads.")
+
+        struct_score = self.struct_score(struct_emb).squeeze(-1)
+        feat_score = self.feat_score(feat_emb).squeeze(-1)
+        self.last_struct_score = struct_score.detach()
+        self.last_feat_score = feat_score.detach()
+        return struct_score, feat_score
+
+    def forward(self, edge_emb, adj_t, edges, node_emb=None):
+        """
+        Standard forward without context calibration (uses combined classifier).
+        """
+        # 1. Compute Node Weights (Inverse Log Degree)
+        node_weight = None
+        if self.use_degree == 'aa':
+            degree = adj_t.sum(dim=1)
+            node_weight = torch.sqrt(1.0 / (torch.log(degree + 1.0) + 1e-6))
+        elif self.use_degree == 'ra':
+            degree = adj_t.sum(dim=1)
+            node_weight = torch.sqrt(1.0 / (degree + 1e-6))
+        elif self.use_degree == 'mlp':
+            if node_emb is None:
+                raise ValueError("use_degree='mlp' requires node_emb to be provided.")
+            degree = adj_t.sum(dim=1).view(-1, 1)
+            node_weight_feat = torch.cat([node_emb, degree], dim=1)
+            node_weight = self.node_weight_mlp(node_weight_feat).squeeze(-1) + 1.0
+
+        if edges.size(0) != 2:
+            edges = edges.t()
+
+        struct_feats = self.node_labeling(edges, adj_t, node_weight)
+        struct_emb = self.struct_encode(struct_feats)
+        feat_emb = self.feat_encode(edge_emb)
+
+        self.last_gate_mean = None
+        self.last_struct_score = None
+        self.last_feat_score = None
         final_emb = torch.cat([struct_emb, feat_emb], dim=-1)
         return self.classifier(final_emb).squeeze(-1)
 
@@ -1765,6 +1893,12 @@ class PFNPredictorNodeCls(nn.Module):
                  mplp_signature_sampling='torchhd',
                  mplp_use_subgraph=True,
                  mplp_use_degree='none',
+                 mplp_context_calibrate=False,
+                 mplp_calib_train_static=False,
+                 mplp_calib_shuffle_labels=False,
+                 mplp_calib_reg=1e-3,
+                 mplp_calib_w_min=0.1,
+                 mplp_calib_w_max=10.0,
                  ncn_beta=1.0,
                  ncn_cndeg=-1,
                  nc_head_num_layers=None, lp_head_num_layers=None,
@@ -1784,6 +1918,12 @@ class PFNPredictorNodeCls(nn.Module):
         self.mplp_signature_sampling = mplp_signature_sampling
         self.mplp_use_subgraph = mplp_use_subgraph
         self.mplp_use_degree = mplp_use_degree
+        self.mplp_context_calibrate = mplp_context_calibrate
+        self.mplp_calib_train_static = mplp_calib_train_static
+        self.mplp_calib_shuffle_labels = mplp_calib_shuffle_labels
+        self.mplp_calib_reg = mplp_calib_reg
+        self.mplp_calib_w_min = mplp_calib_w_min
+        self.mplp_calib_w_max = mplp_calib_w_max
         self.ncn_beta = ncn_beta
         self.ncn_cndeg = ncn_cndeg
         # CN concat is not applied to MPLP/NCN heads
@@ -1899,6 +2039,7 @@ class PFNPredictorNodeCls(nn.Module):
                 signature_sampling=self.mplp_signature_sampling,
                 use_subgraph=self.mplp_use_subgraph,
                 use_degree=self.mplp_use_degree,
+                use_context_calibrate=self.mplp_context_calibrate,
                 edge_feat_dim=lp_head_input_dim
             )
         elif self.lp_head_type == 'ncn':
@@ -1934,7 +2075,7 @@ class PFNPredictorNodeCls(nn.Module):
             head_num_layers=self.head_num_layers
         )
     
-    def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification', adj_t=None, lp_edges=None, node_emb=None, lp_cn_context=None, lp_cn_target=None):
+    def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification', adj_t=None, lp_edges=None, node_emb=None, lp_cn_context=None, lp_cn_target=None, lp_context_edges=None):
         """
         Unified forward pass supporting node classification, link prediction, and graph classification.
 
@@ -1952,6 +2093,7 @@ class PFNPredictorNodeCls(nn.Module):
         - context_y: Context edge labels (0: no-link, 1: link)
         - class_x: Link prototypes [2, hidden_dim]
         - adj_t/lp_edges/node_emb: Required for MPLP/NCN heads
+        - lp_context_edges: Context edge indices [2, num_context] for MPLP calibration
 
         For graph classification:
         - data: PFN data structure (prepared for graph classification)
@@ -2046,7 +2188,83 @@ class PFNPredictorNodeCls(nn.Module):
             if self.lp_head_type == 'mplp':
                 if adj_t is None or lp_edges is None:
                     raise ValueError("MPLP head requires adj_t and lp_edges to be passed to forward()")
-                logits = self.lp_head(target_label_emb, adj_t, lp_edges, node_emb=node_emb)
+                def _check_finite(name, tensor):
+                    if tensor is None:
+                        return
+                    finite = torch.isfinite(tensor)
+                    if finite.all():
+                        return
+                    if finite.any():
+                        t_f = tensor[finite]
+                        stats = (
+                            f"finite_mean={t_f.mean().item():.4f} "
+                            f"finite_min={t_f.min().item():.4f} "
+                            f"finite_max={t_f.max().item():.4f} "
+                            f"num_nonfinite={(~finite).sum().item()}"
+                        )
+                    else:
+                        stats = "no finite values"
+                    raise RuntimeError(f"MPLP numeric error: {name} has non-finite values. {stats}")
+                if self.mplp_context_calibrate and self.training and self.mplp_calib_train_static:
+                    struct_score, feat_score = self.lp_head.score_components(
+                        target_label_emb, adj_t, lp_edges, node_emb=node_emb
+                    )
+                    _check_finite("struct_score", struct_score)
+                    _check_finite("feat_score", feat_score)
+                    logits = feat_score + struct_score
+                    _check_finite("logits", logits)
+                    ones = torch.ones((), device=logits.device, dtype=logits.dtype)
+                    zeros = torch.zeros((), device=logits.device, dtype=logits.dtype)
+                    self.lp_head.last_gate_mean = ones.detach()
+                    self.lp_head.last_gate_value = ones.detach()
+                    self.lp_head.last_w_feat = ones.detach()
+                    self.lp_head.last_w_struct = ones.detach()
+                    self.lp_head.last_w_bias = zeros.detach()
+                    self.lp_head.last_gate_calib_ms = None
+                    self.lp_head.last_struct_score = struct_score.detach()
+                    self.lp_head.last_feat_score = feat_score.detach()
+                elif self.mplp_context_calibrate and lp_context_edges is not None:
+                    calib_start = time.perf_counter()
+                    # Fit scalar g on context edges (no grad), then score targets with feat + g * struct
+                    with torch.no_grad():
+                        ctx_struct, ctx_feat = self.lp_head.score_components(
+                            context_label_emb, adj_t, lp_context_edges, node_emb=node_emb
+                        )
+                        _check_finite("ctx_struct", ctx_struct)
+                        _check_finite("ctx_feat", ctx_feat)
+                        y = context_y.float().to(ctx_struct.device)
+                        if self.mplp_calib_shuffle_labels and not self.training:
+                            y = y[torch.randperm(y.size(0), device=y.device)]
+                    with torch.enable_grad():
+                        w, b = _fit_mplp_calib_sgd(
+                            ctx_feat.detach(), ctx_struct.detach(), y.detach(),
+                            w_min=self.mplp_calib_w_min,
+                            w_max=self.mplp_calib_w_max,
+                            reg=self.mplp_calib_reg
+                        )
+                        w_feat, w_struct, w_bias = w[0], w[1], b.squeeze()
+                    _check_finite("w_feat", w_feat)
+                    _check_finite("w_struct", w_struct)
+                    calib_ms = (time.perf_counter() - calib_start) * 1000.0
+                    struct_score, feat_score = self.lp_head.score_components(
+                        target_label_emb, adj_t, lp_edges, node_emb=node_emb
+                    )
+                    _check_finite("struct_score", struct_score)
+                    _check_finite("feat_score", feat_score)
+                    logits = w_feat * feat_score + w_struct * struct_score + w_bias
+                    _check_finite("logits", logits)
+                    ratio = w_struct / (w_feat + 1e-8)
+                    self.lp_head.last_gate_mean = ratio.detach()
+                    self.lp_head.last_gate_value = w_struct.detach()
+                    self.lp_head.last_w_feat = w_feat.detach()
+                    self.lp_head.last_w_struct = w_struct.detach()
+                    self.lp_head.last_w_bias = w_bias.detach()
+                    self.lp_head.last_gate_calib_ms = calib_ms
+                    self.lp_head.last_struct_score = struct_score.detach()
+                    self.lp_head.last_feat_score = feat_score.detach()
+                else:
+                    logits = self.lp_head(target_label_emb, adj_t, lp_edges, node_emb=node_emb)
+                    self.lp_head.last_gate_calib_ms = None
                 class_emb = class_x # Keep prototypes as is (not updated by MPLP)
             elif self.lp_head_type == 'ncn':
                 if adj_t is None or lp_edges is None or node_emb is None:

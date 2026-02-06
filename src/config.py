@@ -238,11 +238,11 @@ def parse_joint_training_args():
                        help='Apply random projection augmentation: σ(WX+b) with random σ, W, b, and hidden_dim')
     parser.add_argument('--num_augmentations', type=int, default=1,
                        help='Number of augmented copies to create per graph (1=double dataset, 2=triple, etc.)')
-    parser.add_argument('--augmentation_mode', type=str, default='preprocessing',
-                       choices=['preprocessing', 'per_epoch'],
-                       help='Augmentation mode: preprocessing (fixed augmentations created once) or per_epoch (new random augmentations each epoch)')
+    parser.add_argument('--augmentation_mode', type=str, default='per_epoch',
+                       choices=['preprocessing', 'per_epoch', 'per_step'],
+                       help='Augmentation mode: preprocessing (fixed), per_epoch (regenerate each N epochs), or per_step (regenerate each training step)')
     parser.add_argument('--augmentation_regenerate_interval', type=int, default=1,
-                       help='Regenerate augmentations every N epochs in per_epoch mode (1 = every epoch, 5 = every 5 epochs, etc.)')
+                       help='Regeneration interval: every N epochs in per_epoch mode or every N train steps in per_step mode')
     parser.add_argument('--augmentation_include_original', type=str2bool, default=False,
                        help='Whether to include original graphs in training (True) or train only on augmented graphs (False)')
     parser.add_argument('--augmentation_shuffle', type=str2bool, default=False,
@@ -361,6 +361,18 @@ def parse_joint_training_args():
                         help='Use 2-hop subgraph for MPLP structural features (default: True)')
     parser.add_argument('--mplp_use_degree', type=str, default='mlp', choices=['none', 'aa', 'ra', 'mlp'],
                         help='Degree-based node weighting for MPLP structural features')
+    parser.add_argument('--mplp_context_calibrate', type=str2bool, default=True,
+                        help='Fit a scalar structure gate on context edges per dataset (MPLP only)')
+    parser.add_argument('--mplp_calib_train_static', type=str2bool, default=False,
+                        help='Use 1:1 feat+struct during training; apply calibration only at eval')
+    parser.add_argument('--mplp_calib_shuffle_labels', type=str2bool, default=False,
+                        help='Debug: shuffle context labels for MPLP calibration during eval only')
+    parser.add_argument('--mplp_calib_reg', type=float, default=1e-3,
+                        help='L2 regularization strength for MPLP calibration weights')
+    parser.add_argument('--mplp_calib_w_min', type=float, default=0.1,
+                        help='Minimum clamp value for MPLP calibration weights w_f and w_s')
+    parser.add_argument('--mplp_calib_w_max', type=float, default=10,
+                        help='Clamp magnitude for MPLP calibration weights (w_f, w_s in [0, w_max], b in [-w_max, w_max])')
     parser.add_argument('--lp_concat_common_neighbors', type=str2bool, default=False,
                         help='Concatenate common-neighbor count to edge embeddings before LP head')
     parser.add_argument('--ncn_cndeg', type=int, default=-1,

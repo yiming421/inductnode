@@ -219,7 +219,7 @@ class MiniBatchNCLoader:
 
 
 def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, device,
-                                  identity_projection=None, projector=None, external_embeddings=None, optimizer=None):
+                                  identity_projection=None, projector=None, external_embeddings=None, optimizer=None, epoch=0):
     """
     Compute node classification loss using MiniBatchNCLoader.
     Performs forward pass, backward pass, and optimizer step for each batch.
@@ -235,6 +235,7 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
         identity_projection: Optional identity projection layer
         external_embeddings: Optional external embeddings
         optimizer: Optimizer (for backward pass)
+        epoch: Current epoch (forwarded to full-batch NC trainer)
 
     Returns:
         avg_loss: Average loss across batches (as scalar)
@@ -365,7 +366,7 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
                     batch_size=args.nc_batch_size if hasattr(args, 'nc_batch_size') else 1024,
                     projector=projector,
                     rank=0,
-                    epoch=0,  # Only used for distributed sampler, batch refresh removed
+                    epoch=epoch,
                     identity_projection=identity_projection,
                     lambda_=args.lambda_nc if hasattr(args, 'lambda_nc') else 1.0,
                     args=args,
@@ -383,7 +384,7 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
                     clip_grad=args.clip_grad if hasattr(args, 'clip_grad') else 1.0,
                     projector=projector,
                     rank=0,
-                    epoch=0,  # Only used for distributed sampler
+                    epoch=epoch,
                     identity_projection=identity_projection,
                     lambda_=args.lambda_nc if hasattr(args, 'lambda_nc') else 1.0,
                     args=args,
