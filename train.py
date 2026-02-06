@@ -1900,6 +1900,12 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                         if graph_idx == 0:
                             print(f"\n  [WARNING] x_original not available, using current data.x")
 
+                    # Keep PCA on GPU when requested (match initial preprocessing behavior)
+                    if args.pca_device != 'cpu' and device.type == 'cuda':
+                        data_for_aug.x = data_for_aug.x.to(device)
+                        if hasattr(data_for_aug, 'y'):
+                            data_for_aug.y = data_for_aug.y.to(device)
+
                     # Apply augmentation to RAW features
                     data_aug = apply_random_projection_augmentation(
                         data_for_aug,
