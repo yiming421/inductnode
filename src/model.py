@@ -56,6 +56,45 @@ def _fit_mplp_calib_sgd(
     return w.detach(), b.detach()
 
 
+def _fit_hybrid3_calib_sgd(
+    ctx_std,
+    ctx_mplp_struct,
+    ctx_ncn_cn,
+    labels,
+    w_min=0.0,
+    w_max=10.0,
+    reg=1e-3,
+    steps=20,
+    lr=0.1,
+):
+    """
+    Fit non-negative branch weights [w_std, w_mplp, w_ncn] on context edges.
+    """
+    X = torch.stack(
+        [
+            ctx_std.view(-1),
+            ctx_mplp_struct.view(-1),
+            ctx_ncn_cn.view(-1),
+        ],
+        dim=1,
+    )
+    y = labels.view(-1).float()
+
+    w = torch.ones(3, device=X.device, dtype=X.dtype, requires_grad=True)
+    opt = torch.optim.SGD([w], lr=lr)
+    w_min = max(0.0, w_min)
+    for _ in range(steps):
+        opt.zero_grad()
+        logits = X @ w
+        loss = F.binary_cross_entropy_with_logits(logits, y)
+        loss = loss + reg * ((w - 1.0) ** 2).sum()
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            w.clamp_(w_min, w_max)
+    return w.detach()
+
+
 
 class BankOfTags(nn.Module):
     """
@@ -1337,9 +1376,10 @@ class NCNLinkPredictionHead(nn.Module):
     Combines pooled common-neighbor node features with refined edge embeddings.
     """
     def __init__(self, node_dim, edge_dim, hidden_dim, dropout=0.2, norm=True, norm_affine=True,
-                 head_num_layers=2, beta=1.0, cndeg=-1):
+                 head_num_layers=2, beta=1.0, cndeg=-1, use_edge_branch=True):
         super().__init__()
         self.cndeg = cndeg
+        self.use_edge_branch = use_edge_branch
         self.register_parameter("beta", nn.Parameter(beta * torch.ones((1))))
 
         self.xcnlin = MLP(
@@ -1352,16 +1392,18 @@ class NCNLinkPredictionHead(nn.Module):
             tailact=False,
             norm_affine=norm_affine
         )
-        self.xijlin = MLP(
-            in_channels=edge_dim,
-            hidden_channels=hidden_dim,
-            out_channels=hidden_dim,
-            num_layers=2,
-            dropout=dropout,
-            norm=norm,
-            tailact=False,
-            norm_affine=norm_affine
-        )
+        self.xijlin = None
+        if self.use_edge_branch:
+            self.xijlin = MLP(
+                in_channels=edge_dim,
+                hidden_channels=hidden_dim,
+                out_channels=hidden_dim,
+                num_layers=2,
+                dropout=dropout,
+                norm=norm,
+                tailact=False,
+                norm_affine=norm_affine
+            )
 
         if head_num_layers <= 1:
             self.lin = nn.Linear(hidden_dim, 1)
@@ -1398,11 +1440,12 @@ class NCNLinkPredictionHead(nn.Module):
         if xcn.dim() == 1:
             xcn = xcn.unsqueeze(0)
 
-        xij = self.xijlin(edge_emb)
-        if xij.dim() == 1:
-            xij = xij.unsqueeze(0)
-
-        h = xcn * self.beta + xij
+        h = xcn * self.beta
+        if self.xijlin is not None:
+            xij = self.xijlin(edge_emb)
+            if xij.dim() == 1:
+                xij = xij.unsqueeze(0)
+            h = h + xij
         if self.lin_mlp is not None:
             logits = self.lin_mlp(h)
         else:
@@ -1868,6 +1911,178 @@ class MPLPLinkPredictionHead(nn.Module):
         return self.classifier(final_emb).squeeze(-1)
 
 
+class MPLPStructOnlyBranch(nn.Module):
+    """
+    MPLP structural-only branch (no edge-feature pathway).
+    """
+    def __init__(self, hidden_dim, dropout=0.2, signature_dim=64, num_hops=2,
+                 prop_type='combine', signature_sampling='torchhd',
+                 use_subgraph=True, use_degree='none'):
+        super().__init__()
+        self.use_degree = use_degree
+        from .node_label import RandomizedNodeLabeling
+        self.node_labeling = RandomizedNodeLabeling(
+            signature_dim=signature_dim,
+            num_hops=num_hops,
+            prop_type=prop_type,
+            signature_sampling=signature_sampling,
+            use_subgraph=use_subgraph
+        )
+        structural_input_dim = 15 if prop_type == 'combine' else 5
+        self.struct_encode = MLP(
+            in_channels=structural_input_dim,
+            hidden_channels=structural_input_dim,
+            out_channels=structural_input_dim,
+            num_layers=1,
+            dropout=dropout,
+            norm=True,
+            tailact=True
+        )
+        self.struct_score = MLP(
+            in_channels=structural_input_dim,
+            hidden_channels=hidden_dim,
+            out_channels=1,
+            num_layers=2,
+            dropout=dropout,
+            norm=True
+        )
+        self.node_weight_mlp = None
+        if self.use_degree == 'mlp':
+            self.node_weight_mlp = MLP(
+                in_channels=hidden_dim + 1,
+                hidden_channels=32,
+                out_channels=1,
+                num_layers=2,
+                dropout=dropout,
+                norm=True
+            )
+
+    def forward(self, adj_t, edges, node_emb=None):
+        node_weight = None
+        if self.use_degree == 'aa':
+            degree = adj_t.sum(dim=1)
+            node_weight = torch.sqrt(1.0 / (torch.log(degree + 1.0) + 1e-6))
+        elif self.use_degree == 'ra':
+            degree = adj_t.sum(dim=1)
+            node_weight = torch.sqrt(1.0 / (degree + 1e-6))
+        elif self.use_degree == 'mlp':
+            if node_emb is None:
+                raise ValueError("use_degree='mlp' requires node_emb to be provided.")
+            degree = adj_t.sum(dim=1).view(-1, 1)
+            node_weight_feat = torch.cat([node_emb, degree], dim=1)
+            node_weight = self.node_weight_mlp(node_weight_feat).squeeze(-1) + 1.0
+        if edges.size(0) != 2:
+            edges = edges.t()
+        struct_feats = self.node_labeling(edges, adj_t, node_weight)
+        struct_emb = self.struct_encode(struct_feats)
+        return self.struct_score(struct_emb).squeeze(-1)
+
+
+class Hybrid3LinkPredictionHead(nn.Module):
+    """
+    Fuses standard edge-feature, MPLP-struct, and NCN-CN-only branches.
+    """
+    def __init__(self, hidden_dim, edge_dim, node_dim, dropout=0.2, norm=True, norm_affine=True,
+                 head_num_layers=2, mplp_signature_dim=64, mplp_num_hops=2, mplp_prop_type='combine',
+                 mplp_signature_sampling='torchhd', mplp_use_subgraph=True, mplp_use_degree='none',
+                 ncn_beta=1.0, ncn_cndeg=-1, calib_reg=1e-3, calib_w_min=0.1, calib_w_max=10.0):
+        super().__init__()
+        self.std_head = MLP(
+            in_channels=edge_dim,
+            hidden_channels=hidden_dim,
+            out_channels=1,
+            num_layers=head_num_layers,
+            dropout=dropout,
+            norm=norm,
+            tailact=False,
+            norm_affine=norm_affine
+        )
+        self.mplp_struct_branch = MPLPStructOnlyBranch(
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            signature_dim=mplp_signature_dim,
+            num_hops=mplp_num_hops,
+            prop_type=mplp_prop_type,
+            signature_sampling=mplp_signature_sampling,
+            use_subgraph=mplp_use_subgraph,
+            use_degree=mplp_use_degree
+        )
+        self.ncn_cn_branch = NCNLinkPredictionHead(
+            node_dim=node_dim,
+            edge_dim=edge_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            norm=norm,
+            norm_affine=norm_affine,
+            head_num_layers=head_num_layers,
+            beta=ncn_beta,
+            cndeg=ncn_cndeg,
+            use_edge_branch=False
+        )
+        # Keep training stable: static 1:1:1 branch fusion during training.
+        # Context-based calibration runs only in eval mode.
+        self.calib_w_min = calib_w_min
+        self.calib_w_max = calib_w_max
+        self.calib_reg = calib_reg
+        self.calib_steps = 20
+        self.calib_lr = 0.1
+        self.last_fusion_weights = None
+        self.last_std_score = None
+        self.last_mplp_struct_score = None
+        self.last_ncn_score = None
+
+    @staticmethod
+    def _uniform_weights(device):
+        return torch.tensor([1.0, 1.0, 1.0], device=device)
+
+    def _branch_logits(self, edge_emb, adj_t, edges, node_emb):
+        z_std = self.std_head(edge_emb).squeeze(-1)
+        z_mplp_struct = self.mplp_struct_branch(adj_t, edges, node_emb=node_emb)
+        z_ncn_cn = self.ncn_cn_branch(edge_emb, adj_t, edges, node_emb=node_emb)
+        return z_std, z_mplp_struct, z_ncn_cn
+
+    def _fusion_weights(self, context_edge_emb, context_edges, context_labels, adj_t, node_emb):
+        device = node_emb.device
+        # Training path is intentionally static to avoid context-driven instability.
+        if self.training:
+            return self._uniform_weights(device)
+
+        if context_edge_emb is None or context_edges is None or context_labels is None or context_labels.numel() == 0:
+            return self._uniform_weights(device)
+
+        with torch.no_grad():
+            z_std, z_mplp_struct, z_ncn_cn = self._branch_logits(
+                context_edge_emb, adj_t, context_edges, node_emb
+            )
+            y = context_labels.float().to(z_std.device)
+        with torch.enable_grad():
+            weights = _fit_hybrid3_calib_sgd(
+                z_std.detach(),
+                z_mplp_struct.detach(),
+                z_ncn_cn.detach(),
+                y.detach(),
+                w_min=getattr(self, 'calib_w_min', 0.0),
+                w_max=getattr(self, 'calib_w_max', 10.0),
+                reg=getattr(self, 'calib_reg', 1e-3),
+                steps=getattr(self, 'calib_steps', 20),
+                lr=getattr(self, 'calib_lr', 0.1),
+            )
+        return weights
+
+    def forward(self, edge_emb, adj_t, edges, node_emb=None,
+                context_edge_emb=None, context_edges=None, context_labels=None):
+        if node_emb is None:
+            raise ValueError("Hybrid3 head requires node_emb to be provided.")
+        weights = self._fusion_weights(context_edge_emb, context_edges, context_labels, adj_t, node_emb)
+        z_std, z_mplp_struct, z_ncn_cn = self._branch_logits(edge_emb, adj_t, edges, node_emb)
+        logits = weights[0] * z_std + weights[1] * z_mplp_struct + weights[2] * z_ncn_cn
+        self.last_fusion_weights = weights.detach()
+        self.last_std_score = z_std.detach()
+        self.last_mplp_struct_score = z_mplp_struct.detach()
+        self.last_ncn_score = z_ncn_cn.detach()
+        return logits
+
+
 class PFNPredictorNodeCls(nn.Module):
     def __init__(self, hidden_dim, nhead=1, num_layers=2, mlp_layers=2, dropout=0.2,
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
@@ -1927,7 +2142,7 @@ class PFNPredictorNodeCls(nn.Module):
         self.ncn_beta = ncn_beta
         self.ncn_cndeg = ncn_cndeg
         # CN concat is not applied to MPLP/NCN heads
-        self.lp_concat_common_neighbors = lp_concat_common_neighbors and self.lp_head_type not in ('mplp', 'ncn')
+        self.lp_concat_common_neighbors = lp_concat_common_neighbors and self.lp_head_type not in ('mplp', 'ncn', 'hybrid3')
 
         # Separate ridge regression configurations
         # Use explicit task-specific parameters - they have proper defaults from config
@@ -2053,6 +2268,27 @@ class PFNPredictorNodeCls(nn.Module):
                 head_num_layers=self.lp_head_num_layers,
                 beta=self.ncn_beta,
                 cndeg=self.ncn_cndeg
+            )
+        elif self.lp_head_type == 'hybrid3':
+            self.lp_head = Hybrid3LinkPredictionHead(
+                hidden_dim=head_hidden_dim,
+                edge_dim=head_hidden_dim,
+                node_dim=self.hidden_dim,
+                dropout=dropout,
+                norm=norm,
+                norm_affine=norm_affine,
+                head_num_layers=self.lp_head_num_layers,
+                mplp_signature_dim=mplp_signature_dim,
+                mplp_num_hops=mplp_num_hops,
+                mplp_prop_type=self.mplp_prop_type,
+                mplp_signature_sampling=self.mplp_signature_sampling,
+                mplp_use_subgraph=self.mplp_use_subgraph,
+                mplp_use_degree=self.mplp_use_degree,
+                ncn_beta=self.ncn_beta,
+                ncn_cndeg=self.ncn_cndeg,
+                calib_reg=self.mplp_calib_reg,
+                calib_w_min=self.mplp_calib_w_min,
+                calib_w_max=self.mplp_calib_w_max
             )
         else:
             self.lp_head = LinkPredictionHead(
@@ -2270,6 +2506,19 @@ class PFNPredictorNodeCls(nn.Module):
                 if adj_t is None or lp_edges is None or node_emb is None:
                     raise ValueError("NCN head requires adj_t, lp_edges, and node_emb to be passed to forward()")
                 logits = self.lp_head(target_label_emb, adj_t, lp_edges, node_emb=node_emb)
+                class_emb = class_x
+            elif self.lp_head_type == 'hybrid3':
+                if adj_t is None or lp_edges is None or node_emb is None:
+                    raise ValueError("Hybrid3 head requires adj_t, lp_edges, and node_emb to be passed to forward()")
+                logits = self.lp_head(
+                    target_label_emb,
+                    adj_t,
+                    lp_edges,
+                    node_emb=node_emb,
+                    context_edge_emb=context_label_emb,
+                    context_edges=lp_context_edges,
+                    context_labels=context_y
+                )
                 class_emb = class_x
             else:
                 logits, class_emb = self.lp_head(

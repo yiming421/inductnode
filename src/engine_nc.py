@@ -92,6 +92,49 @@ def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
     return x
 
 
+def _has_trainable_parameters(module):
+    """Return True if module has any trainable parameter."""
+    if module is None:
+        return False
+    return any(p.requires_grad for p in module.parameters())
+
+
+def _is_puregcn_v1_parameter_free(model_module):
+    """
+    Conservative check for parameter-free PureGCN_v1 forward path.
+
+    Returns:
+        (is_safe, reason)
+    """
+    if model_module is None:
+        return False, "model_missing"
+
+    if model_module.__class__.__name__ != 'PureGCN_v1':
+        return False, "model_not_puregcn_v1"
+
+    if not isinstance(getattr(model_module, 'lin', None), nn.Identity):
+        return False, "input_projection_not_identity"
+
+    if getattr(model_module, 'use_virtual_node', False):
+        return False, "virtual_node_enabled"
+
+    if float(getattr(model_module, 'dp', 0.0)) > 0:
+        return False, "model_dropout_enabled"
+
+    if getattr(model_module, 'norm', False):
+        norms = getattr(model_module, 'norms', None)
+        if norms is None:
+            return False, "missing_norm_layers"
+        for layer_norm in norms:
+            if getattr(layer_norm, 'elementwise_affine', False):
+                return False, "gnn_norm_affine_enabled"
+
+    if _has_trainable_parameters(model_module):
+        return False, "model_has_trainable_params"
+
+    return True, None
+
+
 def refresh_dataset_context_if_needed(data, split_idx, batch_idx, epoch, args):
     """
     Simple dataset-specific context refresh for batch-level updates.
@@ -242,7 +285,8 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                     activation_pool=None,
                     seed=seed,
                     verbose=False,
-                    rank=rank
+                    rank=rank,
+                    max_hidden_dim=getattr(args, 'augmentation_max_dim', None)
                 )
 
                 data_aug.x_pca = _pca_or_pad(data_aug.x, pca_target_dim)
@@ -260,6 +304,127 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
     if use_per_step_augmentation and rank == 0 and epoch == 0:
         print(f"[Per-Step Augmentation] Enabled: NC features are regenerated every {per_step_regen_interval} train step(s).")
+
+    # Helper: forward pass for a given base feature tensor and adjacency
+    def _forward_with_features(features, adj_t_input):
+        # Apply different projection strategies
+        # Priority: Dynamic Encoder > FUG embeddings > identity projection > standard projection > raw features
+        if hasattr(data, 'uses_dynamic_encoder') and data.uses_dynamic_encoder:
+            x_input = features
+        elif hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
+            x_input = projector(features)
+        elif hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
+            x_input = identity_projection(features)
+        elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
+            projected_features = projector(features)
+            if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
+                x_input = apply_final_pca(projected_features, projected_features.size(1))
+            else:
+                x_input = projected_features
+        else:
+            x_input = features
+
+        # Apply feature dropout AFTER projection
+        x_input = apply_feature_dropout_if_enabled(x_input, args, rank, training=model.training)
+
+        # GNN forward pass
+        if (hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing
+                and torch.is_grad_enabled()):
+            h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
+        else:
+            h = model(x_input, adj_t_input)
+
+        return h, x_input
+
+    # Optional NC static embedding cache (full-batch only).
+    # In auto mode, enable only when forward is deterministic and parameter-free.
+    nc_cache_mode = getattr(args, 'nc_static_embedding_cache', 'auto') if args is not None else 'auto'
+    if nc_cache_mode not in ('off', 'auto', 'force'):
+        nc_cache_mode = 'auto'
+
+    model_module = model.module if hasattr(model, 'module') else model
+    model_has_trainable_params = _has_trainable_parameters(model_module)
+    projector_has_trainable_params = _has_trainable_parameters(projector)
+    identity_has_trainable_params = _has_trainable_parameters(identity_projection)
+
+    puregcn_cacheable, puregcn_reason = _is_puregcn_v1_parameter_free(model_module)
+
+    edge_dropout_active = (
+        args is not None and
+        getattr(args, 'edge_dropout_enabled', False) and
+        float(getattr(args, 'edge_dropout_rate', 0.0)) > 0
+    )
+    feature_dropout_active = (
+        args is not None and
+        getattr(args, 'feature_dropout_enabled', False) and
+        float(getattr(args, 'feature_dropout_rate', 0.0)) > 0
+    )
+    contrastive_active = (
+        args is not None and
+        getattr(args, 'use_contrastive_augmentation_loss', False) and
+        hasattr(data, 'x_pca_original') and
+        data.x_pca_original is not None and
+        hasattr(pred, 'get_target_embeddings')
+    )
+
+    cache_hard_blockers = []
+    if use_train_tta:
+        cache_hard_blockers.append('train_time_tta_enabled')
+    if use_per_step_augmentation:
+        cache_hard_blockers.append('per_step_augmentation_enabled')
+    if edge_dropout_active:
+        cache_hard_blockers.append('edge_dropout_enabled')
+    if feature_dropout_active:
+        cache_hard_blockers.append('feature_dropout_enabled')
+    if contrastive_active:
+        cache_hard_blockers.append('contrastive_augmentation_loss_enabled')
+
+    use_static_embedding_cache = False
+    cache_notes = []
+
+    if nc_cache_mode == 'off':
+        cache_notes.append('policy_off')
+    elif len(cache_hard_blockers) > 0:
+        cache_notes.extend(cache_hard_blockers)
+    elif nc_cache_mode == 'auto':
+        if not puregcn_cacheable:
+            cache_notes.append(puregcn_reason or 'model_not_cacheable')
+        if model_has_trainable_params:
+            cache_notes.append('model_has_trainable_params')
+        if projector_has_trainable_params:
+            cache_notes.append('projector_has_trainable_params')
+        if identity_has_trainable_params:
+            cache_notes.append('identity_projection_has_trainable_params')
+        use_static_embedding_cache = len(cache_notes) == 0
+    else:  # force
+        if model_has_trainable_params:
+            cache_notes.append('force_rejected_model_has_trainable_params')
+        if projector_has_trainable_params:
+            cache_notes.append('force_rejected_projector_has_trainable_params')
+        if identity_has_trainable_params:
+            cache_notes.append('force_rejected_identity_projection_has_trainable_params')
+        use_static_embedding_cache = len(cache_notes) == 0
+        if use_static_embedding_cache and not puregcn_cacheable:
+            cache_notes.append(f"forced_without_strict_check:{puregcn_reason or 'unknown'}")
+
+    cache_notes = list(dict.fromkeys(cache_notes))
+
+    if rank == 0:
+        dataset_name = getattr(data, 'name', 'unknown')
+        if use_static_embedding_cache:
+            print(f"[NC Cache] Enabled for {dataset_name} (mode={nc_cache_mode}): one full-graph GNN forward per epoch.")
+            if len(cache_notes) > 0:
+                print(f"[NC Cache] Note: {', '.join(cache_notes)}")
+        else:
+            print(f"[NC Cache] Disabled for {dataset_name} (mode={nc_cache_mode}): {', '.join(cache_notes)}")
+
+    static_cached_h = None
+    static_cached_x_input = None
+    if use_static_embedding_cache:
+        with torch.no_grad():
+            static_cached_h, static_cached_x_input = _forward_with_features(data.x, data.adj_t)
+        static_cached_h = static_cached_h.detach()
+        static_cached_x_input = static_cached_x_input.detach()
 
     cached_step_features = None
     for batch_idx, perm in enumerate(dataloader):
@@ -303,6 +468,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                     use_feature_mixing=getattr(args, 'augmentation_use_feature_mixing', False),
                     mix_ratio=getattr(args, 'augmentation_mix_ratio', 0.3),
                     mix_alpha=getattr(args, 'augmentation_mix_alpha', 0.5),
+                    max_hidden_dim=getattr(args, 'augmentation_max_dim', None),
                 )
                 cached_step_features = _pca_or_pad(data_aug.x, pca_target_dim)
 
@@ -316,39 +482,9 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
         # Apply edge dropout if enabled (shared across views)
         adj_t_input = data.adj_t
-        if args is not None and hasattr(args, 'edge_dropout_enabled') and args.edge_dropout_enabled and hasattr(args, 'edge_dropout_rate'):
+        if edge_dropout_active:
             verbose_dropout = getattr(args, 'verbose_edge_dropout', False) and rank == 0
             adj_t_input = edge_dropout_sparse_tensor(data.adj_t, args.edge_dropout_rate, training=model.training, verbose=verbose_dropout)
-
-        # Helper: forward pass for a given base feature tensor
-        def _forward_with_features(features):
-            # Apply different projection strategies
-            # Priority: Dynamic Encoder > FUG embeddings > identity projection > standard projection > raw features
-            if hasattr(data, 'uses_dynamic_encoder') and data.uses_dynamic_encoder:
-                x_input = features
-            elif hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
-                x_input = projector(features)
-            elif hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
-                x_input = identity_projection(features)
-            elif hasattr(data, 'needs_projection') and data.needs_projection and projector is not None:
-                projected_features = projector(features)
-                if hasattr(data, 'needs_final_pca') and data.needs_final_pca:
-                    x_input = apply_final_pca(projected_features, projected_features.size(1))
-                else:
-                    x_input = projected_features
-            else:
-                x_input = features
-
-            # Apply feature dropout AFTER projection
-            x_input = apply_feature_dropout_if_enabled(x_input, args, rank, training=model.training)
-
-            # GNN forward pass
-            if hasattr(data, 'use_gradient_checkpointing') and data.use_gradient_checkpointing:
-                h = torch.utils.checkpoint.checkpoint(model, x_input, adj_t_input)
-            else:
-                h = model(x_input, adj_t_input)
-
-            return h, x_input
 
         if use_train_tta and tta_base_features_list is not None:
             view_logits = []
@@ -358,7 +494,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             saved_x_input = None
 
             for view_idx, view_features in enumerate(tta_base_features_list):
-                h, x_input = _forward_with_features(view_features)
+                h, x_input = _forward_with_features(view_features, adj_t_input)
                 context_h = h[data.context_sample]
                 target_h = h[train_perm_idx]
 
@@ -389,7 +525,11 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
             class_h = saved_class_h
             x_input = saved_x_input
         else:
-            h, x_input = _forward_with_features(base_features)
+            if use_static_embedding_cache:
+                h = static_cached_h
+                x_input = static_cached_x_input
+            else:
+                h, x_input = _forward_with_features(base_features, adj_t_input)
 
         # Extract DE loss if model has Dynamic Encoder
         de_loss = torch.tensor(0.0, device=device)
@@ -421,11 +561,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
         # This compares Transformer-generated embeddings from original vs augmented features
         contrastive_loss = torch.tensor(0.0, device=score.device)
 
-        if (args is not None and
-            hasattr(args, 'use_contrastive_augmentation_loss') and
-            args.use_contrastive_augmentation_loss and
-            hasattr(data, 'x_pca_original') and data.x_pca_original is not None and
-            hasattr(pred, 'get_target_embeddings')):
+        if contrastive_active:
 
             # Use x_pca_original directly - it's already PCA-projected with correct dimensions
             # Get GNN embeddings from original PCA features
@@ -852,7 +988,8 @@ def train_all(model, data_list, split_idx_list, optimizer, pred, batch_size, deg
                     dropout_rate=augmentation_dropout_rate,
                     use_feature_mixing=augmentation_use_feature_mixing,
                     mix_ratio=augmentation_mix_ratio,
-                    mix_alpha=augmentation_mix_alpha
+                    mix_alpha=augmentation_mix_alpha,
+                    max_hidden_dim=getattr(args, 'augmentation_max_dim', None)
                 )
 
                 # DEBUG: Check augmented features (first graph of first copy only)
@@ -1408,7 +1545,8 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 activation_pool=None,   # Use default diverse pool
                 seed=seed,
                 verbose=False,
-                rank=rank
+                rank=rank,
+                max_hidden_dim=getattr(args, 'augmentation_max_dim', None)
             )
 
             # Step 3: Apply PCA to augmented features

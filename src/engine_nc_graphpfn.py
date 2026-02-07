@@ -27,6 +27,15 @@ from .data_utils import select_k_shot_context
 from .graphpfn.decomposition import create_decomposer
 
 
+def _graphpfn_debug_enabled(args=None, graphpfn_predictor=None):
+    """Return whether GraphPFN debug checks/logs should be printed."""
+    if args is not None and hasattr(args, 'graphpfn_debug_norm'):
+        return bool(args.graphpfn_debug_norm)
+    if graphpfn_predictor is not None and hasattr(graphpfn_predictor, 'config'):
+        return bool(getattr(graphpfn_predictor.config, 'debug_norm', False))
+    return False
+
+
 def graphpfn_forward_with_decomposition_training(
     graphpfn_predictor,
     gnn_embeddings,
@@ -208,6 +217,7 @@ def graphpfn_forward_with_decomposition(
         return probs
 
     # Decomposition path (num_classes > 10)
+    debug_enabled = _graphpfn_debug_enabled(graphpfn_predictor=graphpfn_predictor)
     import time
     decomp_start = time.time()
 
@@ -250,20 +260,21 @@ def graphpfn_forward_with_decomposition(
     # Aggregate predictions from all sub-problems
     final_probs = decomposer.aggregate_predictions(sub_probabilities)
 
-    decomp_time = time.time() - decomp_start
-    print(f"  [Decomposition] {num_classes} classes → {num_subproblems} sub-problems, time: {decomp_time:.3f}s")
+    if debug_enabled:
+        decomp_time = time.time() - decomp_start
+        print(f"  [Decomposition] {num_classes} classes → {num_subproblems} sub-problems, time: {decomp_time:.3f}s")
 
-    # CORRUPTION CHECK 7: Validate decomposition output shape
-    N_query = (~context_mask).sum().item()
-    expected_shape = (N_query, num_classes)
-    if final_probs.shape != expected_shape:
-        print(f"[CORRUPTION] Decomposition output shape mismatch! Got {final_probs.shape}, expected {expected_shape}")
+        # CORRUPTION CHECK 7: Validate decomposition output shape
+        N_query = (~context_mask).sum().item()
+        expected_shape = (N_query, num_classes)
+        if final_probs.shape != expected_shape:
+            print(f"[CORRUPTION] Decomposition output shape mismatch! Got {final_probs.shape}, expected {expected_shape}")
 
-    # CORRUPTION CHECK 8: Check if aggregation is reasonable
-    # Each query node should have probabilities summing to 1.0
-    prob_sums = final_probs.sum(dim=-1)
-    if not torch.allclose(prob_sums, torch.ones_like(prob_sums), atol=1e-5):
-        print(f"[CORRUPTION] Aggregated probabilities don't sum to 1! Range: [{prob_sums.min().item():.6f}, {prob_sums.max().item():.6f}]")
+        # CORRUPTION CHECK 8: Check if aggregation is reasonable
+        # Each query node should have probabilities summing to 1.0
+        prob_sums = final_probs.sum(dim=-1)
+        if not torch.allclose(prob_sums, torch.ones_like(prob_sums), atol=1e-5):
+            print(f"[CORRUPTION] Aggregated probabilities don't sum to 1! Range: [{prob_sums.min().item():.6f}, {prob_sums.max().item():.6f}]")
 
     return final_probs
 
@@ -349,16 +360,17 @@ def train_graphpfn(model, data, train_idx, optimizer, graphpfn_predictor, batch_
 
     # Get number of classes from data
     num_classes = int(data.y.max().item()) + 1
+    debug_enabled = _graphpfn_debug_enabled(args=args, graphpfn_predictor=graphpfn_predictor)
 
     # Create decomposer if needed (for >10 classes)
     device = data.x.device if hasattr(data.x, 'device') else 'cpu'
     decomposer = create_decomposer(num_classes, max_classes_per_subproblem=graphpfn_predictor.n_out, device=str(device))
-    if decomposer is not None and rank == 0:
-        print(f"[GraphPFN] Using output space decomposition: {num_classes} classes → "
-              f"{decomposer.config.num_subproblems} sub-problems")
-    elif num_classes > graphpfn_predictor.n_out:
+    if decomposer is None and num_classes > graphpfn_predictor.n_out:
         raise ValueError(f"Dataset has {num_classes} classes but GraphPFN only supports {graphpfn_predictor.n_out}. "
                         f"Decomposition failed to initialize!")
+    if decomposer is not None and rank == 0 and debug_enabled:
+        print(f"[GraphPFN] Using output space decomposition: {num_classes} classes → "
+              f"{decomposer.config.num_subproblems} sub-problems")
 
     # Use distributed sampler for DDP
     if dist.is_initialized():
@@ -370,7 +382,7 @@ def train_graphpfn(model, data, train_idx, optimizer, graphpfn_predictor, batch_
         dataloader = DataLoader(range(train_idx.size(0)), batch_size, shuffle=True)
 
     # Print dataset statistics for decomposition training
-    if rank == 0 and decomposer is not None:
+    if rank == 0 and decomposer is not None and debug_enabled:
         print(f"[Decomposition Training] {num_classes} classes → {decomposer.config.num_subproblems} sub-problems, "
               f"{train_idx.size(0)} training nodes, {len(dataloader)} batches")
 
@@ -526,19 +538,21 @@ def test_graphpfn(model, graphpfn_predictor, data, train_idx, valid_idx, test_id
 
     # Get number of classes
     num_classes = int(data.y.max().item()) + 1
+    debug_enabled = _graphpfn_debug_enabled(args=args, graphpfn_predictor=graphpfn_predictor)
 
     # DEBUG: Check if context_sample exists
     if not hasattr(data, 'context_sample'):
         dataset_name = getattr(data, 'name', 'unknown')
-        print(f"[DEBUG] ERROR: Dataset {dataset_name} has no context_sample!")
-        print(f"[DEBUG] Dataset has {data.num_nodes} nodes, {num_classes} classes")
-        print(f"[DEBUG] train_idx size: {len(train_idx)}, valid_idx size: {len(valid_idx)}, test_idx size: {len(test_idx)}")
+        if debug_enabled:
+            print(f"[DEBUG] ERROR: Dataset {dataset_name} has no context_sample!")
+            print(f"[DEBUG] Dataset has {data.num_nodes} nodes, {num_classes} classes")
+            print(f"[DEBUG] train_idx size: {len(train_idx)}, valid_idx size: {len(valid_idx)}, test_idx size: {len(test_idx)}")
         raise AttributeError(f"Dataset {dataset_name} missing context_sample - must be set before evaluation!")
 
     # Create decomposer if needed (for >10 classes)
     device = data.x.device if hasattr(data.x, 'device') else 'cpu'
     decomposer = create_decomposer(num_classes, max_classes_per_subproblem=graphpfn_predictor.n_out, device=str(device))
-    if decomposer is not None and rank == 0:
+    if decomposer is not None and rank == 0 and debug_enabled:
         print(f"[GraphPFN Eval] Using output space decomposition: {num_classes} classes → "
               f"{decomposer.config.num_subproblems} sub-problems")
 
@@ -550,7 +564,7 @@ def test_graphpfn(model, graphpfn_predictor, data, train_idx, valid_idx, test_id
     labels = data.y.squeeze()
 
     # DEBUG: Print context info (after labels is defined)
-    if rank == 0:
+    if rank == 0 and debug_enabled:
         dataset_name = getattr(data, 'name', 'unknown')
         print(f"[DEBUG] {dataset_name}: context_sample size = {len(data.context_sample)}, "
               f"num_classes = {num_classes}, total_nodes = {data.num_nodes}")
@@ -665,7 +679,7 @@ def test_graphpfn(model, graphpfn_predictor, data, train_idx, valid_idx, test_id
     pred_labels = all_logits.argmax(dim=-1)
 
     # DEBUG: Check prediction distribution
-    if rank == 0:
+    if rank == 0 and debug_enabled:
         dataset_name = getattr(data, 'name', 'unknown')
         print(f"[DEBUG] {dataset_name} prediction distribution:")
         for c in range(num_classes):

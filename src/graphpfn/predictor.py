@@ -226,7 +226,11 @@ class GraphPFNPredictor(nn.Module):
             mean = gnn_embeddings.mean(dim=0, keepdim=True)
             std = gnn_embeddings.std(dim=0, keepdim=True)
             gnn_embeddings = (gnn_embeddings - mean) / (std + 1e-9)
-            print(f"[DEBUG NORM] After normalization: shape={gnn_embeddings.shape}, norm={gnn_embeddings.norm().item():.2f}")
+            if self.config.debug_norm:
+                print(
+                    f"[DEBUG NORM] After normalization: "
+                    f"shape={gnn_embeddings.shape}, norm={gnn_embeddings.norm().item():.2f}"
+                )
 
         # Pad GNN embeddings to be divisible by features_per_group (like TabPFN)
         # This is done DYNAMICALLY based on actual input dimension

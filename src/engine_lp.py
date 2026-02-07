@@ -247,6 +247,10 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         gate_count = 0
         calib_sum = 0.0
         calib_count = 0
+        hybrid_w_std_sum = 0.0
+        hybrid_w_mplp_sum = 0.0
+        hybrid_w_ncn_sum = 0.0
+        hybrid_w_count = 0
         struct_sum = 0.0
         struct_sumsq = 0.0
         struct_count = 0
@@ -338,7 +342,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                     continue
 
                 # Use unified PFNPredictorNodeCls for link prediction
-                if head_type == 'mplp':
+                if head_type in ('mplp', 'hybrid3'):
                     scores, link_prototypes = predictor(
                         data_for_gnn,
                         context_edge_embeds,
@@ -351,7 +355,7 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                         node_emb=node_embeddings,
                         lp_context_edges=context_edge_pairs.t()
                     )
-                    if getattr(predictor, 'lp_head', None) is not None:
+                    if head_type == 'mplp' and getattr(predictor, 'lp_head', None) is not None:
                         gate_val = getattr(predictor.lp_head, 'last_gate_mean', None)
                         if gate_val is not None:
                             gate_sum += float(gate_val.item())
@@ -360,6 +364,13 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                         if calib_val is not None:
                             calib_sum += float(calib_val)
                             calib_count += 1
+                    elif head_type == 'hybrid3' and getattr(predictor, 'lp_head', None) is not None:
+                        fusion_w = getattr(predictor.lp_head, 'last_fusion_weights', None)
+                        if fusion_w is not None and fusion_w.numel() >= 3:
+                            hybrid_w_std_sum += float(fusion_w[0].item())
+                            hybrid_w_mplp_sum += float(fusion_w[1].item())
+                            hybrid_w_ncn_sum += float(fusion_w[2].item())
+                            hybrid_w_count += 1
                 elif head_type == 'ncn':
                     scores, link_prototypes = predictor(
                         data_for_gnn,
@@ -493,6 +504,14 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 predictor.lp_head.last_struct_loss_train = struct_loss_sum / struct_loss_count
             else:
                 predictor.lp_head.last_struct_loss_train = None
+            if hybrid_w_count > 0:
+                predictor.lp_head.last_hybrid_w_std_train = hybrid_w_std_sum / hybrid_w_count
+                predictor.lp_head.last_hybrid_w_mplp_train = hybrid_w_mplp_sum / hybrid_w_count
+                predictor.lp_head.last_hybrid_w_ncn_train = hybrid_w_ncn_sum / hybrid_w_count
+            else:
+                predictor.lp_head.last_hybrid_w_std_train = None
+                predictor.lp_head.last_hybrid_w_mplp_train = None
+                predictor.lp_head.last_hybrid_w_ncn_train = None
             if struct_count > 0:
                 mean = struct_sum / struct_count
                 var = max(struct_sumsq / struct_count - mean * mean, 0.0)
@@ -718,6 +737,16 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         calib_sum = 0.0
         calib_count = 0
         gate_values = []
+        hybrid_w_std_sum = 0.0
+        hybrid_w_mplp_sum = 0.0
+        hybrid_w_ncn_sum = 0.0
+        hybrid_w_count = 0
+        hybrid_std_pos_scores = []
+        hybrid_std_neg_scores = []
+        hybrid_mplp_pos_scores = []
+        hybrid_mplp_neg_scores = []
+        hybrid_ncn_pos_scores = []
+        hybrid_ncn_neg_scores = []
         struct_pos_scores = []
         struct_neg_scores = []
         feat_pos_scores = []
@@ -747,7 +776,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                     cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
 
                 # Use the unified predictor for link prediction
-                if head_type == 'mplp':
+                if head_type in ('mplp', 'hybrid3'):
                     pred_output = predictor(
                         data,
                         context_edge_embeds,
@@ -760,7 +789,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                         node_emb=node_embeddings,
                         lp_context_edges=context_edge_pairs.t()
                     )
-                    if getattr(predictor, 'lp_head', None) is not None:
+                    if head_type == 'mplp' and getattr(predictor, 'lp_head', None) is not None:
                         gate_val = getattr(predictor.lp_head, 'last_gate_mean', None)
                         gate_weight = getattr(predictor.lp_head, 'last_gate_value', None)
                         if gate_val is not None:
@@ -794,6 +823,22 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                         if gate_weight is not None and struct_scores is not None:
                             gate_struct_abs_sum += (struct_scores.abs() * gate_weight.abs()).sum().item()
                             gate_struct_abs_count += struct_scores.numel()
+                    elif head_type == 'hybrid3' and getattr(predictor, 'lp_head', None) is not None:
+                        fusion_w = getattr(predictor.lp_head, 'last_fusion_weights', None)
+                        if fusion_w is not None and fusion_w.numel() >= 3:
+                            hybrid_w_std_sum += float(fusion_w[0].item())
+                            hybrid_w_mplp_sum += float(fusion_w[1].item())
+                            hybrid_w_ncn_sum += float(fusion_w[2].item())
+                            hybrid_w_count += 1
+                        std_scores = getattr(predictor.lp_head, 'last_std_score', None)
+                        mplp_scores = getattr(predictor.lp_head, 'last_mplp_struct_score', None)
+                        ncn_scores = getattr(predictor.lp_head, 'last_ncn_score', None)
+                        if std_scores is not None:
+                            hybrid_std_pos_scores.append(std_scores.detach().cpu())
+                        if mplp_scores is not None:
+                            hybrid_mplp_pos_scores.append(mplp_scores.detach().cpu())
+                        if ncn_scores is not None:
+                            hybrid_ncn_pos_scores.append(ncn_scores.detach().cpu())
                 elif head_type == 'ncn':
                     pred_output = predictor(
                         data,
@@ -842,7 +887,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                     cn_target = _common_neighbor_count(adj_for_lp, batch_edges)
 
                 # Use the unified predictor for link prediction
-                if head_type == 'mplp':
+                if head_type in ('mplp', 'hybrid3'):
                     pred_output = predictor(
                         data,
                         context_edge_embeds,
@@ -855,7 +900,7 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                         node_emb=node_embeddings,
                         lp_context_edges=context_edge_pairs.t()
                     )
-                    if getattr(predictor, 'lp_head', None) is not None:
+                    if head_type == 'mplp' and getattr(predictor, 'lp_head', None) is not None:
                         gate_val = getattr(predictor.lp_head, 'last_gate_mean', None)
                         gate_weight = getattr(predictor.lp_head, 'last_gate_value', None)
                         if gate_val is not None:
@@ -889,6 +934,22 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                         if gate_weight is not None and struct_scores is not None:
                             gate_struct_abs_sum += (struct_scores.abs() * gate_weight.abs()).sum().item()
                             gate_struct_abs_count += struct_scores.numel()
+                    elif head_type == 'hybrid3' and getattr(predictor, 'lp_head', None) is not None:
+                        fusion_w = getattr(predictor.lp_head, 'last_fusion_weights', None)
+                        if fusion_w is not None and fusion_w.numel() >= 3:
+                            hybrid_w_std_sum += float(fusion_w[0].item())
+                            hybrid_w_mplp_sum += float(fusion_w[1].item())
+                            hybrid_w_ncn_sum += float(fusion_w[2].item())
+                            hybrid_w_count += 1
+                        std_scores = getattr(predictor.lp_head, 'last_std_score', None)
+                        mplp_scores = getattr(predictor.lp_head, 'last_mplp_struct_score', None)
+                        ncn_scores = getattr(predictor.lp_head, 'last_ncn_score', None)
+                        if std_scores is not None:
+                            hybrid_std_neg_scores.append(std_scores.detach().cpu())
+                        if mplp_scores is not None:
+                            hybrid_mplp_neg_scores.append(mplp_scores.detach().cpu())
+                        if ncn_scores is not None:
+                            hybrid_ncn_neg_scores.append(ncn_scores.detach().cpu())
                 elif head_type == 'ncn':
                     pred_output = predictor(
                         data,
@@ -998,6 +1059,38 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                 pass
             if dataset_name == 'ogbl-citation2':
                 feat_results['mrr'] = compute_mrr_citation2(feat_pos_scores, feat_neg_scores)
+
+        def _compute_branch_results(pos_list, neg_list):
+            branch_results = {}
+            if not (_has_scores(pos_list) and _has_scores(neg_list)):
+                return branch_results
+            pos_scores_branch = pos_list if isinstance(pos_list, torch.Tensor) else torch.cat(pos_list, dim=0)
+            neg_scores_branch = neg_list if isinstance(neg_list, torch.Tensor) else torch.cat(neg_list, dim=0)
+            for k in k_values:
+                evaluator.K = k
+                hits_k = evaluator.eval({
+                    'y_pred_pos': pos_scores_branch.cpu(),
+                    'y_pred_neg': neg_scores_branch.cpu(),
+                })[f'hits@{k}']
+                branch_results[f'hits@{k}'] = hits_k
+            try:
+                from sklearn.metrics import roc_auc_score, accuracy_score
+                pos_labels = torch.ones(pos_scores_branch.size(0))
+                neg_labels = torch.zeros(neg_scores_branch.size(0))
+                all_labels = torch.cat([pos_labels, neg_labels]).cpu().numpy()
+                all_scores = torch.cat([pos_scores_branch, neg_scores_branch])
+                all_probs = torch.sigmoid(all_scores).cpu().numpy()
+                branch_results['auc'] = roc_auc_score(all_labels, all_probs)
+                branch_results['acc'] = accuracy_score(all_labels, (all_probs > 0.5).astype(int))
+            except Exception:
+                pass
+            if dataset_name == 'ogbl-citation2':
+                branch_results['mrr'] = compute_mrr_citation2(pos_scores_branch, neg_scores_branch)
+            return branch_results
+
+        hybrid_std_results = _compute_branch_results(hybrid_std_pos_scores, hybrid_std_neg_scores)
+        hybrid_mplp_results = _compute_branch_results(hybrid_mplp_pos_scores, hybrid_mplp_neg_scores)
+        hybrid_ncn_results = _compute_branch_results(hybrid_ncn_pos_scores, hybrid_ncn_neg_scores)
         
         results = {}
         for k in k_values:
@@ -1159,6 +1252,36 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             results['mplp_gate_struct_abs_ratio'] = results['mplp_gate_abs_struct_mean'] / (results['mplp_feat_abs_mean'] + 1e-8)
         else:
             results['mplp_gate_struct_abs_ratio'] = None
+
+        if hybrid_w_count > 0:
+            results['hybrid3_w_std'] = hybrid_w_std_sum / hybrid_w_count
+            results['hybrid3_w_mplp'] = hybrid_w_mplp_sum / hybrid_w_count
+            results['hybrid3_w_ncn'] = hybrid_w_ncn_sum / hybrid_w_count
+        else:
+            results['hybrid3_w_std'] = None
+            results['hybrid3_w_mplp'] = None
+            results['hybrid3_w_ncn'] = None
+
+        def _select_default_metric(branch_results):
+            if not branch_results:
+                return None, None
+            if evaluation_metric in branch_results:
+                return branch_results[evaluation_metric], evaluation_metric
+            if default_metric in branch_results:
+                return branch_results[default_metric], default_metric
+            if 'hits@100' in branch_results:
+                return branch_results['hits@100'], 'hits@100'
+            return None, None
+
+        hybrid_std_metric, hybrid_std_metric_name = _select_default_metric(hybrid_std_results)
+        hybrid_mplp_metric, hybrid_mplp_metric_name = _select_default_metric(hybrid_mplp_results)
+        hybrid_ncn_metric, hybrid_ncn_metric_name = _select_default_metric(hybrid_ncn_results)
+        results['hybrid3_std_only_metric'] = hybrid_std_metric
+        results['hybrid3_std_only_metric_name'] = hybrid_std_metric_name
+        results['hybrid3_mplp_only_metric'] = hybrid_mplp_metric
+        results['hybrid3_mplp_only_metric_name'] = hybrid_mplp_metric_name
+        results['hybrid3_ncn_only_metric'] = hybrid_ncn_metric
+        results['hybrid3_ncn_only_metric_name'] = hybrid_ncn_metric_name
 
         # Move persistent tensors back to CPU to free GPU memory
         test_edges['edge_pairs'] = test_edges['edge_pairs'].cpu()

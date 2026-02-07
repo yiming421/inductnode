@@ -349,8 +349,26 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
             data = batch  # batch is actually full data
 
             moved_to_device = False
-            if data.x.device != device:
+
+            # IMPORTANT: check/move SparseTensor adjacency explicitly. Depending on
+            # PyG/torch_sparse versions, Data.to(device) may not reliably move adj_t.
+            adj_device = None
+            if hasattr(data, 'adj_t') and data.adj_t is not None:
+                adj_device = getattr(data.adj_t, 'device', None)
+                if callable(adj_device):
+                    adj_device = adj_device()
+
+            needs_move = (
+                data.x.device != device or
+                (hasattr(data, 'y') and data.y is not None and data.y.device != device) or
+                (adj_device is not None and adj_device != device) or
+                (hasattr(data, 'context_sample') and data.context_sample is not None and data.context_sample.device != device)
+            )
+
+            if needs_move:
                 data = data.to(device)
+                if hasattr(data, 'adj_t') and data.adj_t is not None:
+                    data.adj_t = data.adj_t.to(device)
                 split_idx = {k: v.to(device) for k, v in split_idx.items()}
                 if hasattr(data, 'context_sample') and data.context_sample is not None:
                     data.context_sample = data.context_sample.to(device)
@@ -407,6 +425,8 @@ def compute_nc_loss_with_loader(data_loader, split_idx, model, predictor, args, 
             # Move data back to CPU to release GPU memory between datasets
             if moved_to_device:
                 data = data.cpu()
+                if hasattr(data, 'adj_t') and data.adj_t is not None:
+                    data.adj_t = data.adj_t.cpu()
                 split_idx = {k: v.cpu() for k, v in split_idx.items()}
                 if hasattr(data, 'context_sample') and data.context_sample is not None:
                     data.context_sample = data.context_sample.cpu()

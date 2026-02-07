@@ -1041,6 +1041,7 @@ def create_unified_model(args, input_dim, device):
             feature_positional_embedding=feature_pos_emb,
             seed=args.graphpfn_seed,
             normalize_x=args.graphpfn_normalize_x,
+            debug_norm=args.graphpfn_debug_norm,
             n_out=10,  # Fixed for foundational model (TabPFN default)
             fourier_feature_scale=args.graphpfn_fourier_scale,
         )
@@ -1788,6 +1789,10 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
     lp_gate_count = 0
     lp_gate_calib_sum = 0.0
     lp_gate_calib_count = 0
+    lp_hybrid_w_std_sum = 0.0
+    lp_hybrid_w_mplp_sum = 0.0
+    lp_hybrid_w_ncn_sum = 0.0
+    lp_hybrid_w_count = 0
     lp_struct_loss_sum = 0.0
     lp_struct_loss_count = 0
     # Initialize loss breakdown variables
@@ -1919,7 +1924,8 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                         dropout_rate=augmentation_dropout_rate,
                         use_feature_mixing=augmentation_use_feature_mixing,
                         mix_ratio=augmentation_mix_ratio,
-                        mix_alpha=augmentation_mix_alpha
+                        mix_alpha=augmentation_mix_alpha,
+                        max_hidden_dim=getattr(args, 'augmentation_max_dim', None)
                     )
 
                     # Apply process_data to do PCA/padding
@@ -1938,6 +1944,23 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                         args.use_dynamic_encoder, False, args.use_orthogonal_noise,
                         args=args, is_augmented_data=True
                     )
+
+                    # Keep loaders consistent: move augmented tensors + split indices back to CPU
+                    # (PCA ran on GPU above when requested)
+                    if device.type == 'cuda':
+                        if hasattr(data_aug, 'x'):
+                            data_aug.x = data_aug.x.cpu()
+                        if hasattr(data_aug, 'x_pca'):
+                            data_aug.x_pca = data_aug.x_pca.cpu()
+                        if hasattr(data_aug, 'x_original'):
+                            data_aug.x_original = data_aug.x_original.cpu()
+                        if hasattr(data_aug, 'context_sample'):
+                            data_aug.context_sample = data_aug.context_sample.cpu()
+                        if hasattr(data_aug, 'y'):
+                            data_aug.y = data_aug.y.cpu()
+                        split_idx['train'] = split_idx['train'].cpu()
+                        split_idx['valid'] = split_idx['valid'].cpu()
+                        split_idx['test'] = split_idx['test'].cpu()
 
                     # Attach original data's x_pca_original to augmented data for contrastive loss
                     if hasattr(data, 'x_pca_original') and data.x_pca_original is not None:
@@ -2136,6 +2159,14 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                         if calib_val is not None:
                             lp_gate_calib_sum += float(calib_val)
                             lp_gate_calib_count += 1
+                        hybrid_w_std = getattr(getattr(predictor, 'lp_head', None), 'last_hybrid_w_std_train', None)
+                        hybrid_w_mplp = getattr(getattr(predictor, 'lp_head', None), 'last_hybrid_w_mplp_train', None)
+                        hybrid_w_ncn = getattr(getattr(predictor, 'lp_head', None), 'last_hybrid_w_ncn_train', None)
+                        if hybrid_w_std is not None and hybrid_w_mplp is not None and hybrid_w_ncn is not None:
+                            lp_hybrid_w_std_sum += float(hybrid_w_std)
+                            lp_hybrid_w_mplp_sum += float(hybrid_w_mplp)
+                            lp_hybrid_w_ncn_sum += float(hybrid_w_ncn)
+                            lp_hybrid_w_count += 1
                         struct_loss_val = getattr(getattr(predictor, 'lp_head', None), 'last_struct_loss_train', None)
                         if struct_loss_val is not None:
                             lp_struct_loss_sum += float(struct_loss_val)
@@ -2323,6 +2354,9 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
         'nc_dataset_losses': nc_dataset_losses if 'nc_dataset_losses' in locals() else {},
         'lp_gate_mean_train': (lp_gate_sum / lp_gate_count) if lp_gate_count > 0 else None,
         'lp_gate_calib_ms_train': (lp_gate_calib_sum / lp_gate_calib_count) if lp_gate_calib_count > 0 else None,
+        'lp_hybrid_w_std_train': (lp_hybrid_w_std_sum / lp_hybrid_w_count) if lp_hybrid_w_count > 0 else None,
+        'lp_hybrid_w_mplp_train': (lp_hybrid_w_mplp_sum / lp_hybrid_w_count) if lp_hybrid_w_count > 0 else None,
+        'lp_hybrid_w_ncn_train': (lp_hybrid_w_ncn_sum / lp_hybrid_w_count) if lp_hybrid_w_count > 0 else None,
         'lp_struct_only_loss_train': (lp_struct_loss_sum / lp_struct_loss_count) if lp_struct_loss_count > 0 else None,
         'lp_struct_score_mean_train': getattr(getattr(predictor, 'lp_head', None), 'last_struct_score_mean_train', None),
         'lp_struct_score_std_train': getattr(getattr(predictor, 'lp_head', None), 'last_struct_score_std_train', None),
@@ -2585,9 +2619,21 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
             lp_gate_ratio_values = []
             lp_feat_abs_values = []
             lp_gate_abs_struct_values = []
+            lp_hybrid_w_std_values = []
+            lp_hybrid_w_mplp_values = []
+            lp_hybrid_w_ncn_values = []
+            lp_hybrid_std_perf_values = []
+            lp_hybrid_mplp_perf_values = []
+            lp_hybrid_ncn_perf_values = []
             lp_gate_by_dataset = {}
             lp_struct_by_dataset = {}
             lp_feat_by_dataset = {}
+            lp_hybrid_w_std_by_dataset = {}
+            lp_hybrid_w_mplp_by_dataset = {}
+            lp_hybrid_w_ncn_by_dataset = {}
+            lp_hybrid_std_perf_by_dataset = {}
+            lp_hybrid_mplp_perf_by_dataset = {}
+            lp_hybrid_ncn_perf_by_dataset = {}
             
             for i, (data, split_idx) in enumerate(zip(lp_data_list, lp_split_idx_list)):
                 link_data_all = lp_link_data_all[i]
@@ -2623,12 +2669,20 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                 lp_results.get('mplp_gate_struct_abs_ratio', None),
                                 lp_results.get('mplp_feat_abs_mean', None),
                                 lp_results.get('mplp_gate_abs_struct_mean', None),
-                                lp_results.get('mplp_struct_only_metric', None)
+                                lp_results.get('mplp_struct_only_metric', None),
+                                lp_results.get('hybrid3_w_std', None),
+                                lp_results.get('hybrid3_w_mplp', None),
+                                lp_results.get('hybrid3_w_ncn', None),
+                                lp_results.get('hybrid3_std_only_metric', None),
+                                lp_results.get('hybrid3_mplp_only_metric', None),
+                                lp_results.get('hybrid3_ncn_only_metric', None)
                             )
 
                         if num_context_samples == 1:
                             (lp_metric_value, lp_gate_value, lp_gate_calib, lp_feat_value, lp_gate_ratio,
-                             lp_feat_abs_mean, lp_gate_abs_struct_mean, lp_struct_value) = _eval_with_context(context_data)
+                             lp_feat_abs_mean, lp_gate_abs_struct_mean, lp_struct_value,
+                             lp_hybrid_w_std, lp_hybrid_w_mplp, lp_hybrid_w_ncn,
+                             lp_hybrid_std_perf, lp_hybrid_mplp_perf, lp_hybrid_ncn_perf) = _eval_with_context(context_data)
                         else:
                             context_source = link_data_all.get('train', None)
                             context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
@@ -2641,6 +2695,12 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                             sample_feat_abs = []
                             sample_gate_abs_struct = []
                             sample_calib = []
+                            sample_hybrid_w_std = []
+                            sample_hybrid_w_mplp = []
+                            sample_hybrid_w_ncn = []
+                            sample_hybrid_std_perf = []
+                            sample_hybrid_mplp_perf = []
+                            sample_hybrid_ncn_perf = []
                             for sample_idx in range(num_context_samples):
                                 torch.manual_seed(base_seed + i * 1000 + sample_idx)
                                 if context_source is not None and context_source['edge_pairs'].size(0) > 0:
@@ -2651,7 +2711,9 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                     context_data_sample = context_data
 
                                 (metric_val, gate_val, calib_val, feat_val, gate_ratio_val,
-                                 feat_abs_val, gate_abs_struct_val, struct_val) = _eval_with_context(context_data_sample)
+                                 feat_abs_val, gate_abs_struct_val, struct_val,
+                                 hybrid_w_std_val, hybrid_w_mplp_val, hybrid_w_ncn_val,
+                                 hybrid_std_perf_val, hybrid_mplp_perf_val, hybrid_ncn_perf_val) = _eval_with_context(context_data_sample)
                                 sample_metrics.append(metric_val)
                                 if gate_val is not None:
                                     sample_gates.append(gate_val)
@@ -2667,6 +2729,18 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                     sample_gate_abs_struct.append(gate_abs_struct_val)
                                 if struct_val is not None:
                                     sample_struct.append(struct_val)
+                                if hybrid_w_std_val is not None:
+                                    sample_hybrid_w_std.append(hybrid_w_std_val)
+                                if hybrid_w_mplp_val is not None:
+                                    sample_hybrid_w_mplp.append(hybrid_w_mplp_val)
+                                if hybrid_w_ncn_val is not None:
+                                    sample_hybrid_w_ncn.append(hybrid_w_ncn_val)
+                                if hybrid_std_perf_val is not None:
+                                    sample_hybrid_std_perf.append(hybrid_std_perf_val)
+                                if hybrid_mplp_perf_val is not None:
+                                    sample_hybrid_mplp_perf.append(hybrid_mplp_perf_val)
+                                if hybrid_ncn_perf_val is not None:
+                                    sample_hybrid_ncn_perf.append(hybrid_ncn_perf_val)
 
                             lp_metric_value = sum(sample_metrics) / len(sample_metrics) if sample_metrics else 0.0
                             lp_gate_value = (sum(sample_gates) / len(sample_gates)) if sample_gates else None
@@ -2676,6 +2750,12 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                             lp_feat_abs_mean = (sum(sample_feat_abs) / len(sample_feat_abs)) if sample_feat_abs else None
                             lp_gate_abs_struct_mean = (sum(sample_gate_abs_struct) / len(sample_gate_abs_struct)) if sample_gate_abs_struct else None
                             lp_struct_value = (sum(sample_struct) / len(sample_struct)) if sample_struct else None
+                            lp_hybrid_w_std = (sum(sample_hybrid_w_std) / len(sample_hybrid_w_std)) if sample_hybrid_w_std else None
+                            lp_hybrid_w_mplp = (sum(sample_hybrid_w_mplp) / len(sample_hybrid_w_mplp)) if sample_hybrid_w_mplp else None
+                            lp_hybrid_w_ncn = (sum(sample_hybrid_w_ncn) / len(sample_hybrid_w_ncn)) if sample_hybrid_w_ncn else None
+                            lp_hybrid_std_perf = (sum(sample_hybrid_std_perf) / len(sample_hybrid_std_perf)) if sample_hybrid_std_perf else None
+                            lp_hybrid_mplp_perf = (sum(sample_hybrid_mplp_perf) / len(sample_hybrid_mplp_perf)) if sample_hybrid_mplp_perf else None
+                            lp_hybrid_ncn_perf = (sum(sample_hybrid_ncn_perf) / len(sample_hybrid_ncn_perf)) if sample_hybrid_ncn_perf else None
                         
                         # Move all data back to CPU to free GPU memory
                         data.x = data.x.cpu()
@@ -2702,9 +2782,21 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     lp_feat_values.append(lp_feat_value)
                     lp_feat_abs_values.append(lp_feat_abs_mean)
                     lp_gate_abs_struct_values.append(lp_gate_abs_struct_mean)
+                    lp_hybrid_w_std_values.append(lp_hybrid_w_std)
+                    lp_hybrid_w_mplp_values.append(lp_hybrid_w_mplp)
+                    lp_hybrid_w_ncn_values.append(lp_hybrid_w_ncn)
+                    lp_hybrid_std_perf_values.append(lp_hybrid_std_perf)
+                    lp_hybrid_mplp_perf_values.append(lp_hybrid_mplp_perf)
+                    lp_hybrid_ncn_perf_values.append(lp_hybrid_ncn_perf)
                     lp_gate_by_dataset[dataset_name] = lp_gate_value
                     lp_struct_by_dataset[dataset_name] = lp_struct_value
                     lp_feat_by_dataset[dataset_name] = lp_feat_value
+                    lp_hybrid_w_std_by_dataset[dataset_name] = lp_hybrid_w_std
+                    lp_hybrid_w_mplp_by_dataset[dataset_name] = lp_hybrid_w_mplp
+                    lp_hybrid_w_ncn_by_dataset[dataset_name] = lp_hybrid_w_ncn
+                    lp_hybrid_std_perf_by_dataset[dataset_name] = lp_hybrid_std_perf
+                    lp_hybrid_mplp_perf_by_dataset[dataset_name] = lp_hybrid_mplp_perf
+                    lp_hybrid_ncn_perf_by_dataset[dataset_name] = lp_hybrid_ncn_perf
                 else:
                     lp_results_list.append(0.0)
                     lp_gate_values.append(None)
@@ -2714,6 +2806,12 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     lp_feat_abs_values.append(None)
                     lp_gate_abs_struct_values.append(None)
                     lp_struct_values.append(None)
+                    lp_hybrid_w_std_values.append(None)
+                    lp_hybrid_w_mplp_values.append(None)
+                    lp_hybrid_w_ncn_values.append(None)
+                    lp_hybrid_std_perf_values.append(None)
+                    lp_hybrid_mplp_perf_values.append(None)
+                    lp_hybrid_ncn_perf_values.append(None)
             
             if lp_results_list:
                 avg_result = sum(lp_results_list) / len(lp_results_list)
@@ -2731,6 +2829,18 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                 avg_feat_abs = (sum(feat_abs_values) / len(feat_abs_values)) if feat_abs_values else None
                 gate_abs_struct_values = [v for v in lp_gate_abs_struct_values if v is not None]
                 avg_gate_abs_struct = (sum(gate_abs_struct_values) / len(gate_abs_struct_values)) if gate_abs_struct_values else None
+                hybrid_w_std_values = [v for v in lp_hybrid_w_std_values if v is not None]
+                hybrid_w_mplp_values = [v for v in lp_hybrid_w_mplp_values if v is not None]
+                hybrid_w_ncn_values = [v for v in lp_hybrid_w_ncn_values if v is not None]
+                avg_hybrid_w_std = (sum(hybrid_w_std_values) / len(hybrid_w_std_values)) if hybrid_w_std_values else None
+                avg_hybrid_w_mplp = (sum(hybrid_w_mplp_values) / len(hybrid_w_mplp_values)) if hybrid_w_mplp_values else None
+                avg_hybrid_w_ncn = (sum(hybrid_w_ncn_values) / len(hybrid_w_ncn_values)) if hybrid_w_ncn_values else None
+                hybrid_std_perf_values = [v for v in lp_hybrid_std_perf_values if v is not None]
+                hybrid_mplp_perf_values = [v for v in lp_hybrid_mplp_perf_values if v is not None]
+                hybrid_ncn_perf_values = [v for v in lp_hybrid_ncn_perf_values if v is not None]
+                avg_hybrid_std_perf = (sum(hybrid_std_perf_values) / len(hybrid_std_perf_values)) if hybrid_std_perf_values else None
+                avg_hybrid_mplp_perf = (sum(hybrid_mplp_perf_values) / len(hybrid_mplp_perf_values)) if hybrid_mplp_perf_values else None
+                avg_hybrid_ncn_perf = (sum(hybrid_ncn_perf_values) / len(hybrid_ncn_perf_values)) if hybrid_ncn_perf_values else None
                 results = {
                     'train': avg_result,  # For consistency with NC format
                     'valid': avg_result,
@@ -2752,7 +2862,19 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     'mplp_gate_abs_struct_mean': avg_gate_abs_struct,
                     'individual_gate_abs_struct_mean': lp_gate_abs_struct_values,
                     'mplp_struct_only_metric': avg_struct,
-                    'individual_struct_only_metrics': lp_struct_values
+                    'individual_struct_only_metrics': lp_struct_values,
+                    'hybrid3_w_std': avg_hybrid_w_std,
+                    'hybrid3_w_mplp': avg_hybrid_w_mplp,
+                    'hybrid3_w_ncn': avg_hybrid_w_ncn,
+                    'hybrid3_w_std_by_dataset': lp_hybrid_w_std_by_dataset,
+                    'hybrid3_w_mplp_by_dataset': lp_hybrid_w_mplp_by_dataset,
+                    'hybrid3_w_ncn_by_dataset': lp_hybrid_w_ncn_by_dataset,
+                    'hybrid3_std_only_metric': avg_hybrid_std_perf,
+                    'hybrid3_mplp_only_metric': avg_hybrid_mplp_perf,
+                    'hybrid3_ncn_only_metric': avg_hybrid_ncn_perf,
+                    'hybrid3_std_only_metric_by_dataset': lp_hybrid_std_perf_by_dataset,
+                    'hybrid3_mplp_only_metric_by_dataset': lp_hybrid_mplp_perf_by_dataset,
+                    'hybrid3_ncn_only_metric_by_dataset': lp_hybrid_ncn_perf_by_dataset
                 }
     
     return results
@@ -3645,36 +3767,57 @@ def run_joint_training(args, device='cuda:0'):
             lp_feat_only_unseen = lp_unseen_results.get('mplp_feat_only_metric', None)
             if lp_feat_only_unseen is not None:
                 unseen_metrics['test_unseen/lp_feat_only_metric'] = lp_feat_only_unseen
-            lp_gate_ratio_unseen = lp_unseen_results.get('mplp_gate_struct_abs_ratio', None)
-            if lp_gate_ratio_unseen is not None:
-                unseen_metrics['test_unseen/lp_gate_struct_abs_ratio'] = lp_gate_ratio_unseen
-            lp_feat_abs_unseen = lp_unseen_results.get('mplp_feat_abs_mean', None)
-            if lp_feat_abs_unseen is not None:
-                unseen_metrics['test_unseen/lp_feat_abs_mean'] = lp_feat_abs_unseen
-            lp_gate_abs_struct_unseen = lp_unseen_results.get('mplp_gate_abs_struct_mean', None)
-            if lp_gate_abs_struct_unseen is not None:
-                unseen_metrics['test_unseen/lp_gate_abs_struct_mean'] = lp_gate_abs_struct_unseen
             lp_struct_unseen = lp_unseen_results.get('mplp_struct_only_metric', None)
             if lp_struct_unseen is not None:
                 unseen_metrics['test_unseen/lp_struct_only_metric'] = lp_struct_unseen
-            lp_struct_mean_unseen = lp_unseen_results.get('mplp_struct_score_mean', None)
-            lp_struct_std_unseen = lp_unseen_results.get('mplp_struct_score_std', None)
-            lp_feat_mean_unseen = lp_unseen_results.get('mplp_feat_score_mean', None)
-            lp_feat_std_unseen = lp_unseen_results.get('mplp_feat_score_std', None)
-            lp_std_ratio_unseen = lp_unseen_results.get('mplp_struct_feat_std_ratio', None)
-            lp_mean_ratio_unseen = lp_unseen_results.get('mplp_struct_feat_absmean_ratio', None)
-            if lp_struct_mean_unseen is not None:
-                unseen_metrics['test_unseen/lp_struct_score_mean'] = lp_struct_mean_unseen
-            if lp_struct_std_unseen is not None:
-                unseen_metrics['test_unseen/lp_struct_score_std'] = lp_struct_std_unseen
-            if lp_feat_mean_unseen is not None:
-                unseen_metrics['test_unseen/lp_feat_score_mean'] = lp_feat_mean_unseen
-            if lp_feat_std_unseen is not None:
-                unseen_metrics['test_unseen/lp_feat_score_std'] = lp_feat_std_unseen
-            if lp_std_ratio_unseen is not None:
-                unseen_metrics['test_unseen/lp_struct_feat_std_ratio'] = lp_std_ratio_unseen
-            if lp_mean_ratio_unseen is not None:
-                unseen_metrics['test_unseen/lp_struct_feat_absmean_ratio'] = lp_mean_ratio_unseen
+            lp_hybrid_w_std_unseen = lp_unseen_results.get('hybrid3_w_std', None)
+            lp_hybrid_w_mplp_unseen = lp_unseen_results.get('hybrid3_w_mplp', None)
+            lp_hybrid_w_ncn_unseen = lp_unseen_results.get('hybrid3_w_ncn', None)
+            if lp_hybrid_w_std_unseen is not None:
+                unseen_metrics['weights/test_unseen/lp_hybrid3/w_std'] = lp_hybrid_w_std_unseen
+            if lp_hybrid_w_mplp_unseen is not None:
+                unseen_metrics['weights/test_unseen/lp_hybrid3/w_mplp'] = lp_hybrid_w_mplp_unseen
+            if lp_hybrid_w_ncn_unseen is not None:
+                unseen_metrics['weights/test_unseen/lp_hybrid3/w_ncn'] = lp_hybrid_w_ncn_unseen
+            lp_hybrid_w_std_by_dataset = lp_unseen_results.get('hybrid3_w_std_by_dataset', None)
+            lp_hybrid_w_mplp_by_dataset = lp_unseen_results.get('hybrid3_w_mplp_by_dataset', None)
+            lp_hybrid_w_ncn_by_dataset = lp_unseen_results.get('hybrid3_w_ncn_by_dataset', None)
+            if isinstance(lp_hybrid_w_std_by_dataset, dict):
+                for ds_name, val in lp_hybrid_w_std_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'weights/test_unseen/lp_hybrid3/{ds_name}/w_std'] = val
+            if isinstance(lp_hybrid_w_mplp_by_dataset, dict):
+                for ds_name, val in lp_hybrid_w_mplp_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'weights/test_unseen/lp_hybrid3/{ds_name}/w_mplp'] = val
+            if isinstance(lp_hybrid_w_ncn_by_dataset, dict):
+                for ds_name, val in lp_hybrid_w_ncn_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'weights/test_unseen/lp_hybrid3/{ds_name}/w_ncn'] = val
+            lp_hybrid_std_perf_unseen = lp_unseen_results.get('hybrid3_std_only_metric', None)
+            lp_hybrid_mplp_perf_unseen = lp_unseen_results.get('hybrid3_mplp_only_metric', None)
+            lp_hybrid_ncn_perf_unseen = lp_unseen_results.get('hybrid3_ncn_only_metric', None)
+            if lp_hybrid_std_perf_unseen is not None:
+                unseen_metrics['perf/test_unseen/lp_hybrid3/std_only_metric'] = lp_hybrid_std_perf_unseen
+            if lp_hybrid_mplp_perf_unseen is not None:
+                unseen_metrics['perf/test_unseen/lp_hybrid3/mplp_only_metric'] = lp_hybrid_mplp_perf_unseen
+            if lp_hybrid_ncn_perf_unseen is not None:
+                unseen_metrics['perf/test_unseen/lp_hybrid3/ncn_only_metric'] = lp_hybrid_ncn_perf_unseen
+            lp_hybrid_std_perf_by_dataset = lp_unseen_results.get('hybrid3_std_only_metric_by_dataset', None)
+            lp_hybrid_mplp_perf_by_dataset = lp_unseen_results.get('hybrid3_mplp_only_metric_by_dataset', None)
+            lp_hybrid_ncn_perf_by_dataset = lp_unseen_results.get('hybrid3_ncn_only_metric_by_dataset', None)
+            if isinstance(lp_hybrid_std_perf_by_dataset, dict):
+                for ds_name, val in lp_hybrid_std_perf_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'perf/test_unseen/lp_hybrid3/{ds_name}/std_only_metric'] = val
+            if isinstance(lp_hybrid_mplp_perf_by_dataset, dict):
+                for ds_name, val in lp_hybrid_mplp_perf_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'perf/test_unseen/lp_hybrid3/{ds_name}/mplp_only_metric'] = val
+            if isinstance(lp_hybrid_ncn_perf_by_dataset, dict):
+                for ds_name, val in lp_hybrid_ncn_perf_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'perf/test_unseen/lp_hybrid3/{ds_name}/ncn_only_metric'] = val
             
             # Add individual dataset metrics to wandb
             for i, (dataset_name, metric) in enumerate(zip(nc_test_datasets, nc_individual)):
@@ -3764,32 +3907,15 @@ def run_joint_training(args, device='cuda:0'):
             lp_gate_calib_train = train_results.get('lp_gate_calib_ms_train', None)
             if lp_gate_calib_train is not None:
                 wandb_log['train/lp_mplp_gate_calib_ms'] = lp_gate_calib_train
-            lp_struct_loss_train = train_results.get('lp_struct_only_loss_train', None)
-            if lp_struct_loss_train is not None:
-                wandb_log['train/lp_struct_only_loss'] = lp_struct_loss_train
-
-            lp_struct_mean_train = train_results.get('lp_struct_score_mean_train', None)
-            lp_struct_std_train = train_results.get('lp_struct_score_std_train', None)
-            lp_feat_mean_train = train_results.get('lp_feat_score_mean_train', None)
-            lp_feat_std_train = train_results.get('lp_feat_score_std_train', None)
-            lp_logit_mean_train = train_results.get('lp_logit_mean_train', None)
-            lp_logit_std_train = train_results.get('lp_logit_std_train', None)
-            if lp_struct_mean_train is not None:
-                wandb_log['train/lp_struct_score_mean'] = lp_struct_mean_train
-            if lp_struct_std_train is not None:
-                wandb_log['train/lp_struct_score_std'] = lp_struct_std_train
-            if lp_feat_mean_train is not None:
-                wandb_log['train/lp_feat_score_mean'] = lp_feat_mean_train
-            if lp_feat_std_train is not None:
-                wandb_log['train/lp_feat_score_std'] = lp_feat_std_train
-            if lp_logit_mean_train is not None:
-                wandb_log['train/lp_logit_mean'] = lp_logit_mean_train
-            if lp_logit_std_train is not None:
-                wandb_log['train/lp_logit_std'] = lp_logit_std_train
-            if lp_struct_std_train is not None and lp_feat_std_train is not None:
-                wandb_log['train/lp_struct_feat_std_ratio'] = lp_struct_std_train / (lp_feat_std_train + 1e-8)
-            if lp_struct_mean_train is not None and lp_feat_mean_train is not None:
-                wandb_log['train/lp_struct_feat_absmean_ratio'] = abs(lp_struct_mean_train) / (abs(lp_feat_mean_train) + 1e-8)
+            lp_hybrid_w_std_train = train_results.get('lp_hybrid_w_std_train', None)
+            lp_hybrid_w_mplp_train = train_results.get('lp_hybrid_w_mplp_train', None)
+            lp_hybrid_w_ncn_train = train_results.get('lp_hybrid_w_ncn_train', None)
+            if lp_hybrid_w_std_train is not None:
+                wandb_log['weights/train/lp_hybrid3/w_std'] = lp_hybrid_w_std_train
+            if lp_hybrid_w_mplp_train is not None:
+                wandb_log['weights/train/lp_hybrid3/w_mplp'] = lp_hybrid_w_mplp_train
+            if lp_hybrid_w_ncn_train is not None:
+                wandb_log['weights/train/lp_hybrid3/w_ncn'] = lp_hybrid_w_ncn_train
 
             lp_gate_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_mean', None)
             if lp_gate_valid is not None:
@@ -3815,36 +3941,58 @@ def run_joint_training(args, device='cuda:0'):
             lp_feat_only_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_only_metric', None)
             if lp_feat_only_valid is not None:
                 wandb_log['valid_seen/lp_feat_only_metric'] = lp_feat_only_valid
-            lp_gate_ratio_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_struct_abs_ratio', None)
-            if lp_gate_ratio_valid is not None:
-                wandb_log['valid_seen/lp_gate_struct_abs_ratio'] = lp_gate_ratio_valid
-            lp_feat_abs_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_abs_mean', None)
-            if lp_feat_abs_valid is not None:
-                wandb_log['valid_seen/lp_feat_abs_mean'] = lp_feat_abs_valid
-            lp_gate_abs_struct_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_gate_abs_struct_mean', None)
-            if lp_gate_abs_struct_valid is not None:
-                wandb_log['valid_seen/lp_gate_abs_struct_mean'] = lp_gate_abs_struct_valid
             lp_struct_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_only_metric', None)
             if lp_struct_valid is not None:
                 wandb_log['valid_seen/lp_struct_only_metric'] = lp_struct_valid
-            lp_struct_mean_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_score_mean', None)
-            lp_struct_std_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_score_std', None)
-            lp_feat_mean_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_score_mean', None)
-            lp_feat_std_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_feat_score_std', None)
-            lp_std_ratio_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_feat_std_ratio', None)
-            lp_mean_ratio_valid = seen_valid_results.get('lp_metrics', {}).get('mplp_struct_feat_absmean_ratio', None)
-            if lp_struct_mean_valid is not None:
-                wandb_log['valid_seen/lp_struct_score_mean'] = lp_struct_mean_valid
-            if lp_struct_std_valid is not None:
-                wandb_log['valid_seen/lp_struct_score_std'] = lp_struct_std_valid
-            if lp_feat_mean_valid is not None:
-                wandb_log['valid_seen/lp_feat_score_mean'] = lp_feat_mean_valid
-            if lp_feat_std_valid is not None:
-                wandb_log['valid_seen/lp_feat_score_std'] = lp_feat_std_valid
-            if lp_std_ratio_valid is not None:
-                wandb_log['valid_seen/lp_struct_feat_std_ratio'] = lp_std_ratio_valid
-            if lp_mean_ratio_valid is not None:
-                wandb_log['valid_seen/lp_struct_feat_absmean_ratio'] = lp_mean_ratio_valid
+            lp_hybrid_w_std_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_w_std', None)
+            lp_hybrid_w_mplp_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_w_mplp', None)
+            lp_hybrid_w_ncn_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_w_ncn', None)
+            if lp_hybrid_w_std_valid is not None:
+                wandb_log['weights/valid_seen/lp_hybrid3/w_std'] = lp_hybrid_w_std_valid
+            if lp_hybrid_w_mplp_valid is not None:
+                wandb_log['weights/valid_seen/lp_hybrid3/w_mplp'] = lp_hybrid_w_mplp_valid
+            if lp_hybrid_w_ncn_valid is not None:
+                wandb_log['weights/valid_seen/lp_hybrid3/w_ncn'] = lp_hybrid_w_ncn_valid
+            lp_hybrid_w_std_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_w_std_by_dataset', None)
+            lp_hybrid_w_mplp_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_w_mplp_by_dataset', None)
+            lp_hybrid_w_ncn_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_w_ncn_by_dataset', None)
+            if isinstance(lp_hybrid_w_std_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_w_std_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'weights/valid_seen/lp_hybrid3/{ds_name}/w_std'] = val
+            if isinstance(lp_hybrid_w_mplp_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_w_mplp_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'weights/valid_seen/lp_hybrid3/{ds_name}/w_mplp'] = val
+            if isinstance(lp_hybrid_w_ncn_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_w_ncn_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'weights/valid_seen/lp_hybrid3/{ds_name}/w_ncn'] = val
+
+            lp_hybrid_std_perf_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_std_only_metric', None)
+            lp_hybrid_mplp_perf_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_mplp_only_metric', None)
+            lp_hybrid_ncn_perf_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_only_metric', None)
+            if lp_hybrid_std_perf_valid is not None:
+                wandb_log['perf/valid_seen/lp_hybrid3/std_only_metric'] = lp_hybrid_std_perf_valid
+            if lp_hybrid_mplp_perf_valid is not None:
+                wandb_log['perf/valid_seen/lp_hybrid3/mplp_only_metric'] = lp_hybrid_mplp_perf_valid
+            if lp_hybrid_ncn_perf_valid is not None:
+                wandb_log['perf/valid_seen/lp_hybrid3/ncn_only_metric'] = lp_hybrid_ncn_perf_valid
+            lp_hybrid_std_perf_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_std_only_metric_by_dataset', None)
+            lp_hybrid_mplp_perf_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_mplp_only_metric_by_dataset', None)
+            lp_hybrid_ncn_perf_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_only_metric_by_dataset', None)
+            if isinstance(lp_hybrid_std_perf_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_std_perf_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'perf/valid_seen/lp_hybrid3/{ds_name}/std_only_metric'] = val
+            if isinstance(lp_hybrid_mplp_perf_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_mplp_perf_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'perf/valid_seen/lp_hybrid3/{ds_name}/mplp_only_metric'] = val
+            if isinstance(lp_hybrid_ncn_perf_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_ncn_perf_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'perf/valid_seen/lp_hybrid3/{ds_name}/ncn_only_metric'] = val
 
             if gc_train_seen is not None:
                 if isinstance(gc_train_seen, dict):

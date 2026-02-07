@@ -75,6 +75,9 @@ class GraphPFNConfig:
     normalize_x: bool = True
     """Whether to normalize input features. TabPFN default: True"""
 
+    debug_norm: bool = False
+    """Whether to enable GraphPFN debug/corruption checks and internal traces."""
+
     # ============================================================================
     # Attention parameters
     # ============================================================================

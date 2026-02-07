@@ -42,11 +42,13 @@ class MLP(torch.nn.Module):
         size: int,
         hidden_size: int,
         activation: Activation | str = "gelu",
+        debug: bool = False,
         *,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        self.debug = debug
         self.linear1 = torch.nn.Linear(
             size,
             hidden_size,
@@ -109,7 +111,7 @@ class MLP(torch.nn.Module):
             input_norm = input_tensor.norm().item()
             mlp_norm = x.norm().item()
             ratio = input_norm / (mlp_norm + 1e-9)
-            if ratio > 5.0 or ratio < 0.2:  # Log if imbalanced
+            if self.debug and (ratio > 5.0 or ratio < 0.2):  # Log if imbalanced
                 print(f"[MLP MAGNITUDE] Input norm: {input_norm:.4f}, MLP output norm: {mlp_norm:.4f}, Ratio: {ratio:.2f}x")
 
             x = x + input_tensor

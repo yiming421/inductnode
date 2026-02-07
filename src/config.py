@@ -68,8 +68,8 @@ def parse_joint_training_args():
     
     # === Training Configuration ===
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
-    parser.add_argument('--lr', type=float, default=0.000001995432810684568, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.005, help='Weight decay')
+    parser.add_argument('--lr', type=float, default=0.00001, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.001, help='Weight decay')
     parser.add_argument('--eps', type=float, default=1e-8, help='Epsilon for optimizer (term added to denominator for numerical stability)')
     parser.add_argument('--schedule', type=str, default='cosine', choices=['cosine', 'step', 'warmup', 'none'])
     parser.add_argument('--nc_batch_size', type=int, default=1024, help='Node classification batch size')
@@ -105,11 +105,11 @@ def parse_joint_training_args():
                         help='Task schedule per phase (comma-separated). Use + for multiple tasks. Tasks: nc, lp, gc. Phases split at epochs 15 and 30.')
 
     # === Virtual Node ===
-    parser.add_argument('--use_virtual_node', type=str2bool, default=True,
+    parser.add_argument('--use_virtual_node', type=str2bool, default=False,
                         help='Add a virtual node connected to all graph nodes for global information aggregation (uses main dropout rate and residual connections)')
 
     # === Dataset Configuration ===
-    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Actor,DeezerEurope,LastFMAsia,Twitch-DE,Twitch-EN,Twitch-ES,Twitch-FR,Twitch-PT,Twitch-RU', 
+    parser.add_argument('--nc_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Actor,DeezerEurope,LastFMAsia', 
                        help='Node classification training datasets')
     parser.add_argument('--nc_test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS', 
                        help='Node classification test datasets')
@@ -195,7 +195,7 @@ def parse_joint_training_args():
     parser.add_argument('--use_pca_cache', type=str2bool, default=True, help='Enable PCA result caching for faster subsequent runs')
     parser.add_argument('--pca_cache_dir', type=str, default='./pca_cache', help='Directory to store PCA cache files')
     parser.add_argument('--normalize_data', type=str2bool, default=True, help='Normalize input data')
-    parser.add_argument('--padding_strategy', type=str, default='random', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
+    parser.add_argument('--padding_strategy', type=str, default='zero', choices=['zero', 'random', 'repeat'], help='Feature padding strategy') #
     parser.add_argument('--use_batchnorm', type=str2bool, default=True, help='Use BatchNorm instead of LayerNorm')
     parser.add_argument('--projection_small_dim', type=int, default=128, help='Small dimension for identity projection')
     parser.add_argument('--projection_large_dim', type=int, default=512, help='Large dimension for identity projection')
@@ -232,6 +232,11 @@ def parse_joint_training_args():
     parser.add_argument('--feature_dropout_type', type=str, default='channel_wise',
                        choices=['element_wise', 'channel_wise', 'gaussian_noise'],
                        help='Type of feature dropout: element_wise, channel_wise, or gaussian_noise')
+    parser.add_argument('--nc_static_embedding_cache', type=str, default='auto',
+                       choices=['off', 'auto', 'force'],
+                       help='Node classification full-batch embedding cache mode: '
+                            'off=disabled, auto=enable only for safe parameter-free settings, '
+                            'force=override conservative model-type checks (still requires no trainable NC encoder/projection params)')
 
     # === Random Projection Augmentation ===
     parser.add_argument('--use_random_projection_augmentation', type=str2bool, default=False,
@@ -263,6 +268,9 @@ def parse_joint_training_args():
                        help='Ratio of nodes to participate in feature mixing (0.0 to 1.0)')
     parser.add_argument('--augmentation_mix_alpha', type=float, default=0.5,
                        help='Interpolation weight for feature mixing (0.5 = equal mix, 0.8 = keep 80%% original)')
+    parser.add_argument('--augmentation_max_dim', type=int, default=1000,
+                       help='Cap random projection augmentation output dimension (0 = disable). '
+                            'Use to prevent huge augmentation matrices on GPU.')
 
     # === Contrastive Augmentation Loss ===
     parser.add_argument('--use_contrastive_augmentation_loss', type=str2bool, default=False,
@@ -347,7 +355,7 @@ def parse_joint_training_args():
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
     parser.add_argument('--lp_metric', type=str, default='auto', choices=['auto', 'auc', 'acc', 'hits@20', 'hits@50', 'hits@100', 'mrr'],
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
-    parser.add_argument('--lp_head_type', type=str, default='standard', choices=['standard', 'mplp', 'ncn'], help='Type of link prediction head')
+    parser.add_argument('--lp_head_type', type=str, default='standard', choices=['standard', 'mplp', 'ncn', 'hybrid3'], help='Type of link prediction head')
     
     # === MPLP Head Configuration ===
     parser.add_argument('--mplp_signature_dim', type=int, default=1024, help='Dimension of random signature vectors for MPLP')
@@ -379,7 +387,6 @@ def parse_joint_training_args():
                         help='Sample degree for NCN common-neighbor pooling (-1 = no sampling)')
     parser.add_argument('--ncn_beta', type=float, default=1.0,
                         help='Scaling factor for NCN common-neighbor features')
-    
     # === Graph Classification Specific ===
     parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')
     parser.add_argument('--gc_test_dataset', type=str, default='hiv,pcba', help='Graph classification test datasets')
@@ -543,6 +550,8 @@ def parse_joint_training_args():
                         help='GraphPFN random seed for feature positional embeddings (TabPFN default: 0)')
     parser.add_argument('--graphpfn_normalize_x', type=str2bool, default=True,
                         help='GraphPFN normalize input features (TabPFN default: True)')
+    parser.add_argument('--graphpfn_debug_norm', type=str2bool, default=False,
+                        help='GraphPFN global debug switch: enable/disable debug checks and traces (default: False)')
     parser.add_argument('--graphpfn_cache_trainset', type=str2bool, default=True,
                         help='GraphPFN cache K,V for context nodes during inference (major speedup)')
 
