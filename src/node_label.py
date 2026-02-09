@@ -24,13 +24,15 @@ class RandomizedNodeLabeling(torch.nn.Module):
     prop_type='combine': 15 features (MPLP default combine signal)
     """
     def __init__(self, signature_dim=64, num_hops=2, prop_type='exact',
-                 signature_sampling='gaussian', use_subgraph=False):
+                 signature_sampling='gaussian', use_subgraph=False,
+                 minimum_degree_onehot=-1):
         super().__init__()
         self.signature_dim = signature_dim
         self.num_hops = num_hops
         self.prop_type = prop_type
         self.signature_sampling = signature_sampling
         self.use_subgraph = use_subgraph
+        self.minimum_degree_onehot = minimum_degree_onehot
 
     def _subgraph(self, edges, adj_t, k=2):
         if pyg_k_hop_subgraph is None or to_edge_index is None:
@@ -51,23 +53,51 @@ class RandomizedNodeLabeling(torch.nn.Module):
         num_nodes = adj_t.size(0)
         device = adj_t.device()
         embedding = torch.zeros(num_nodes, self.signature_dim, device=device)
+
+        # Variance reduction for hub nodes (matches MPLP's minimum_degree_onehot behavior):
+        # assign deterministic one-hot dimensions to high-degree nodes.
+        if self.minimum_degree_onehot is not None and self.minimum_degree_onehot > 0:
+            degree = adj_t.sum(dim=1)
+            hub_mask = degree >= self.minimum_degree_onehot
+            hub_count = int(hub_mask.sum().item())
+            min_rand_dim = 64
+            if hub_count + min_rand_dim > self.signature_dim:
+                raise ValueError(
+                    f"{hub_count} hub nodes selected by minimum_degree_onehot={self.minimum_degree_onehot}, "
+                    f"but signature_dim={self.signature_dim} is too small; increase signature_dim or threshold."
+                )
+            if hub_count > 0:
+                hub_eye = F.one_hot(torch.arange(hub_count, device=device), num_classes=hub_count).float()
+                embedding[hub_mask, :hub_count] = hub_eye
+        else:
+            hub_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+            hub_count = 0
+
+        rand_dim = self.signature_dim - hub_count
+        non_hub_count = int((~hub_mask).sum().item())
+
         if self.signature_sampling == 'torchhd':
             try:
                 import torchhd
-                scale = math.sqrt(1.0 / self.signature_dim)
-                rand_vecs = torchhd.random(num_nodes, self.signature_dim, device=device)
+                scale = math.sqrt(1.0 / rand_dim)
+                rand_vecs = torchhd.random(non_hub_count, rand_dim, device=device)
                 rand_vecs = rand_vecs * scale
             except Exception:
                 warnings.warn("torchhd not available; falling back to gaussian signatures.")
-                rand_vecs = torch.randn(num_nodes, self.signature_dim, device=device)
+                rand_vecs = torch.randn(non_hub_count, rand_dim, device=device)
                 rand_vecs = F.normalize(rand_vecs, p=2, dim=1)
         elif self.signature_sampling == 'onehot':
-            rand_vecs = F.one_hot(torch.arange(num_nodes, device=device), num_classes=self.signature_dim).float()
+            if rand_dim < non_hub_count:
+                raise ValueError(
+                    f"signature_sampling=onehot requires rand_dim >= number of non-hub nodes; "
+                    f"got rand_dim={rand_dim}, non_hub_nodes={non_hub_count}"
+                )
+            rand_vecs = F.one_hot(torch.arange(non_hub_count, device=device), num_classes=rand_dim).float()
         else:
-            rand_vecs = torch.randn(num_nodes, self.signature_dim, device=device)
+            rand_vecs = torch.randn(non_hub_count, rand_dim, device=device)
             rand_vecs = F.normalize(rand_vecs, p=2, dim=1)
 
-        embedding[:] = rand_vecs
+        embedding[~hub_mask, hub_count:] = rand_vecs
         if node_weight is not None:
             embedding = embedding * node_weight.unsqueeze(1)
 

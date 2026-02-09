@@ -681,6 +681,12 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         device = data.x.device
         head_type = getattr(predictor, 'lp_head_type', '')
         use_lp_cn = lp_concat_common_neighbors and head_type == 'standard'
+        ncn_overlap_fn = None
+        if head_type == 'hybrid3':
+            try:
+                from .model import _ncn_adjoverlap as ncn_overlap_fn
+            except Exception:
+                ncn_overlap_fn = None
         
         # Get node embeddings - use full_adj_t for test evaluation if available
         node_embeddings = get_node_embeddings(model, data, projector, identity_projection, use_full_adj_for_test, args=None, rank=rank)
@@ -741,6 +747,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         hybrid_w_mplp_sum = 0.0
         hybrid_w_ncn_sum = 0.0
         hybrid_w_count = 0
+        ncn_neg_overlap_nonzero = 0
+        ncn_neg_overlap_total = 0
         hybrid_std_pos_scores = []
         hybrid_std_neg_scores = []
         hybrid_mplp_pos_scores = []
@@ -941,6 +949,16 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                             hybrid_w_mplp_sum += float(fusion_w[1].item())
                             hybrid_w_ncn_sum += float(fusion_w[2].item())
                             hybrid_w_count += 1
+                        if ncn_overlap_fn is not None and getattr(predictor.lp_head, 'ncn_cn_branch', None) is not None:
+                            cn_overlap = ncn_overlap_fn(
+                                adj_for_lp,
+                                adj_for_lp,
+                                batch_edges.t(),
+                                cnsampledeg=getattr(predictor.lp_head.ncn_cn_branch, 'cndeg', -1)
+                            )
+                            rowcount = cn_overlap.storage.rowcount()
+                            ncn_neg_overlap_nonzero += int((rowcount > 0).sum().item())
+                            ncn_neg_overlap_total += int(rowcount.numel())
                         std_scores = getattr(predictor.lp_head, 'last_std_score', None)
                         mplp_scores = getattr(predictor.lp_head, 'last_mplp_struct_score', None)
                         ncn_scores = getattr(predictor.lp_head, 'last_ncn_score', None)
@@ -1282,6 +1300,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         results['hybrid3_mplp_only_metric_name'] = hybrid_mplp_metric_name
         results['hybrid3_ncn_only_metric'] = hybrid_ncn_metric
         results['hybrid3_ncn_only_metric_name'] = hybrid_ncn_metric_name
+        results['hybrid3_ncn_neg_nonzero_overlap_count'] = ncn_neg_overlap_nonzero
+        results['hybrid3_ncn_neg_overlap_total_count'] = ncn_neg_overlap_total
 
         # Move persistent tensors back to CPU to free GPU memory
         test_edges['edge_pairs'] = test_edges['edge_pairs'].cpu()

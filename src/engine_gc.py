@@ -1342,21 +1342,29 @@ def _multitask_rank_loss(logits, labels, task_mask, max_pairs=1024):
 
 
 def _vectorized_multitask_pfn_logits(predictor, target_embeddings, pos_embeds_by_task, neg_embeds_by_task,
-                                     normalize_class_h=True, device=None):
+                                     normalize_class_h=True, device=None, task_indices=None):
     """
     Compute per-task logits using PFN predictor. Runs PFN once per task.
 
     Returns:
-        logits: [B, T]
-        task_context_mask: [T] bool (True if task has both pos/neg context)
+        logits: [B, len(task_indices)] (or [B, T] when task_indices is None)
+        task_context_mask: [len(task_indices)] bool (True if task has both pos/neg context)
     """
     if device is None:
         device = target_embeddings.device
     num_tasks = len(pos_embeds_by_task)
-    logits_by_task = []
-    task_context_mask = torch.zeros(num_tasks, dtype=torch.bool, device=device)
+    if task_indices is None:
+        task_indices = list(range(num_tasks))
+    else:
+        task_indices = list(task_indices)
 
-    for t in range(num_tasks):
+    logits_by_task = []
+    task_context_mask = torch.zeros(len(task_indices), dtype=torch.bool, device=device)
+
+    for out_idx, t in enumerate(task_indices):
+        if t < 0 or t >= num_tasks:
+            raise IndexError(f"Task index {t} out of range [0, {num_tasks - 1}]")
+
         pos_e = pos_embeds_by_task[t]
         neg_e = neg_embeds_by_task[t]
         if pos_e is None or neg_e is None or pos_e.numel() == 0 or neg_e.numel() == 0:
@@ -1392,7 +1400,7 @@ def _vectorized_multitask_pfn_logits(predictor, target_embeddings, pos_embeds_by
             logits_t = scores.view(-1)
 
         logits_by_task.append(logits_t)
-        task_context_mask[t] = True
+        task_context_mask[out_idx] = True
 
     logits = torch.stack(logits_by_task, dim=1) if logits_by_task else torch.empty(
         (target_embeddings.size(0), 0), device=device
@@ -1497,9 +1505,15 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
     use_ridge = sim_type == 'ridge'
     ridge_alpha = getattr(args, 'gc_ridge_alpha', 1.0) if args is not None else 1.0
     context_batch_size = getattr(args, 'gc_batch_size', 1024) if args is not None else 1024
+    gc_vec_task_chunk_size = int(getattr(args, 'gc_vec_task_chunk_size', 0)) if args is not None else 0
+    if gc_vec_task_chunk_size < 0:
+        gc_vec_task_chunk_size = 0
     pos_weight = None
 
     supervised_debug_printed = False
+    chunking_enabled = (not use_supervised) and (not use_ridge) and gc_vec_task_chunk_size > 0 and gc_vec_task_chunk_size < num_tasks
+    if chunking_enabled:
+        print(f"[GC-VEC] task-chunked backward enabled: chunk_size={gc_vec_task_chunk_size}, num_tasks={num_tasks}")
 
     for batch in data_loaders['train']:
         if not use_supervised and use_ridge:
@@ -1597,39 +1611,154 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
         # Replace invalid labels with 0 to keep BCE stable
         labels = batch_labels.float()
         labels = torch.where(task_mask, labels, torch.zeros_like(labels))
+        valid = task_mask.float()
+        global_valid = valid.sum().clamp_min(1.0)
+        loss = torch.tensor(0.0, device=device)
+        did_backward = False
+
         # Vectorized logits [B, T]
         if use_supervised:
             logits = gc_supervised_head(target_embeddings)
+            if logits is None:
+                continue
+            loss_matrix = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+            loss = (loss_matrix * valid).sum() / global_valid
+
+            if not supervised_debug_printed:
+                head_params = [p for p in gc_supervised_head.parameters() if p.requires_grad]
+                opt_param_ids = {id(p) for g in optimizer.param_groups for p in g['params']}
+                in_opt = sum(1 for p in head_params if id(p) in opt_param_ids)
+                print(f"[GC-VEC] supervised head params in optimizer: {in_opt}/{len(head_params)}")
+
+            loss.backward()
+            did_backward = True
+
+            if not supervised_debug_printed:
+                grad_norms = [p.grad.norm().item() for p in gc_supervised_head.parameters() if p.grad is not None]
+                if grad_norms:
+                    print(f"[GC-VEC] supervised head grad: mean={sum(grad_norms)/len(grad_norms):.3e} max={max(grad_norms):.3e}")
+                else:
+                    print("[GC-VEC] supervised head grad: None (no grads)")
+                supervised_debug_printed = True
         elif use_ridge:
             logits = target_embeddings @ W
+            loss_matrix = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+            loss = (loss_matrix * valid).sum() / global_valid
+            loss.backward()
+            did_backward = True
+        elif chunking_enabled:
+            # Exact full-batch objective with task-wise chunked autograd:
+            # one optimizer step per graph batch, but lower peak memory in PFN task loop.
+            predictor_params = [p for p in predictor.parameters() if p.requires_grad]
+            grad_target = torch.zeros_like(target_embeddings)
+            grad_pos = {}
+            grad_neg = {}
+            chunk_loss_values = []
+
+            for chunk_start in range(0, num_tasks, gc_vec_task_chunk_size):
+                chunk_end = min(chunk_start + gc_vec_task_chunk_size, num_tasks)
+                chunk_task_indices = list(range(chunk_start, chunk_end))
+
+                chunk_logits, _ = _vectorized_multitask_pfn_logits(
+                    predictor, target_embeddings, pos_embeds_by_task, neg_embeds_by_task,
+                    normalize_class_h=normalize_class_h, device=device, task_indices=chunk_task_indices
+                )
+                if chunk_logits is None:
+                    continue
+
+                chunk_labels = labels[:, chunk_task_indices]
+                chunk_valid = valid[:, chunk_task_indices]
+                chunk_loss_matrix = F.binary_cross_entropy_with_logits(chunk_logits, chunk_labels, reduction='none')
+                chunk_loss = (chunk_loss_matrix * chunk_valid).sum() / global_valid
+                chunk_loss_values.append(chunk_loss.detach())
+
+                if not chunk_loss.requires_grad:
+                    continue
+
+                grad_inputs = [target_embeddings]
+                grad_meta = [('target', None)]
+
+                for idx, p in enumerate(predictor_params):
+                    grad_inputs.append(p)
+                    grad_meta.append(('predictor', idx))
+
+                for task_idx in chunk_task_indices:
+                    pos_e = pos_embeds_by_task[task_idx]
+                    neg_e = neg_embeds_by_task[task_idx]
+                    if pos_e is not None and pos_e.numel() > 0:
+                        grad_inputs.append(pos_e)
+                        grad_meta.append(('pos', task_idx))
+                    if neg_e is not None and neg_e.numel() > 0:
+                        grad_inputs.append(neg_e)
+                        grad_meta.append(('neg', task_idx))
+
+                chunk_grads = torch.autograd.grad(
+                    chunk_loss,
+                    grad_inputs,
+                    allow_unused=True,
+                    retain_graph=False
+                )
+
+                for (kind, idx), grad in zip(grad_meta, chunk_grads):
+                    if grad is None:
+                        continue
+                    if kind == 'target':
+                        grad_target = grad_target + grad
+                        did_backward = True
+                    elif kind == 'predictor':
+                        param = predictor_params[idx]
+                        grad_detached = grad.detach()
+                        if param.grad is None:
+                            param.grad = grad_detached.clone()
+                        else:
+                            param.grad.add_(grad_detached)
+                        did_backward = True
+                    elif kind == 'pos':
+                        if idx not in grad_pos:
+                            grad_pos[idx] = grad
+                        else:
+                            grad_pos[idx] = grad_pos[idx] + grad
+                        did_backward = True
+                    elif kind == 'neg':
+                        if idx not in grad_neg:
+                            grad_neg[idx] = grad
+                        else:
+                            grad_neg[idx] = grad_neg[idx] + grad
+                        did_backward = True
+
+            if chunk_loss_values:
+                loss = torch.stack(chunk_loss_values).sum()
+
+            if did_backward:
+                back_tensors = [target_embeddings]
+                back_grads = [grad_target]
+
+                for task_idx, grad in grad_pos.items():
+                    pos_e = pos_embeds_by_task[task_idx]
+                    if pos_e is not None:
+                        back_tensors.append(pos_e)
+                        back_grads.append(grad)
+                for task_idx, grad in grad_neg.items():
+                    neg_e = neg_embeds_by_task[task_idx]
+                    if neg_e is not None:
+                        back_tensors.append(neg_e)
+                        back_grads.append(grad)
+
+                torch.autograd.backward(back_tensors, back_grads)
         else:
             logits, _ = _vectorized_multitask_pfn_logits(
                 predictor, target_embeddings, pos_embeds_by_task, neg_embeds_by_task,
                 normalize_class_h=normalize_class_h, device=device
             )
+            if logits is None:
+                continue
+            loss_matrix = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+            loss = (loss_matrix * valid).sum() / global_valid
+            loss.backward()
+            did_backward = True
 
-        if logits is None:
+        if not did_backward:
             continue
-
-        loss_matrix = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
-        valid = task_mask.float()
-        loss = (loss_matrix * valid).sum() / valid.sum().clamp_min(1.0)
-
-        if use_supervised and not supervised_debug_printed:
-            head_params = [p for p in gc_supervised_head.parameters() if p.requires_grad]
-            opt_param_ids = {id(p) for g in optimizer.param_groups for p in g['params']}
-            in_opt = sum(1 for p in head_params if id(p) in opt_param_ids)
-            print(f"[GC-VEC] supervised head params in optimizer: {in_opt}/{len(head_params)}")
-
-        loss.backward()
-
-        if use_supervised and not supervised_debug_printed:
-            grad_norms = [p.grad.norm().item() for p in gc_supervised_head.parameters() if p.grad is not None]
-            if grad_norms:
-                print(f"[GC-VEC] supervised head grad: mean={sum(grad_norms)/len(grad_norms):.3e} max={max(grad_norms):.3e}")
-            else:
-                print("[GC-VEC] supervised head grad: None (no grads)")
-            supervised_debug_printed = True
 
         if clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)

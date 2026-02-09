@@ -211,8 +211,10 @@ class LinkPredictionTracker:
 class GraphClassificationTracker:
     """Comprehensive memory and time tracker for graph classification operations."""
     
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', log_memory_events=False, log_memory_warnings=False):
         self.device = device
+        self.log_memory_events = log_memory_events
+        self.log_memory_warnings = log_memory_warnings
         self.reset()
     
     def reset(self):
@@ -294,12 +296,13 @@ class GraphClassificationTracker:
         self.record_memory()
         
         # Log significant memory usage
-        if stats['cpu_memory'] > 4.0:  # Log when CPU memory > 4GB
+        if self.log_memory_events and stats['cpu_memory'] > 4.0:  # Log when CPU memory > 4GB
             print(f"[GC-MEMORY] {operation_name}: CPU={stats['cpu_memory']:.2f}GB, "
                   f"GPU={stats['gpu_allocated']:.2f}GB, System={stats['system_memory_percent']:.1f}%")
         
         # Check for memory spikes
-        self.log_memory_spike_warning()
+        if self.log_memory_warnings:
+            self.log_memory_spike_warning()
     
     def record_dataset_info(self, dataset_name, num_graphs, num_features, avg_nodes_per_graph=None):
         """Record dataset-specific information for memory analysis."""
@@ -341,11 +344,14 @@ class GraphClassificationTracker:
                 
                 # Calculate memory delta for this operation
                 memory_delta = end_memory['cpu_memory'] - start_memory['cpu_memory']
-                if abs(memory_delta) > 0.1:  # Only log significant memory changes (>100MB)
+                if self.log_memory_events and abs(memory_delta) > 0.1:  # Only log significant memory changes (>100MB)
                     print(f"[GC-MEMORY] {operation_type}: {memory_delta:+.2f} GB CPU memory change (Duration: {duration:.2f}s)")
     
     def log_memory_spike_warning(self, threshold_gb=8.0):
         """Check for memory spikes and log warnings."""
+        if not self.log_memory_warnings:
+            return
+
         current_stats = self.get_memory_stats()
         if current_stats['cpu_memory'] > threshold_gb:
             print(f"[GC-MEMORY-WARNING] High CPU memory usage: {current_stats['cpu_memory']:.2f} GB "
@@ -2625,6 +2631,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
             lp_hybrid_std_perf_values = []
             lp_hybrid_mplp_perf_values = []
             lp_hybrid_ncn_perf_values = []
+            lp_hybrid_ncn_neg_cn_count_values = []
+            lp_hybrid_ncn_neg_total_count_values = []
             lp_gate_by_dataset = {}
             lp_struct_by_dataset = {}
             lp_feat_by_dataset = {}
@@ -2634,6 +2642,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
             lp_hybrid_std_perf_by_dataset = {}
             lp_hybrid_mplp_perf_by_dataset = {}
             lp_hybrid_ncn_perf_by_dataset = {}
+            lp_hybrid_ncn_neg_cn_count_by_dataset = {}
+            lp_hybrid_ncn_neg_total_count_by_dataset = {}
             
             for i, (data, split_idx) in enumerate(zip(lp_data_list, lp_split_idx_list)):
                 link_data_all = lp_link_data_all[i]
@@ -2675,14 +2685,17 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                 lp_results.get('hybrid3_w_ncn', None),
                                 lp_results.get('hybrid3_std_only_metric', None),
                                 lp_results.get('hybrid3_mplp_only_metric', None),
-                                lp_results.get('hybrid3_ncn_only_metric', None)
+                                lp_results.get('hybrid3_ncn_only_metric', None),
+                                lp_results.get('hybrid3_ncn_neg_nonzero_overlap_count', None),
+                                lp_results.get('hybrid3_ncn_neg_overlap_total_count', None)
                             )
 
                         if num_context_samples == 1:
                             (lp_metric_value, lp_gate_value, lp_gate_calib, lp_feat_value, lp_gate_ratio,
                              lp_feat_abs_mean, lp_gate_abs_struct_mean, lp_struct_value,
                              lp_hybrid_w_std, lp_hybrid_w_mplp, lp_hybrid_w_ncn,
-                             lp_hybrid_std_perf, lp_hybrid_mplp_perf, lp_hybrid_ncn_perf) = _eval_with_context(context_data)
+                             lp_hybrid_std_perf, lp_hybrid_mplp_perf, lp_hybrid_ncn_perf,
+                             lp_hybrid_ncn_neg_cn_count, lp_hybrid_ncn_neg_total_count) = _eval_with_context(context_data)
                         else:
                             context_source = link_data_all.get('train', None)
                             context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
@@ -2701,6 +2714,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                             sample_hybrid_std_perf = []
                             sample_hybrid_mplp_perf = []
                             sample_hybrid_ncn_perf = []
+                            sample_hybrid_ncn_neg_cn_count = []
+                            sample_hybrid_ncn_neg_total_count = []
                             for sample_idx in range(num_context_samples):
                                 torch.manual_seed(base_seed + i * 1000 + sample_idx)
                                 if context_source is not None and context_source['edge_pairs'].size(0) > 0:
@@ -2713,7 +2728,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                 (metric_val, gate_val, calib_val, feat_val, gate_ratio_val,
                                  feat_abs_val, gate_abs_struct_val, struct_val,
                                  hybrid_w_std_val, hybrid_w_mplp_val, hybrid_w_ncn_val,
-                                 hybrid_std_perf_val, hybrid_mplp_perf_val, hybrid_ncn_perf_val) = _eval_with_context(context_data_sample)
+                                 hybrid_std_perf_val, hybrid_mplp_perf_val, hybrid_ncn_perf_val,
+                                 hybrid_ncn_neg_cn_count_val, hybrid_ncn_neg_total_count_val) = _eval_with_context(context_data_sample)
                                 sample_metrics.append(metric_val)
                                 if gate_val is not None:
                                     sample_gates.append(gate_val)
@@ -2741,6 +2757,10 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                                     sample_hybrid_mplp_perf.append(hybrid_mplp_perf_val)
                                 if hybrid_ncn_perf_val is not None:
                                     sample_hybrid_ncn_perf.append(hybrid_ncn_perf_val)
+                                if hybrid_ncn_neg_cn_count_val is not None:
+                                    sample_hybrid_ncn_neg_cn_count.append(hybrid_ncn_neg_cn_count_val)
+                                if hybrid_ncn_neg_total_count_val is not None:
+                                    sample_hybrid_ncn_neg_total_count.append(hybrid_ncn_neg_total_count_val)
 
                             lp_metric_value = sum(sample_metrics) / len(sample_metrics) if sample_metrics else 0.0
                             lp_gate_value = (sum(sample_gates) / len(sample_gates)) if sample_gates else None
@@ -2756,6 +2776,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                             lp_hybrid_std_perf = (sum(sample_hybrid_std_perf) / len(sample_hybrid_std_perf)) if sample_hybrid_std_perf else None
                             lp_hybrid_mplp_perf = (sum(sample_hybrid_mplp_perf) / len(sample_hybrid_mplp_perf)) if sample_hybrid_mplp_perf else None
                             lp_hybrid_ncn_perf = (sum(sample_hybrid_ncn_perf) / len(sample_hybrid_ncn_perf)) if sample_hybrid_ncn_perf else None
+                            lp_hybrid_ncn_neg_cn_count = (sum(sample_hybrid_ncn_neg_cn_count) / len(sample_hybrid_ncn_neg_cn_count)) if sample_hybrid_ncn_neg_cn_count else None
+                            lp_hybrid_ncn_neg_total_count = (sum(sample_hybrid_ncn_neg_total_count) / len(sample_hybrid_ncn_neg_total_count)) if sample_hybrid_ncn_neg_total_count else None
                         
                         # Move all data back to CPU to free GPU memory
                         data.x = data.x.cpu()
@@ -2788,6 +2810,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     lp_hybrid_std_perf_values.append(lp_hybrid_std_perf)
                     lp_hybrid_mplp_perf_values.append(lp_hybrid_mplp_perf)
                     lp_hybrid_ncn_perf_values.append(lp_hybrid_ncn_perf)
+                    lp_hybrid_ncn_neg_cn_count_values.append(lp_hybrid_ncn_neg_cn_count)
+                    lp_hybrid_ncn_neg_total_count_values.append(lp_hybrid_ncn_neg_total_count)
                     lp_gate_by_dataset[dataset_name] = lp_gate_value
                     lp_struct_by_dataset[dataset_name] = lp_struct_value
                     lp_feat_by_dataset[dataset_name] = lp_feat_value
@@ -2797,6 +2821,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     lp_hybrid_std_perf_by_dataset[dataset_name] = lp_hybrid_std_perf
                     lp_hybrid_mplp_perf_by_dataset[dataset_name] = lp_hybrid_mplp_perf
                     lp_hybrid_ncn_perf_by_dataset[dataset_name] = lp_hybrid_ncn_perf
+                    lp_hybrid_ncn_neg_cn_count_by_dataset[dataset_name] = lp_hybrid_ncn_neg_cn_count
+                    lp_hybrid_ncn_neg_total_count_by_dataset[dataset_name] = lp_hybrid_ncn_neg_total_count
                 else:
                     lp_results_list.append(0.0)
                     lp_gate_values.append(None)
@@ -2812,6 +2838,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     lp_hybrid_std_perf_values.append(None)
                     lp_hybrid_mplp_perf_values.append(None)
                     lp_hybrid_ncn_perf_values.append(None)
+                    lp_hybrid_ncn_neg_cn_count_values.append(None)
+                    lp_hybrid_ncn_neg_total_count_values.append(None)
             
             if lp_results_list:
                 avg_result = sum(lp_results_list) / len(lp_results_list)
@@ -2838,9 +2866,13 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                 hybrid_std_perf_values = [v for v in lp_hybrid_std_perf_values if v is not None]
                 hybrid_mplp_perf_values = [v for v in lp_hybrid_mplp_perf_values if v is not None]
                 hybrid_ncn_perf_values = [v for v in lp_hybrid_ncn_perf_values if v is not None]
+                hybrid_ncn_neg_cn_count_values = [v for v in lp_hybrid_ncn_neg_cn_count_values if v is not None]
+                hybrid_ncn_neg_total_count_values = [v for v in lp_hybrid_ncn_neg_total_count_values if v is not None]
                 avg_hybrid_std_perf = (sum(hybrid_std_perf_values) / len(hybrid_std_perf_values)) if hybrid_std_perf_values else None
                 avg_hybrid_mplp_perf = (sum(hybrid_mplp_perf_values) / len(hybrid_mplp_perf_values)) if hybrid_mplp_perf_values else None
                 avg_hybrid_ncn_perf = (sum(hybrid_ncn_perf_values) / len(hybrid_ncn_perf_values)) if hybrid_ncn_perf_values else None
+                avg_hybrid_ncn_neg_cn_count = (sum(hybrid_ncn_neg_cn_count_values) / len(hybrid_ncn_neg_cn_count_values)) if hybrid_ncn_neg_cn_count_values else None
+                avg_hybrid_ncn_neg_total_count = (sum(hybrid_ncn_neg_total_count_values) / len(hybrid_ncn_neg_total_count_values)) if hybrid_ncn_neg_total_count_values else None
                 results = {
                     'train': avg_result,  # For consistency with NC format
                     'valid': avg_result,
@@ -2874,7 +2906,11 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     'hybrid3_ncn_only_metric': avg_hybrid_ncn_perf,
                     'hybrid3_std_only_metric_by_dataset': lp_hybrid_std_perf_by_dataset,
                     'hybrid3_mplp_only_metric_by_dataset': lp_hybrid_mplp_perf_by_dataset,
-                    'hybrid3_ncn_only_metric_by_dataset': lp_hybrid_ncn_perf_by_dataset
+                    'hybrid3_ncn_only_metric_by_dataset': lp_hybrid_ncn_perf_by_dataset,
+                    'hybrid3_ncn_neg_nonzero_overlap_count': avg_hybrid_ncn_neg_cn_count,
+                    'hybrid3_ncn_neg_overlap_total_count': avg_hybrid_ncn_neg_total_count,
+                    'hybrid3_ncn_neg_nonzero_overlap_count_by_dataset': lp_hybrid_ncn_neg_cn_count_by_dataset,
+                    'hybrid3_ncn_neg_overlap_total_count_by_dataset': lp_hybrid_ncn_neg_total_count_by_dataset
                 }
     
     return results
@@ -3224,10 +3260,6 @@ def run_joint_training(args, device='cuda:0'):
         print(f"✓ Graph Classification Tracker initialized on {device}")
         # Record initial memory state
         gc_tracker.record_memory()
-        initial_stats = gc_tracker.get_memory_stats()
-        print(f"[GC-MEMORY] Initial Memory - GPU: {initial_stats['gpu_allocated']:.2f}GB, "
-              f"CPU: {initial_stats['cpu_memory']:.2f}GB, System: {initial_stats['system_memory_percent']:.1f}% used")
-        gc_tracker.log_memory_spike_warning(threshold_gb=4.0)  # Lower threshold for initial warning
     
     # Initialize logging
     logger = TrainingLogger(
@@ -3273,9 +3305,6 @@ def run_joint_training(args, device='cuda:0'):
     if gc_tracker:
         gc_tracker.record_memory()
         after_data_stats = gc_tracker.get_memory_stats()
-        print(f"[GC-MEMORY] After Data Loading - CPU: {after_data_stats['cpu_memory']:.2f}GB, "
-              f"GPU: {after_data_stats['gpu_allocated']:.2f}GB")
-        gc_tracker.log_memory_spike_warning(threshold_gb=6.0)
         print(f"After Data Loading - GPU: {after_data_stats['gpu_allocated']:.2f}GB, CPU: {after_data_stats['cpu_memory']:.2f}GB")
     
     # Create unified model
@@ -3797,15 +3826,23 @@ def run_joint_training(args, device='cuda:0'):
             lp_hybrid_std_perf_unseen = lp_unseen_results.get('hybrid3_std_only_metric', None)
             lp_hybrid_mplp_perf_unseen = lp_unseen_results.get('hybrid3_mplp_only_metric', None)
             lp_hybrid_ncn_perf_unseen = lp_unseen_results.get('hybrid3_ncn_only_metric', None)
+            lp_hybrid_ncn_neg_cn_count_unseen = lp_unseen_results.get('hybrid3_ncn_neg_nonzero_overlap_count', None)
+            lp_hybrid_ncn_neg_total_count_unseen = lp_unseen_results.get('hybrid3_ncn_neg_overlap_total_count', None)
             if lp_hybrid_std_perf_unseen is not None:
                 unseen_metrics['perf/test_unseen/lp_hybrid3/std_only_metric'] = lp_hybrid_std_perf_unseen
             if lp_hybrid_mplp_perf_unseen is not None:
                 unseen_metrics['perf/test_unseen/lp_hybrid3/mplp_only_metric'] = lp_hybrid_mplp_perf_unseen
             if lp_hybrid_ncn_perf_unseen is not None:
                 unseen_metrics['perf/test_unseen/lp_hybrid3/ncn_only_metric'] = lp_hybrid_ncn_perf_unseen
+            if lp_hybrid_ncn_neg_cn_count_unseen is not None:
+                unseen_metrics['perf/test_unseen/lp_hybrid3/ncn_neg_nonzero_overlap_count'] = lp_hybrid_ncn_neg_cn_count_unseen
+            if lp_hybrid_ncn_neg_total_count_unseen is not None:
+                unseen_metrics['perf/test_unseen/lp_hybrid3/ncn_neg_overlap_total_count'] = lp_hybrid_ncn_neg_total_count_unseen
             lp_hybrid_std_perf_by_dataset = lp_unseen_results.get('hybrid3_std_only_metric_by_dataset', None)
             lp_hybrid_mplp_perf_by_dataset = lp_unseen_results.get('hybrid3_mplp_only_metric_by_dataset', None)
             lp_hybrid_ncn_perf_by_dataset = lp_unseen_results.get('hybrid3_ncn_only_metric_by_dataset', None)
+            lp_hybrid_ncn_neg_cn_count_by_dataset = lp_unseen_results.get('hybrid3_ncn_neg_nonzero_overlap_count_by_dataset', None)
+            lp_hybrid_ncn_neg_total_count_by_dataset = lp_unseen_results.get('hybrid3_ncn_neg_overlap_total_count_by_dataset', None)
             if isinstance(lp_hybrid_std_perf_by_dataset, dict):
                 for ds_name, val in lp_hybrid_std_perf_by_dataset.items():
                     if val is not None:
@@ -3818,6 +3855,14 @@ def run_joint_training(args, device='cuda:0'):
                 for ds_name, val in lp_hybrid_ncn_perf_by_dataset.items():
                     if val is not None:
                         unseen_metrics[f'perf/test_unseen/lp_hybrid3/{ds_name}/ncn_only_metric'] = val
+            if isinstance(lp_hybrid_ncn_neg_cn_count_by_dataset, dict):
+                for ds_name, val in lp_hybrid_ncn_neg_cn_count_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'perf/test_unseen/lp_hybrid3/{ds_name}/ncn_neg_nonzero_overlap_count'] = val
+            if isinstance(lp_hybrid_ncn_neg_total_count_by_dataset, dict):
+                for ds_name, val in lp_hybrid_ncn_neg_total_count_by_dataset.items():
+                    if val is not None:
+                        unseen_metrics[f'perf/test_unseen/lp_hybrid3/{ds_name}/ncn_neg_overlap_total_count'] = val
             
             # Add individual dataset metrics to wandb
             for i, (dataset_name, metric) in enumerate(zip(nc_test_datasets, nc_individual)):
@@ -3972,15 +4017,23 @@ def run_joint_training(args, device='cuda:0'):
             lp_hybrid_std_perf_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_std_only_metric', None)
             lp_hybrid_mplp_perf_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_mplp_only_metric', None)
             lp_hybrid_ncn_perf_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_only_metric', None)
+            lp_hybrid_ncn_neg_cn_count_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_neg_nonzero_overlap_count', None)
+            lp_hybrid_ncn_neg_total_count_valid = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_neg_overlap_total_count', None)
             if lp_hybrid_std_perf_valid is not None:
                 wandb_log['perf/valid_seen/lp_hybrid3/std_only_metric'] = lp_hybrid_std_perf_valid
             if lp_hybrid_mplp_perf_valid is not None:
                 wandb_log['perf/valid_seen/lp_hybrid3/mplp_only_metric'] = lp_hybrid_mplp_perf_valid
             if lp_hybrid_ncn_perf_valid is not None:
                 wandb_log['perf/valid_seen/lp_hybrid3/ncn_only_metric'] = lp_hybrid_ncn_perf_valid
+            if lp_hybrid_ncn_neg_cn_count_valid is not None:
+                wandb_log['perf/valid_seen/lp_hybrid3/ncn_neg_nonzero_overlap_count'] = lp_hybrid_ncn_neg_cn_count_valid
+            if lp_hybrid_ncn_neg_total_count_valid is not None:
+                wandb_log['perf/valid_seen/lp_hybrid3/ncn_neg_overlap_total_count'] = lp_hybrid_ncn_neg_total_count_valid
             lp_hybrid_std_perf_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_std_only_metric_by_dataset', None)
             lp_hybrid_mplp_perf_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_mplp_only_metric_by_dataset', None)
             lp_hybrid_ncn_perf_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_only_metric_by_dataset', None)
+            lp_hybrid_ncn_neg_cn_count_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_neg_nonzero_overlap_count_by_dataset', None)
+            lp_hybrid_ncn_neg_total_count_valid_by_dataset = seen_valid_results.get('lp_metrics', {}).get('hybrid3_ncn_neg_overlap_total_count_by_dataset', None)
             if isinstance(lp_hybrid_std_perf_valid_by_dataset, dict):
                 for ds_name, val in lp_hybrid_std_perf_valid_by_dataset.items():
                     if val is not None:
@@ -3993,6 +4046,14 @@ def run_joint_training(args, device='cuda:0'):
                 for ds_name, val in lp_hybrid_ncn_perf_valid_by_dataset.items():
                     if val is not None:
                         wandb_log[f'perf/valid_seen/lp_hybrid3/{ds_name}/ncn_only_metric'] = val
+            if isinstance(lp_hybrid_ncn_neg_cn_count_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_ncn_neg_cn_count_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'perf/valid_seen/lp_hybrid3/{ds_name}/ncn_neg_nonzero_overlap_count'] = val
+            if isinstance(lp_hybrid_ncn_neg_total_count_valid_by_dataset, dict):
+                for ds_name, val in lp_hybrid_ncn_neg_total_count_valid_by_dataset.items():
+                    if val is not None:
+                        wandb_log[f'perf/valid_seen/lp_hybrid3/{ds_name}/ncn_neg_overlap_total_count'] = val
 
             if gc_train_seen is not None:
                 if isinstance(gc_train_seen, dict):

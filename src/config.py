@@ -369,7 +369,7 @@ def parse_joint_training_args():
                         help='Use 2-hop subgraph for MPLP structural features (default: True)')
     parser.add_argument('--mplp_use_degree', type=str, default='mlp', choices=['none', 'aa', 'ra', 'mlp'],
                         help='Degree-based node weighting for MPLP structural features')
-    parser.add_argument('--mplp_context_calibrate', type=str2bool, default=True,
+    parser.add_argument('--mplp_context_calibrate', type=str2bool, default=False,
                         help='Fit a scalar structure gate on context edges per dataset (MPLP only)')
     parser.add_argument('--mplp_calib_train_static', type=str2bool, default=False,
                         help='Use 1:1 feat+struct during training; apply calibration only at eval')
@@ -397,12 +397,14 @@ def parse_joint_training_args():
                        help='Graph classification metric override (auto=dataset default)')
     parser.add_argument('--lambda_gc', type=float, default=0.41834063194474214, help='Weight for graph classification loss')
     parser.add_argument('--context_graph_num', type=int, default=5, help='Number of context graphs for graph classification')
-    parser.add_argument('--gc_multitask_vectorized', type=str2bool, default=False,
+    parser.add_argument('--gc_multitask_vectorized', type=str2bool, default=True,
                        help='Enable vectorized multi-task prototypical GC (single BCEWithLogits over all tasks, e.g., PCBA)')
     parser.add_argument('--gc_supervised_mlp', type=str2bool, default=False,
                        help='Use supervised MLP head for graph classification (bypasses PFN/transformer)')
     parser.add_argument('--gc_profile_context', type=str2bool, default=False,
                        help='Profile context prototype computation time (encode vs overhead) in vectorized GC')
+    parser.add_argument('--gc_vec_task_chunk_size', type=int, default=0,
+                       help='Task chunk size for vectorized GC PFN backward (0 = disabled, keeps original all-task backward)')
     parser.add_argument('--gc_log_train_metrics', type=str2bool, default=True,
                        help='Log graph classification train metrics each epoch (can be expensive for large datasets)')
     parser.add_argument('--gc_train_eval_max_batches', type=int, default=20,
