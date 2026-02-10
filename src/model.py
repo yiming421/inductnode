@@ -2,7 +2,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GINConv, MessagePassing, SAGEConv, GATConv
+from torch_geometric.nn import GCNConv, GINConv, MessagePassing, SAGEConv, GATConv, GPSConv
 from torch_geometric.utils import degree
 from torch_sparse.matmul import spmm_add
 from torch_sparse import SparseTensor
@@ -434,6 +434,88 @@ class GCN(nn.Module):
                 h = self.convs[i](h, g)
             else:
                 h = self.conv(h, g)
+        return h
+
+
+class GraphGPS(nn.Module):
+    """
+    GraphGPS backbone built from stacked PyG GPSConv layers.
+
+    Keeps the same forward signature as other backbones:
+        forward(x, adj_t, batch=None) -> node embeddings
+    """
+
+    def __init__(self, in_feats, h_feats, prop_step=2, dropout=0.2, norm=True,
+                 norm_affine=True, activation='relu', heads=4, local_conv='GCN',
+                 attn_type='multihead', gin_aggr='sum'):
+        super(GraphGPS, self).__init__()
+        self.lin = nn.Linear(in_feats, h_feats) if in_feats != h_feats else nn.Identity()
+        self.prop_step = prop_step
+        self.dropout = dropout
+        self.norm = norm
+        self.activation = activation
+        self.local_conv = local_conv
+        self.attn_type = attn_type
+        self.gin_aggr = 'add' if gin_aggr == 'sum' else gin_aggr
+
+        self.heads = self._resolve_heads(h_feats, heads)
+        if self.heads != heads:
+            print(f"[GraphGPS] Adjusted heads from {heads} to {self.heads} to divide hidden={h_feats}")
+
+        norm_name = 'batch_norm' if norm else None
+        norm_kwargs = {'affine': norm_affine} if norm else None
+
+        self.layers = nn.ModuleList()
+        for _ in range(prop_step):
+            conv = self._create_local_conv(h_feats, h_feats)
+            self.layers.append(
+                GPSConv(
+                    channels=h_feats,
+                    conv=conv,
+                    heads=self.heads,
+                    dropout=dropout,
+                    act=activation,
+                    norm=norm_name,
+                    norm_kwargs=norm_kwargs,
+                    attn_type=attn_type,
+                )
+            )
+
+    @staticmethod
+    def _resolve_heads(hidden_dim, requested_heads):
+        requested_heads = max(1, int(requested_heads))
+        if hidden_dim % requested_heads == 0:
+            return requested_heads
+        for h in range(requested_heads - 1, 0, -1):
+            if hidden_dim % h == 0:
+                return h
+        return 1
+
+    def _create_local_conv(self, in_dim, out_dim):
+        conv_type = str(self.local_conv).upper()
+        if conv_type == 'NONE':
+            return None
+        if conv_type == 'GCN':
+            return GCNConv(in_dim, out_dim)
+        if conv_type == 'SAGE':
+            return SAGEConv(in_dim, out_dim, aggr='mean')
+        if conv_type == 'GAT':
+            return GATConv(in_dim, out_dim, heads=1, concat=False)
+        if conv_type == 'GIN':
+            mlp = MLP(in_dim, out_dim, out_dim, 2, self.dropout, self.norm)
+            return GINConv(mlp, aggr=self.gin_aggr)
+        raise ValueError(f"Unsupported GraphGPS local conv type: {self.local_conv}")
+
+    def forward(self, in_feat, adj_t, batch=None):
+        h = self.lin(in_feat)
+
+        # GPSConv global attention uses batch to separate graphs.
+        if batch is None:
+            batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
+
+        for layer in self.layers:
+            h = layer(h, adj_t, batch=batch)
+
         return h
 
 class EnhancedGCN(nn.Module):

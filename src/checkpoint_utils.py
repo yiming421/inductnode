@@ -215,6 +215,15 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
     args.res = checkpoint_args['res']
     args.multilayer = checkpoint_args['multilayer']
     args.use_gin = checkpoint_args['use_gin']
+    args.activation = checkpoint_args.get('activation', getattr(args, 'activation', 'relu'))
+    args.gin_aggr = checkpoint_args.get('gin_aggr', getattr(args, 'gin_aggr', 'sum'))
+    args.graphgps_heads = checkpoint_args.get('graphgps_heads', getattr(args, 'graphgps_heads', 4))
+    args.graphgps_local_conv = checkpoint_args.get(
+        'graphgps_local_conv', getattr(args, 'graphgps_local_conv', 'GCN')
+    )
+    args.graphgps_attn_type = checkpoint_args.get(
+        'graphgps_attn_type', getattr(args, 'graphgps_attn_type', 'multihead')
+    )
 
     # Override head_num_layers if present in checkpoint (added for backwards compatibility)
     if 'head_num_layers' in checkpoint_args:
@@ -228,7 +237,7 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
 
 def create_gnn_from_config(model_config, args_dict, input_dim):
     """Creates a GNN model from a configuration dictionary."""
-    from .model import PureGCN, PureGCN_v1, GCN
+    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS
     model_type = model_config.get('model_type') or args_dict.get('model')
     
     if model_type == 'PureGCN':
@@ -242,6 +251,20 @@ def create_gnn_from_config(model_config, args_dict, input_dim):
                    args_dict['relu'], args_dict['num_layers'], args_dict['dp'], 
                    args_dict['multilayer'], args_dict['use_gin'], args_dict['res'], 
                    args_dict['gnn_norm_affine'])
+    elif model_type == 'GraphGPS':
+        model = GraphGPS(
+            in_feats=input_dim,
+            h_feats=args_dict['hidden'],
+            prop_step=args_dict['num_layers'],
+            dropout=args_dict['dp'],
+            norm=args_dict['norm'],
+            norm_affine=args_dict.get('gnn_norm_affine', True),
+            activation=args_dict.get('activation', 'relu'),
+            heads=args_dict.get('graphgps_heads', 4),
+            local_conv=args_dict.get('graphgps_local_conv', 'GCN'),
+            attn_type=args_dict.get('graphgps_attn_type', 'multihead'),
+            gin_aggr=args_dict.get('gin_aggr', 'sum'),
+        )
     else:
         raise ValueError(f"Unknown GNN model type: {model_type}")
     return model
@@ -293,7 +316,7 @@ def create_pfn_components_from_config(args_dict, device='cpu'):
 
 def create_model_from_args(args, input_dim, device):
     """Creates a GNN model and all PFN components from command-line arguments."""
-    from .model import PureGCN, PureGCN_v1, GCN, AttentionPool, MLP, IdentityProjection
+    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, AttentionPool, MLP, IdentityProjection
     
     # GNN Model
     if args.model == 'PureGCN':
@@ -302,6 +325,20 @@ def create_model_from_args(args, input_dim, device):
         model = PureGCN_v1(input_dim, args.num_layers, args.hidden, args.dp, args.norm, args.res, args.relu, args.gnn_norm_affine)
     elif args.model == 'GCN':
         model = GCN(input_dim, args.hidden, args.norm, args.relu, args.num_layers, args.dp, args.multilayer, args.use_gin, args.res, args.gnn_norm_affine)
+    elif args.model == 'GraphGPS':
+        model = GraphGPS(
+            in_feats=input_dim,
+            h_feats=args.hidden,
+            prop_step=args.num_layers,
+            dropout=args.dp,
+            norm=args.norm,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            heads=getattr(args, 'graphgps_heads', 4),
+            local_conv=getattr(args, 'graphgps_local_conv', 'GCN'),
+            attn_type=getattr(args, 'graphgps_attn_type', 'multihead'),
+            gin_aggr=getattr(args, 'gin_aggr', 'sum'),
+        )
     else:
         raise ValueError(f"Unknown model type: {args.model}")
     model = model.to(device)

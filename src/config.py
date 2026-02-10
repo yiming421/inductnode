@@ -29,7 +29,7 @@ def parse_joint_training_args():
     parser.add_argument('--claim_all_gpu_memory', type=str2bool, default=False, help='Claim all available GPU memory at startup to prevent competition')
 
     # === Model Architecture ===
-    parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN', 'UnifiedGNN'])
+    parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN', 'UnifiedGNN', 'GraphGPS'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN', 'MPLP'])
     parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
@@ -65,6 +65,16 @@ def parse_joint_training_args():
     parser.add_argument('--supports_edge_weight', type=str2bool, default=True, help='Whether model supports edge weights')
     parser.add_argument('--no_parameters', type=str2bool, default=False, help='Use parameter-free convolutions')
     parser.add_argument('--input_norm', type=str2bool, default=False, help='Apply input normalization')
+
+    # === GraphGPS Specific Arguments ===
+    parser.add_argument('--graphgps_heads', type=int, default=4,
+                       help='Number of attention heads for GraphGPS global attention')
+    parser.add_argument('--graphgps_local_conv', type=str, default='GCN',
+                       choices=['GCN', 'SAGE', 'GAT', 'GIN', 'NONE'],
+                       help='Local message passing layer type inside GraphGPS')
+    parser.add_argument('--graphgps_attn_type', type=str, default='multihead',
+                       choices=['multihead', 'performer'],
+                       help='Global attention type for GraphGPS')
     
     # === Training Configuration ===
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])

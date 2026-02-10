@@ -21,7 +21,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Core imports - reuse from existing scripts
-from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN
+from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN, GraphGPS
 from src.model_graphpfn import ParameterFreeGCN
 from src.graphpfn import GraphPFNConfig, GraphPFNPredictor
 from src.data_nc import load_all_data, load_all_data_train
@@ -985,6 +985,20 @@ def create_unified_model(args, input_dim, device):
             no_parameters=getattr(args, 'no_parameters', False),
             input_norm=getattr(args, 'input_norm', False),
             activation=getattr(args, 'activation', 'relu')
+        )
+    elif args.model == 'GraphGPS':
+        model = GraphGPS(
+            in_feats=gnn_input_dim,
+            h_feats=hidden,
+            prop_step=args.num_layers,
+            dropout=args.dp,
+            norm=args.norm,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            heads=getattr(args, 'graphgps_heads', 4),
+            local_conv=getattr(args, 'graphgps_local_conv', 'GCN'),
+            attn_type=getattr(args, 'graphgps_attn_type', 'multihead'),
+            gin_aggr=getattr(args, 'gin_aggr', 'sum')
         )
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")

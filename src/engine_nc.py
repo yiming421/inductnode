@@ -1216,7 +1216,13 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
         refresh_seed = args.seed + epoch * 1000 + dataset_hash
         predictor.bank_of_tags.refresh_permutation(num_classes=num_classes, seed=refresh_seed)
 
-    device = next(model.parameters()).device
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        try:
+            device = next(predictor.parameters()).device
+        except StopIteration:
+            device = data.x.device
     moved_to_device = False
     if data.x.device != device:
         data = data.to(device)
@@ -1791,7 +1797,13 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
     if identity_projection is not None:
         identity_projection.eval()
 
-    device = next(model.parameters()).device
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        try:
+            device = next(predictor.parameters()).device
+        except StopIteration:
+            device = data.x.device
     moved_to_device = False
     if data.x.device != device or (hasattr(data, 'adj_t') and data.adj_t.device != device):
         data = data.to(device)

@@ -1,4 +1,5 @@
 import os.path as osp
+from pathlib import Path
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -81,8 +82,8 @@ class TwitchFixed(InMemoryDataset):
 
     @property
     def processed_file_names(self) -> str:
-        # Bump cache version because old processing could misalign x/y rows vs edge indices.
-        return 'data_v2.pt'
+        # v4: global shared feature-space dimension across regions + duplicate-label conflict guard.
+        return 'data_v4.pt'
 
     def download(self) -> None:
         file_path = download_url(self.url, self.raw_dir)
@@ -103,6 +104,13 @@ class TwitchFixed(InMemoryDataset):
 
         dup_count = int(target.duplicated(subset=['new_id']).sum())
         if dup_count > 0:
+            # Safety check: conflicting labels for duplicated node ids would corrupt supervision.
+            mature_conflicts = target.groupby('new_id')['mature'].nunique(dropna=False)
+            if (mature_conflicts > 1).any():
+                bad_ids = mature_conflicts[mature_conflicts > 1].index.tolist()
+                raise ValueError(
+                    f"Twitch target file for {self.name} has duplicate new_id rows with conflicting labels: {bad_ids[:10]}"
+                )
             print(f"[TwitchFixed] Warning: {self.name} has {dup_count} duplicate new_id rows. Keeping first.")
             target = target.drop_duplicates(subset=['new_id'], keep='first')
 
@@ -112,16 +120,53 @@ class TwitchFixed(InMemoryDataset):
         new_ids = target['new_id'].astype(int).to_numpy()
         node_id_to_idx = {node_id: idx for idx, node_id in enumerate(new_ids.tolist())}
 
-        n_feats = 128
+        # Raw JSON stores feature ID lists (sparse categorical indicators), not dense values.
+        # Decode into a multi-hot matrix over full feature vocabulary.
+        max_feat_id = -1
+        for vals in features.values():
+            if vals:
+                local_max = max(vals)
+                if local_max > max_feat_id:
+                    max_feat_id = int(local_max)
+        if max_feat_id < 0:
+            raise ValueError(f"Twitch feature file for {self.name} appears empty.")
+
+        # Datasets share the same feature space across regions.
+        # Infer a global feature dimension from all region feature files in this raw zip.
+        global_max_feat_id = max_feat_id
+        raw_twitch_root = Path(self.raw_dir) / 'twitch'
+        if raw_twitch_root.exists():
+            candidate_files = [
+                raw_twitch_root / 'DE' / 'musae_DE.json',
+                raw_twitch_root / 'ENGB' / 'musae_ENGB_features.json',
+                raw_twitch_root / 'ES' / 'musae_ES_features.json',
+                raw_twitch_root / 'FR' / 'musae_FR_features.json',
+                raw_twitch_root / 'PTBR' / 'musae_PTBR_features.json',
+                raw_twitch_root / 'RU' / 'musae_RU_features.json',
+            ]
+            for file_path in candidate_files:
+                if not file_path.exists():
+                    continue
+                with open(file_path, 'r') as f:
+                    region_features = json.load(f)
+                for vals in region_features.values():
+                    if vals:
+                        region_max = max(vals)
+                        if region_max > global_max_feat_id:
+                            global_max_feat_id = int(region_max)
+
+        n_feats = global_max_feat_id + 1
         x_arr = np.zeros((len(new_ids), n_feats), dtype=np.float32)
         for idx, node_id in enumerate(new_ids):
-            feats = features.get(str(int(node_id)), [])
-            if feats:
-                if len(feats) >= n_feats:
-                    x_arr[idx] = np.asarray(feats[:n_feats], dtype=np.float32)
-                else:
-                    padded = feats + [0] * (n_feats - len(feats))
-                    x_arr[idx] = np.asarray(padded, dtype=np.float32)
+            feat_ids = features.get(str(int(node_id)), [])
+            if not feat_ids:
+                continue
+
+            feat_ids = np.asarray(feat_ids, dtype=np.int64)
+            valid = (feat_ids >= 0) & (feat_ids < n_feats)
+            feat_ids = feat_ids[valid]
+            if feat_ids.size > 0:
+                x_arr[idx, np.unique(feat_ids)] = 1.0
         x = torch.from_numpy(x_arr)
 
         # Convert mature column (True/False) to binary labels (1/0)
