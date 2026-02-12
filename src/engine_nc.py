@@ -1533,6 +1533,8 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
         # Keep a dataset-scoped GPU copy for the whole TTA procedure.
         data_device = data.clone().to(inference_device)
+        if hasattr(data_device, 'y') and data_device.y is not None:
+            data_device.y = data_device.y.to(inference_device)
         train_idx = train_idx.to(inference_device)
         valid_idx = valid_idx.to(inference_device)
         test_idx = test_idx.to(inference_device)
@@ -1653,7 +1655,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
             # DEBUG: Verify aggregation
             if rank == 0:
-                y_agg = data.y.to(test_logits_agg.device)
+                y_agg = data_device.y.to(test_logits_agg.device)
                 test_idx_dev = test_idx.to(test_logits_agg.device)
                 agg_test_pred = test_logits_agg.argmax(dim=-1)
                 agg_test_acc = (agg_test_pred == y_agg[test_idx_dev]).float().mean().item()
