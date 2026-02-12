@@ -1518,10 +1518,73 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
     if rank == 0:
         print(f"  TTA inference device: {inference_device}")
 
+    tta_profile_enabled = bool(args is not None and getattr(args, 'nc_eval_profile', False) and rank == 0)
+    tta_profile_view_interval = max(0, int(getattr(args, 'nc_eval_profile_view_interval', 0))) if args is not None else 0
+    tta_profile_proc = psutil.Process(os.getpid()) if tta_profile_enabled else None
+
+    def _tta_profile_snapshot():
+        if not tta_profile_enabled:
+            return None
+        cpu_times = tta_profile_proc.cpu_times()
+        return time.perf_counter(), (cpu_times.user + cpu_times.system)
+
+    def _tta_profile_elapsed(start_snapshot):
+        if not tta_profile_enabled or start_snapshot is None:
+            return 0.0, 0.0
+        end_snapshot = _tta_profile_snapshot()
+        return end_snapshot[0] - start_snapshot[0], end_snapshot[1] - start_snapshot[1]
+
+    def _tta_profile_log(stage, start_snapshot=None, extra=""):
+        if not tta_profile_enabled:
+            return
+        now_snapshot = _tta_profile_snapshot()
+        wall_dt = 0.0
+        cpu_dt = 0.0
+        cpu_over_wall = 0.0
+        if start_snapshot is not None:
+            wall_dt = now_snapshot[0] - start_snapshot[0]
+            cpu_dt = now_snapshot[1] - start_snapshot[1]
+            if wall_dt > 1e-9:
+                cpu_over_wall = 100.0 * cpu_dt / wall_dt
+        sys_cpu = psutil.cpu_percent(interval=None)
+        rss_gb = tta_profile_proc.memory_info().rss / (1024 ** 3)
+        gpu_alloc_gb = 0.0
+        gpu_reserved_gb = 0.0
+        if inference_device.type == 'cuda' and torch.cuda.is_available():
+            dev_idx = inference_device.index if inference_device.index is not None else torch.cuda.current_device()
+            gpu_alloc_gb = torch.cuda.memory_allocated(dev_idx) / (1024 ** 3)
+            gpu_reserved_gb = torch.cuda.memory_reserved(dev_idx) / (1024 ** 3)
+        extra_text = f" | {extra}" if extra else ""
+        print(
+            f"[NC_TTA_PROFILE] {stage} | wall={wall_dt:.3f}s cpu={cpu_dt:.3f}s "
+            f"cpu/wall={cpu_over_wall:.1f}% sys_cpu={sys_cpu:.1f}% rss={rss_gb:.2f}GB "
+            f"gpu_alloc={gpu_alloc_gb:.2f}GB gpu_reserved={gpu_reserved_gb:.2f}GB{extra_text}"
+        )
+
+    if tta_profile_enabled:
+        # Prime instantaneous CPU sampler.
+        psutil.cpu_percent(interval=None)
+        _tta_profile_log(
+            "enabled",
+            extra=(
+                f"device={inference_device} num_augmentations={tta_num_augmentations} "
+                f"include_original={tta_include_original} view_interval={tta_profile_view_interval}"
+            ),
+        )
+
     train_metric_list, valid_metric_list, test_metric_list = [], [], []
 
     for dataset_idx, (data, split_idx) in enumerate(zip(data_list, split_idx_list)):
         dataset_start_time = time.time()
+        dataset_profile_start = _tta_profile_snapshot()
+        data_to_device_wall = 0.0
+        data_to_device_cpu = 0.0
+        aug_wall = 0.0
+        aug_cpu = 0.0
+        pca_wall = 0.0
+        pca_cpu = 0.0
+        infer_wall = 0.0
+        infer_cpu = 0.0
 
         if rank == 0:
             print(f"  [TTA] Processing unseen dataset {dataset_idx} ({data.name})...")
@@ -1532,6 +1595,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         external_embeddings = external_embeddings_list[dataset_idx] if external_embeddings_list else None
 
         # Keep a dataset-scoped GPU copy for the whole TTA procedure.
+        data_to_device_start = _tta_profile_snapshot()
         data_device = data.clone().to(inference_device)
         if hasattr(data_device, 'y') and data_device.y is not None:
             data_device.y = data_device.y.to(inference_device)
@@ -1542,6 +1606,13 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             data_device.context_sample = data_device.context_sample.to(inference_device)
         if hasattr(data_device, 'adj_t'):
             data_device.adj_t = data_device.adj_t.to(inference_device)
+        data_to_device_wall, data_to_device_cpu = _tta_profile_elapsed(data_to_device_start)
+        if tta_profile_enabled:
+            _tta_profile_log(
+                "dataset_data_to_device",
+                data_to_device_start,
+                extra=f"dataset={dataset_idx} name={data.name}",
+            )
 
         # Determine PCA target dimension based on args (same as in process_data)
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
@@ -1557,12 +1628,25 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         if rank == 0:
             print(f"    Created {total_versions} versions (original + {tta_num_augmentations} augmented)")
 
-        def _run_one_tta_view(data_version, view_type):
+        def _run_one_tta_view(data_version, view_type, view_idx):
+            nonlocal infer_wall, infer_cpu
+            infer_start = _tta_profile_snapshot()
             train_logits, valid_logits, test_logits = test_single_with_logits(
                 model, predictor, data_version, train_idx, valid_idx, test_idx,
                 batch_size, degree, att, mlp, normalize_class_h, projector, rank,
                 identity_projection, external_embeddings, args, use_cs, cs_num_iters, cs_alpha
             )
+            infer_view_wall, infer_view_cpu = _tta_profile_elapsed(infer_start)
+            infer_wall += infer_view_wall
+            infer_cpu += infer_view_cpu
+            if tta_profile_enabled and tta_profile_view_interval > 0:
+                is_last = (view_idx == total_versions - 1)
+                if view_idx == 0 or is_last or (view_idx % tta_profile_view_interval == 0):
+                    _tta_profile_log(
+                        "tta_view_infer",
+                        infer_start,
+                        extra=f"dataset={dataset_idx} view={view_type} idx={view_idx}",
+                    )
             all_train_logits.append(train_logits)
             all_valid_logits.append(valid_logits)
             all_test_logits.append(test_logits)
@@ -1582,7 +1666,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 print(f"      [{view_type}] Train: {train_acc:.4f}, Valid: {valid_acc:.4f}, Test: {test_acc:.4f}")
 
         if tta_include_original:
-            _run_one_tta_view(data_device, "Original")
+            _run_one_tta_view(data_device, "Original", 0)
 
         for aug_idx in range(tta_num_augmentations):
             # Use deterministic seed for reproducibility: base 999000 + graph_idx * 1000 + aug_idx
@@ -1596,6 +1680,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 print(f"    WARNING: x_original not found for {getattr(data_device, 'name', 'unknown')}, using data.x (may be PCA-processed!)")
 
             # Step 2: Apply augmentation (sigma(WX+b)) on inference device
+            aug_start = _tta_profile_snapshot()
             data_aug = apply_random_projection_augmentation(
                 data_for_aug,
                 hidden_dim_range=None,  # Use default (0.5x to 2.0x)
@@ -1605,8 +1690,18 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 rank=rank,
                 max_hidden_dim=getattr(args, 'augmentation_max_dim', None)
             )
+            aug_view_wall, aug_view_cpu = _tta_profile_elapsed(aug_start)
+            aug_wall += aug_view_wall
+            aug_cpu += aug_view_cpu
+            if tta_profile_enabled and tta_profile_view_interval > 0 and ((aug_idx + 1) % tta_profile_view_interval == 0):
+                _tta_profile_log(
+                    "tta_view_augment",
+                    aug_start,
+                    extra=f"dataset={dataset_idx} aug_idx={aug_idx + 1} seed={seed} out_dim={data_aug.x.shape[1]}",
+                )
 
             # Step 3: Apply PCA to augmented features on inference device
+            pca_start = _tta_profile_snapshot()
             if data_aug.x.shape[1] >= pca_target_dim:
                 U, S, _ = torch.pca_lowrank(data_aug.x, q=pca_target_dim)
                 data_aug.x_pca = torch.mm(U, torch.diag(S))
@@ -1616,6 +1711,15 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 pad_size = pca_target_dim - data_aug.x_pca.shape[1]
                 padding = torch.zeros(data_aug.x_pca.shape[0], pad_size, device=data_aug.x.device)
                 data_aug.x_pca = torch.cat([data_aug.x_pca, padding], dim=1)
+            pca_view_wall, pca_view_cpu = _tta_profile_elapsed(pca_start)
+            pca_wall += pca_view_wall
+            pca_cpu += pca_view_cpu
+            if tta_profile_enabled and tta_profile_view_interval > 0 and ((aug_idx + 1) % tta_profile_view_interval == 0):
+                _tta_profile_log(
+                    "tta_view_pca",
+                    pca_start,
+                    extra=f"dataset={dataset_idx} aug_idx={aug_idx + 1} pca_dim={data_aug.x_pca.shape[1]}",
+                )
 
             data_aug.x = data_aug.x_pca
 
@@ -1626,7 +1730,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             if hasattr(data_device, 'needs_projection'):
                 data_aug.needs_projection = data_device.needs_projection
 
-            _run_one_tta_view(data_aug, f"Aug_{aug_idx + 1}")
+            _run_one_tta_view(data_aug, f"Aug_{aug_idx + 1}", aug_idx + 1)
 
         # DEBUG: Print individual view accuracies for comparison
         if rank == 0:
@@ -1779,6 +1883,21 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         if rank == 0:
             print(f"    [TTA] Dataset {dataset_idx} ({data.name}): completed in {dataset_time:.2f}s")
             print(f"      Train {train_metric:.4f}, Valid {valid_metric:.4f}, Test {test_metric:.4f}", flush=True)
+            if tta_profile_enabled:
+                infer_cpu_ratio = (100.0 * infer_cpu / infer_wall) if infer_wall > 1e-9 else 0.0
+                aug_cpu_ratio = (100.0 * aug_cpu / aug_wall) if aug_wall > 1e-9 else 0.0
+                pca_cpu_ratio = (100.0 * pca_cpu / pca_wall) if pca_wall > 1e-9 else 0.0
+                _tta_profile_log(
+                    "dataset_summary",
+                    dataset_profile_start,
+                    extra=(
+                        f"dataset={dataset_idx} name={data.name} versions={total_versions} "
+                        f"data_to_device_wall={data_to_device_wall:.3f}s data_to_device_cpu={data_to_device_cpu:.3f}s "
+                        f"aug_wall={aug_wall:.3f}s aug_cpu={aug_cpu:.3f}s aug_cpu_over_wall={aug_cpu_ratio:.1f}% "
+                        f"pca_wall={pca_wall:.3f}s pca_cpu={pca_cpu:.3f}s pca_cpu_over_wall={pca_cpu_ratio:.1f}% "
+                        f"infer_wall={infer_wall:.3f}s infer_cpu={infer_cpu:.3f}s infer_cpu_over_wall={infer_cpu_ratio:.1f}%"
+                    ),
+                )
 
         train_metric_list.append(train_metric)
         valid_metric_list.append(valid_metric)

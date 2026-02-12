@@ -502,6 +502,10 @@ def parse_joint_training_args():
     # === Profiling and Performance ===
     parser.add_argument('--enable_profiling', type=str2bool, default=False,
                        help='Enable PyTorch profiler during evaluation to track CPU/GPU usage')
+    parser.add_argument('--nc_eval_profile', type=str2bool, default=False,
+                       help='Enable NC unseen-test evaluation profiling (stage wall/CPU time, CPU load, and GPU memory)')
+    parser.add_argument('--nc_eval_profile_view_interval', type=int, default=0,
+                       help='When nc_eval_profile=True, log per-TTA-view inference every N views (0=summary only)')
     
     # === Joint Multi-Task Training (TSGFM-style) ===
 # Removed joint multitask arguments - only using task-specific and full batch training

@@ -2458,12 +2458,71 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
 
     results = {}
 
+    # Lightweight NC evaluation profiler (enabled only for unseen test split).
+    nc_profile_enabled = (split == 'test' and bool(getattr(args, 'nc_eval_profile', False)))
+    nc_profile_proc = psutil.Process(os.getpid()) if nc_profile_enabled else None
+
+    try:
+        nc_profile_device = next(model.parameters()).device
+    except StopIteration:
+        try:
+            nc_profile_device = next(predictor.parameters()).device
+        except StopIteration:
+            nc_profile_device = torch.device('cpu')
+
+    def _nc_profile_snapshot():
+        if not nc_profile_enabled:
+            return None
+        cpu_times = nc_profile_proc.cpu_times()
+        return time.perf_counter(), (cpu_times.user + cpu_times.system)
+
+    def _nc_profile_log(stage, start_snapshot=None, extra=""):
+        if not nc_profile_enabled:
+            return
+        now_snapshot = _nc_profile_snapshot()
+        wall_dt = 0.0
+        cpu_dt = 0.0
+        cpu_over_wall = 0.0
+        if start_snapshot is not None:
+            wall_dt = now_snapshot[0] - start_snapshot[0]
+            cpu_dt = now_snapshot[1] - start_snapshot[1]
+            if wall_dt > 1e-9:
+                cpu_over_wall = 100.0 * cpu_dt / wall_dt
+        sys_cpu = psutil.cpu_percent(interval=None)
+        rss_gb = nc_profile_proc.memory_info().rss / (1024 ** 3)
+        gpu_alloc_gb = 0.0
+        gpu_reserved_gb = 0.0
+        if isinstance(nc_profile_device, torch.device) and nc_profile_device.type == 'cuda' and torch.cuda.is_available():
+            dev_idx = nc_profile_device.index if nc_profile_device.index is not None else torch.cuda.current_device()
+            gpu_alloc_gb = torch.cuda.memory_allocated(dev_idx) / (1024 ** 3)
+            gpu_reserved_gb = torch.cuda.memory_reserved(dev_idx) / (1024 ** 3)
+        extra_text = f" | {extra}" if extra else ""
+        print(
+            f"[NC_EVAL_PROFILE] {stage} | wall={wall_dt:.3f}s cpu={cpu_dt:.3f}s "
+            f"cpu/wall={cpu_over_wall:.1f}% sys_cpu={sys_cpu:.1f}% rss={rss_gb:.2f}GB "
+            f"gpu_alloc={gpu_alloc_gb:.2f}GB gpu_reserved={gpu_reserved_gb:.2f}GB{extra_text}"
+        )
+
+    if nc_profile_enabled:
+        # Prime instantaneous CPU sampler.
+        psutil.cpu_percent(interval=None)
+        _nc_profile_log(
+            "enabled",
+            extra=(
+                f"split={split} use_tta={getattr(args, 'use_test_time_augmentation', False)} "
+                f"tta_aug={getattr(args, 'tta_num_augmentations', 0)} "
+                f"context_samples={getattr(args, 'unseen_test_context_samples', 1)} "
+                f"batch_size={getattr(args, 'test_batch_size', -1)}"
+            ),
+        )
+
     with torch.no_grad():
         nc_data_list, nc_split_idx_list, nc_external_embeddings = nc_data
         if len(nc_data_list) > 0:
             if split == 'test':
                 print(f"  Processing {len(nc_data_list)} unseen test datasets...")
                 datasets_start_time = time.time()
+                test_eval_profile_start = _nc_profile_snapshot()
 
                 # Check if TTA is enabled for final test evaluation
                 use_tta = getattr(args, 'use_test_time_augmentation', False)
@@ -2471,6 +2530,16 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                 num_context_samples = max(1, int(getattr(args, 'unseen_test_context_samples', 1)))
                 if num_context_samples > 1:
                     print(f"  Averaging test metrics over {num_context_samples} random context resamples")
+                if nc_profile_enabled:
+                    views_per_dataset = getattr(args, 'tta_num_augmentations', 0) + (1 if getattr(args, 'tta_include_original', True) else 0) if use_tta else 1
+                    planned_eval_calls = len(nc_data_list) * num_context_samples * views_per_dataset
+                    _nc_profile_log(
+                        "plan",
+                        extra=(
+                            f"datasets={len(nc_data_list)} context_samples={num_context_samples} "
+                            f"views_per_dataset={views_per_dataset} total_view_evals~={planned_eval_calls}"
+                        ),
+                    )
 
                 def _average_metric_lists(metric_lists):
                     if not metric_lists:
@@ -2511,7 +2580,13 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     )
 
                 if num_context_samples == 1:
+                    eval_once_start = _nc_profile_snapshot()
                     train_metrics, valid_metrics, test_metrics = _run_eval_once()
+                    _nc_profile_log(
+                        "eval_once",
+                        eval_once_start,
+                        extra=f"context_sample_idx=0 datasets={len(nc_data_list)}",
+                    )
                 else:
                     from src.data_utils import select_k_shot_context
                     original_contexts = []
@@ -2525,6 +2600,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
 
                     base_seed = _get_unseen_test_context_seed_base(args)
                     for sample_idx in range(num_context_samples):
+                        context_resample_start = _nc_profile_snapshot()
                         torch.manual_seed(base_seed + sample_idx)
                         for data, split_idx in zip(nc_data_list, nc_split_idx_list):
                             context_shots = resolve_context_shots(data.name, 'nc', args, epoch=None)
@@ -2535,8 +2611,19 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                             context_source_split = context_source_split.to(data.y.device)
                             new_context = select_k_shot_context(data, context_shots, context_source_split)
                             data.context_sample = new_context.to(data.y.device)
+                        _nc_profile_log(
+                            "context_resample",
+                            context_resample_start,
+                            extra=f"sample_idx={sample_idx} seed={base_seed + sample_idx}",
+                        )
 
+                        eval_once_start = _nc_profile_snapshot()
                         train_m, valid_m, test_m = _run_eval_once()
+                        _nc_profile_log(
+                            "eval_once",
+                            eval_once_start,
+                            extra=f"context_sample_idx={sample_idx} datasets={len(nc_data_list)}",
+                        )
                         all_train_metrics.append(train_m)
                         all_valid_metrics.append(valid_m)
                         all_test_metrics.append(test_m)
@@ -2556,6 +2643,11 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                 else:
                     tta_suffix = " (with TTA)" if use_tta else ""
                 print(f"  All {len(nc_data_list)} datasets completed in {datasets_time:.2f}s{tta_suffix}")
+                _nc_profile_log(
+                    "test_eval_total",
+                    test_eval_profile_start,
+                    extra=f"datasets={len(nc_data_list)} use_tta={use_tta} context_samples={num_context_samples}",
+                )
 
                 results = {
                     'train': sum(train_metrics) / len(train_metrics) if train_metrics else 0.0,
