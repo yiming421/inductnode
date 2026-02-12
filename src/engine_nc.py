@@ -1568,13 +1568,17 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             all_test_logits.append(test_logits)
 
             if rank == 0:
-                y_view = data_device.y
+                debug_device = train_logits.device
+                y_view = data_version.y.to(debug_device)
+                train_idx_view = train_idx.to(debug_device)
+                valid_idx_view = valid_idx.to(debug_device)
+                test_idx_view = test_idx.to(debug_device)
                 train_pred = train_logits.argmax(dim=-1)
                 valid_pred = valid_logits.argmax(dim=-1)
                 test_pred = test_logits.argmax(dim=-1)
-                train_acc = (train_pred == y_view[train_idx]).float().mean().item()
-                valid_acc = (valid_pred == y_view[valid_idx]).float().mean().item()
-                test_acc = (test_pred == y_view[test_idx]).float().mean().item()
+                train_acc = (train_pred == y_view[train_idx_view]).float().mean().item()
+                valid_acc = (valid_pred == y_view[valid_idx_view]).float().mean().item()
+                test_acc = (test_pred == y_view[test_idx_view]).float().mean().item()
                 print(f"      [{view_type}] Train: {train_acc:.4f}, Valid: {valid_acc:.4f}, Test: {test_acc:.4f}")
 
         if tta_include_original:
@@ -1626,8 +1630,9 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
         # DEBUG: Print individual view accuracies for comparison
         if rank == 0:
-            y_all = data_device.y
-            test_idx_dev = test_idx
+            summary_device = all_test_logits[0].device
+            y_all = data_device.y.to(summary_device)
+            test_idx_dev = test_idx.to(summary_device)
             individual_test_accs = []
             for logits in all_test_logits:
                 pred = logits.argmax(dim=-1)
