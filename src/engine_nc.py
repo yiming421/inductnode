@@ -1525,6 +1525,8 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
     def _tta_profile_snapshot():
         if not tta_profile_enabled:
             return None
+        if inference_device.type == 'cuda' and torch.cuda.is_available():
+            torch.cuda.synchronize(inference_device)
         cpu_times = tta_profile_proc.cpu_times()
         return time.perf_counter(), (cpu_times.user + cpu_times.system)
 

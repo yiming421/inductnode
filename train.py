@@ -2473,6 +2473,8 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
     def _nc_profile_snapshot():
         if not nc_profile_enabled:
             return None
+        if isinstance(nc_profile_device, torch.device) and nc_profile_device.type == 'cuda' and torch.cuda.is_available():
+            torch.cuda.synchronize(nc_profile_device)
         cpu_times = nc_profile_proc.cpu_times()
         return time.perf_counter(), (cpu_times.user + cpu_times.system)
 
