@@ -1507,6 +1507,17 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         print(f"  Total versions per graph: {tta_num_augmentations + (1 if tta_include_original else 0)}")
         print(f"{'='*80}\n")
 
+    # Resolve inference device once; TTA views will be generated and evaluated on this device.
+    try:
+        inference_device = next(model.parameters()).device
+    except StopIteration:
+        try:
+            inference_device = next(predictor.parameters()).device
+        except StopIteration:
+            inference_device = data_list[0].x.device if len(data_list) > 0 else torch.device('cpu')
+    if rank == 0:
+        print(f"  TTA inference device: {inference_device}")
+
     train_metric_list, valid_metric_list, test_metric_list = [], [], []
 
     for dataset_idx, (data, split_idx) in enumerate(zip(data_list, split_idx_list)):
@@ -1520,33 +1531,67 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         test_idx = split_idx['test']
         external_embeddings = external_embeddings_list[dataset_idx] if external_embeddings_list else None
 
+        # Keep a dataset-scoped GPU copy for the whole TTA procedure.
+        data_device = data.clone().to(inference_device)
+        train_idx = train_idx.to(inference_device)
+        valid_idx = valid_idx.to(inference_device)
+        test_idx = test_idx.to(inference_device)
+        if hasattr(data_device, 'context_sample') and data_device.context_sample is not None:
+            data_device.context_sample = data_device.context_sample.to(inference_device)
+        if hasattr(data_device, 'adj_t'):
+            data_device.adj_t = data_device.adj_t.to(inference_device)
+
         # Determine PCA target dimension based on args (same as in process_data)
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
             pca_target_dim = args.projection_small_dim
         else:
             pca_target_dim = args.hidden
 
-        # Create augmented versions
-        augmented_data_list = []
+        # Collect logits from all TTA versions (processed sequentially on GPU).
+        all_train_logits = []
+        all_valid_logits = []
+        all_test_logits = []
+        total_versions = tta_num_augmentations + (1 if tta_include_original else 0)
+        if rank == 0:
+            print(f"    Created {total_versions} versions (original + {tta_num_augmentations} augmented)")
+
+        def _run_one_tta_view(data_version, view_type):
+            train_logits, valid_logits, test_logits = test_single_with_logits(
+                model, predictor, data_version, train_idx, valid_idx, test_idx,
+                batch_size, degree, att, mlp, normalize_class_h, projector, rank,
+                identity_projection, external_embeddings, args, use_cs, cs_num_iters, cs_alpha
+            )
+            all_train_logits.append(train_logits)
+            all_valid_logits.append(valid_logits)
+            all_test_logits.append(test_logits)
+
+            if rank == 0:
+                y_view = data_device.y
+                train_pred = train_logits.argmax(dim=-1)
+                valid_pred = valid_logits.argmax(dim=-1)
+                test_pred = test_logits.argmax(dim=-1)
+                train_acc = (train_pred == y_view[train_idx]).float().mean().item()
+                valid_acc = (valid_pred == y_view[valid_idx]).float().mean().item()
+                test_acc = (test_pred == y_view[test_idx]).float().mean().item()
+                print(f"      [{view_type}] Train: {train_acc:.4f}, Valid: {valid_acc:.4f}, Test: {test_acc:.4f}")
+
         if tta_include_original:
-            augmented_data_list.append(data)
+            _run_one_tta_view(data_device, "Original")
 
         for aug_idx in range(tta_num_augmentations):
             # Use deterministic seed for reproducibility: base 999000 + graph_idx * 1000 + aug_idx
             seed = 999000 + dataset_idx * 1000 + aug_idx
 
-            # TTA chain: ORIGINAL → AUG → PCA → MODEL
-            # Step 1: Start with original features (before PCA)
-            data_aug = data.clone()
-            if hasattr(data, 'x_original'):
-                data_aug.x = data.x_original.clone()
-            else:
-                if rank == 0 and aug_idx == 0:
-                    print(f"    WARNING: x_original not found for {data.name}, using data.x (may be PCA-processed!)")
+            # TTA chain: ORIGINAL -> AUG -> PCA -> MODEL
+            data_for_aug = data_device.clone()
+            if hasattr(data_device, 'x_original'):
+                data_for_aug.x = data_device.x_original.clone()
+            elif rank == 0 and aug_idx == 0:
+                print(f"    WARNING: x_original not found for {getattr(data_device, 'name', 'unknown')}, using data.x (may be PCA-processed!)")
 
-            # Step 2: Apply augmentation (σ(WX+b))
+            # Step 2: Apply augmentation (sigma(WX+b)) on inference device
             data_aug = apply_random_projection_augmentation(
-                data_aug,
+                data_for_aug,
                 hidden_dim_range=None,  # Use default (0.5x to 2.0x)
                 activation_pool=None,   # Use default diverse pool
                 seed=seed,
@@ -1555,76 +1600,32 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 max_hidden_dim=getattr(args, 'augmentation_max_dim', None)
             )
 
-            # Step 3: Apply PCA to augmented features
-            # Apply PCA to target dimension (or less if we don't have enough features)
+            # Step 3: Apply PCA to augmented features on inference device
             if data_aug.x.shape[1] >= pca_target_dim:
-                # PCA to target dimension
-                U, S, V = torch.pca_lowrank(data_aug.x, q=pca_target_dim)
+                U, S, _ = torch.pca_lowrank(data_aug.x, q=pca_target_dim)
                 data_aug.x_pca = torch.mm(U, torch.diag(S))
             else:
-                # PCA to whatever we have, then pad
-                U, S, V = torch.pca_lowrank(data_aug.x, q=data_aug.x.shape[1])
+                U, S, _ = torch.pca_lowrank(data_aug.x, q=data_aug.x.shape[1])
                 data_aug.x_pca = torch.mm(U, torch.diag(S))
-                # Pad to target dimension
                 pad_size = pca_target_dim - data_aug.x_pca.shape[1]
                 padding = torch.zeros(data_aug.x_pca.shape[0], pad_size, device=data_aug.x.device)
                 data_aug.x_pca = torch.cat([data_aug.x_pca, padding], dim=1)
 
-            # Set the processed features as the main features
             data_aug.x = data_aug.x_pca
 
-            # Copy other necessary attributes from original data
-            if hasattr(data, 'needs_identity_projection'):
-                data_aug.needs_identity_projection = data.needs_identity_projection
-            if hasattr(data, 'projection_target_dim'):
-                data_aug.projection_target_dim = data.projection_target_dim
-            if hasattr(data, 'needs_projection'):
-                data_aug.needs_projection = data.needs_projection
+            if hasattr(data_device, 'needs_identity_projection'):
+                data_aug.needs_identity_projection = data_device.needs_identity_projection
+            if hasattr(data_device, 'projection_target_dim'):
+                data_aug.projection_target_dim = data_device.projection_target_dim
+            if hasattr(data_device, 'needs_projection'):
+                data_aug.needs_projection = data_device.needs_projection
 
-            augmented_data_list.append(data_aug)
-
-        if rank == 0:
-            print(f"    Created {len(augmented_data_list)} versions (original + {tta_num_augmentations} augmented)")
-
-        # Collect logits from all augmented versions
-        all_train_logits = []
-        all_valid_logits = []
-        all_test_logits = []
-
-        for version_idx, data_version in enumerate(augmented_data_list):
-            # Run inference on this version
-            train_logits, valid_logits, test_logits = test_single_with_logits(
-                model, predictor, data_version, train_idx, valid_idx, test_idx,
-                batch_size, degree, att, mlp, normalize_class_h, projector, rank,
-                identity_projection, external_embeddings, args, use_cs, cs_num_iters, cs_alpha
-            )
-
-            all_train_logits.append(train_logits)
-            all_valid_logits.append(valid_logits)
-            all_test_logits.append(test_logits)
-
-            # DEBUG: Print accuracy of each view
-            if rank == 0:
-                y_view = data.y.to(train_logits.device)
-                train_idx_view = train_idx.to(train_logits.device)
-                valid_idx_view = valid_idx.to(train_logits.device)
-                test_idx_view = test_idx.to(train_logits.device)
-
-                train_pred = train_logits.argmax(dim=-1)
-                valid_pred = valid_logits.argmax(dim=-1)
-                test_pred = test_logits.argmax(dim=-1)
-
-                train_acc = (train_pred == y_view[train_idx_view]).float().mean().item()
-                valid_acc = (valid_pred == y_view[valid_idx_view]).float().mean().item()
-                test_acc = (test_pred == y_view[test_idx_view]).float().mean().item()
-
-                view_type = "Original" if version_idx == 0 and tta_include_original else f"Aug_{version_idx}"
-                print(f"      [{view_type}] Train: {train_acc:.4f}, Valid: {valid_acc:.4f}, Test: {test_acc:.4f}")
+            _run_one_tta_view(data_aug, f"Aug_{aug_idx + 1}")
 
         # DEBUG: Print individual view accuracies for comparison
         if rank == 0:
-            y_all = data.y.to(all_test_logits[0].device)
-            test_idx_dev = test_idx.to(all_test_logits[0].device)
+            y_all = data_device.y
+            test_idx_dev = test_idx
             individual_test_accs = []
             for logits in all_test_logits:
                 pred = logits.argmax(dim=-1)
@@ -1676,11 +1677,11 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
 
         metric_device = train_logits_agg.device
-        y_device = data.y.to(metric_device)
+        y_device = data_device.y.to(metric_device)
         train_idx_dev = train_idx.to(metric_device)
         valid_idx_dev = valid_idx.to(metric_device)
         test_idx_dev = test_idx.to(metric_device)
-        context_sample_dev = data.context_sample.to(metric_device)
+        context_sample_dev = data_device.context_sample.to(metric_device)
 
         # Optionally gate TTA by validation performance (per dataset)
         train_logits_sel = train_logits_agg
@@ -1730,7 +1731,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             num_classes = context_y.max().item() + 1
 
             cs_predictions = correct_and_smooth(
-                data.adj_t.to(metric_device), all_logits, context_sample_dev, context_y,
+                data_device.adj_t.to(metric_device), all_logits, context_sample_dev, context_y,
                 num_classes, cs_num_iters, cs_alpha
             )
 

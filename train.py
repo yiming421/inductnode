@@ -4422,6 +4422,11 @@ def main():
         print(f"Run {run + 1}/{args.runs}")
         print(f"{'='*50}")
 
+        # Reset per-run unseen-test context seed cache so each run can get
+        # an independent seed base in 'per_run' mode.
+        if hasattr(args, '_unseen_test_context_seed_base'):
+            delattr(args, '_unseen_test_context_seed_base')
+
         # Set different seed for each run with all generators
         run_seed = args.seed + run
         set_all_random_seeds(run_seed)
