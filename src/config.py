@@ -87,6 +87,9 @@ def parse_joint_training_args():
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--unseen_test_context_samples', type=int, default=3,
                         help='Average unseen NC test metrics over N random few-shot context resamples (>=1)')
+    parser.add_argument('--unseen_test_context_seed_mode', type=str, default='per_run',
+                        choices=['per_run', 'fixed'],
+                        help='Seed policy for unseen-test context resampling: per_run=independent each run, fixed=reuse --seed')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
@@ -123,7 +126,7 @@ def parse_joint_training_args():
                        help='Node classification training datasets')
     parser.add_argument('--nc_test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS', 
                        help='Node classification test datasets')
-    parser.add_argument('--lp_train_dataset', type=str, default='CS,Physics,Computers,Photo,Flickr,Wiki,BlogCatalog,FacebookPage', 
+    parser.add_argument('--lp_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Actor,DeezerEurope,LastFMAsia', 
                        help='Link prediction training datasets')
     parser.add_argument('--lp_test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab', 
                        help='Link prediction test datasets')
@@ -242,11 +245,11 @@ def parse_joint_training_args():
     parser.add_argument('--feature_dropout_type', type=str, default='channel_wise',
                        choices=['element_wise', 'channel_wise', 'gaussian_noise'],
                        help='Type of feature dropout: element_wise, channel_wise, or gaussian_noise')
-    parser.add_argument('--nc_static_embedding_cache', type=str, default='auto',
+    parser.add_argument('--static_embedding_cache', type=str, default='auto',
                        choices=['off', 'auto', 'force'],
-                       help='Node classification full-batch embedding cache mode: '
+                       help='Static embedding cache mode for NC/LP/GC: '
                             'off=disabled, auto=enable only for safe parameter-free settings, '
-                            'force=override conservative model-type checks (still requires no trainable NC encoder/projection params)')
+                            'force=override conservative model-type checks (still requires no trainable encoder/projection params)')
 
     # === Random Projection Augmentation ===
     parser.add_argument('--use_random_projection_augmentation', type=str2bool, default=False,
@@ -363,6 +366,8 @@ def parse_joint_training_args():
     parser.add_argument('--context_k', type=int, default=5, help='Number of context samples for link prediction')
     parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
     parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
+    parser.add_argument('--lp_cache_mask_target_only_for_mplp', type=str2bool, default=False,
+                       help='Experimental LP mode: with static embedding cache enabled, keep cached node embeddings but mask batch target edges only in MPLP structural adjacency')
     parser.add_argument('--lp_metric', type=str, default='auto', choices=['auto', 'auc', 'acc', 'hits@20', 'hits@50', 'hits@100', 'mrr'],
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
     parser.add_argument('--lp_head_type', type=str, default='standard', choices=['standard', 'mplp', 'ncn', 'hybrid3'], help='Type of link prediction head')

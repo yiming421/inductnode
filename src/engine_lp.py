@@ -1,6 +1,7 @@
 import torch
 import math
 import torch.nn.functional as F
+import torch.nn as nn
 from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -78,6 +79,49 @@ def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
         return feature_dropout(x, args.feature_dropout_rate, training=training,
                              dropout_type=dropout_type, verbose=verbose)
     return x
+
+
+def _has_trainable_parameters(module):
+    """Return True if module has any trainable parameter."""
+    if module is None:
+        return False
+    return any(p.requires_grad for p in module.parameters())
+
+
+def _is_puregcn_v1_parameter_free(model_module):
+    """
+    Conservative check for parameter-free PureGCN_v1 forward path.
+
+    Returns:
+        (is_safe, reason)
+    """
+    if model_module is None:
+        return False, "model_missing"
+
+    if model_module.__class__.__name__ != 'PureGCN_v1':
+        return False, "model_not_puregcn_v1"
+
+    if not isinstance(getattr(model_module, 'lin', None), nn.Identity):
+        return False, "input_projection_not_identity"
+
+    if getattr(model_module, 'use_virtual_node', False):
+        return False, "virtual_node_enabled"
+
+    if float(getattr(model_module, 'dp', 0.0)) > 0:
+        return False, "model_dropout_enabled"
+
+    if getattr(model_module, 'norm', False):
+        norms = getattr(model_module, 'norms', None)
+        if norms is None:
+            return False, "missing_norm_layers"
+        for layer_norm in norms:
+            if getattr(layer_norm, 'elementwise_affine', False):
+                return False, "gnn_norm_affine_enabled"
+
+    if _has_trainable_parameters(model_module):
+        return False, "model_has_trainable_params"
+
+    return True, None
 
 
 def get_node_embeddings(model, data, projector=None, identity_projection=None, use_full_adj=False, args=None, rank=0):
@@ -206,6 +250,12 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         train_mask = train_mask.to(device)
         head_type = getattr(predictor, 'lp_head_type', '')
         use_lp_cn = getattr(args, 'lp_concat_common_neighbors', False) and head_type == 'standard'
+        cache_mask_target_for_mplp_only = (
+            args is not None and
+            getattr(args, 'lp_cache_mask_target_only_for_mplp', False) and
+            bool(mask_target_edges) and
+            head_type == 'mplp'
+        )
 
         edge_pairs = train_edges['edge_pairs'].to(device)
         labels = train_edges['labels'].to(device)
@@ -240,6 +290,116 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
         # Map original indices to their position in the positive-only list
         pos_original_indices = torch.where(pos_train_mask)[0]
         pos_indices_map = {orig_idx.item(): pos_idx for pos_idx, orig_idx in enumerate(pos_original_indices)}
+
+        def _build_masked_adj_for_batch(batch_indices_local):
+            """Mask current-batch positive target edges from train adjacency."""
+            adj_local = data.adj_t
+            batch_labels_check = labels[batch_indices_local]
+            batch_pos_mask = batch_labels_check == 1
+
+            if not batch_pos_mask.any():
+                return adj_local
+
+            batch_pos_indices = batch_indices_local[batch_pos_mask]
+
+            indices_to_mask_in_pos_list = []
+            for batch_pos_idx in batch_pos_indices:
+                mapped_pos_idx = pos_indices_map.get(batch_pos_idx.item())
+                if mapped_pos_idx is not None:
+                    indices_to_mask_in_pos_list.append(mapped_pos_idx)
+
+            if len(indices_to_mask_in_pos_list) == 0:
+                return adj_local
+
+            pos_adjmask[indices_to_mask_in_pos_list] = False
+            try:
+                edge = pos_train_edges[pos_adjmask].t()
+                adj_local = SparseTensor.from_edge_index(
+                    edge, sparse_sizes=(data.num_nodes, data.num_nodes)
+                ).to(device)
+                adj_local = adj_local.to_symmetric().coalesce()
+            finally:
+                pos_adjmask[indices_to_mask_in_pos_list] = True
+
+            return adj_local
+
+        lp_cache_mode = getattr(args, 'static_embedding_cache', 'auto') if args is not None else 'auto'
+        if lp_cache_mode not in ('off', 'auto', 'force'):
+            lp_cache_mode = 'auto'
+
+        model_module = model.module if hasattr(model, 'module') else model
+        model_has_trainable_params = _has_trainable_parameters(model_module)
+        projector_has_trainable_params = _has_trainable_parameters(projector)
+        identity_has_trainable_params = _has_trainable_parameters(identity_projection)
+        puregcn_cacheable, puregcn_reason = _is_puregcn_v1_parameter_free(model_module)
+
+        edge_dropout_active = (
+            args is not None and
+            getattr(args, 'edge_dropout_enabled', False) and
+            float(getattr(args, 'edge_dropout_rate', 0.0)) > 0
+        )
+        feature_dropout_active = (
+            args is not None and
+            getattr(args, 'feature_dropout_enabled', False) and
+            float(getattr(args, 'feature_dropout_rate', 0.0)) > 0
+        )
+
+        cache_hard_blockers = []
+        if mask_target_edges and not cache_mask_target_for_mplp_only:
+            cache_hard_blockers.append('mask_target_edges_enabled')
+        if edge_dropout_active:
+            cache_hard_blockers.append('edge_dropout_enabled')
+        if feature_dropout_active:
+            cache_hard_blockers.append('feature_dropout_enabled')
+
+        use_static_embedding_cache = False
+        cache_notes = []
+        if lp_cache_mode == 'off':
+            cache_notes.append('policy_off')
+        elif len(cache_hard_blockers) > 0:
+            cache_notes.extend(cache_hard_blockers)
+        elif lp_cache_mode == 'auto':
+            if not puregcn_cacheable:
+                cache_notes.append(puregcn_reason or 'model_not_cacheable')
+            if model_has_trainable_params:
+                cache_notes.append('model_has_trainable_params')
+            if projector_has_trainable_params:
+                cache_notes.append('projector_has_trainable_params')
+            if identity_has_trainable_params:
+                cache_notes.append('identity_projection_has_trainable_params')
+            use_static_embedding_cache = len(cache_notes) == 0
+        else:  # force
+            if model_has_trainable_params:
+                cache_notes.append('force_rejected_model_has_trainable_params')
+            if projector_has_trainable_params:
+                cache_notes.append('force_rejected_projector_has_trainable_params')
+            if identity_has_trainable_params:
+                cache_notes.append('force_rejected_identity_projection_has_trainable_params')
+            use_static_embedding_cache = len(cache_notes) == 0
+            if use_static_embedding_cache and not puregcn_cacheable:
+                cache_notes.append(f"forced_without_strict_check:{puregcn_reason or 'unknown'}")
+
+        cache_notes = list(dict.fromkeys(cache_notes))
+        if rank == 0:
+            dataset_name = getattr(data, 'name', 'unknown')
+            if use_static_embedding_cache:
+                print(f"[LP Cache] Enabled for {dataset_name} (mode={lp_cache_mode}): one full-graph GNN forward per epoch.")
+                if len(cache_notes) > 0:
+                    print(f"[LP Cache] Note: {', '.join(cache_notes)}")
+            else:
+                print(f"[LP Cache] Disabled for {dataset_name} (mode={lp_cache_mode}): {', '.join(cache_notes)}")
+
+        static_node_embeddings = None
+        static_data_for_gnn = None
+        if use_static_embedding_cache:
+            static_data_for_gnn = copy.copy(data)
+            static_data_for_gnn.adj_t = data.adj_t
+            with torch.no_grad():
+                static_node_embeddings = get_node_embeddings(
+                    model, static_data_for_gnn, projector, identity_projection,
+                    use_full_adj=False, args=args, rank=rank
+                )
+            static_node_embeddings = static_node_embeddings.detach()
         
         total_loss = 0
         batch_count = 0
@@ -278,38 +438,28 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
                 if optimizer is not None:
                     optimizer.zero_grad()
 
-                # --- Optional: Masking Target Edges ---
-                adj_for_gnn = data.adj_t
-                if mask_target_edges:
-                    # Get batch labels and find positive edges in current batch
-                    batch_labels_check = labels[batch_indices]
-                    batch_pos_mask = batch_labels_check == 1
-                    
-                    if batch_pos_mask.any():
-                        # Get the actual batch indices that correspond to positive edges
-                        batch_pos_indices = batch_indices[batch_pos_mask]
-                        
-                        # Map these batch indices to positions in the pos_train_edges tensor
-                        indices_to_mask_in_pos_list = []
-                        for batch_pos_idx in batch_pos_indices:
-                            if batch_pos_idx.item() in pos_indices_map:
-                                indices_to_mask_in_pos_list.append(pos_indices_map[batch_pos_idx.item()])
-                        
-                        if indices_to_mask_in_pos_list:
-                            pos_adjmask[indices_to_mask_in_pos_list] = False
-                            
-                            # Build graph from all positive edges *not* in the current batch
-                            edge = pos_train_edges[pos_adjmask].t()
-                            adj_for_gnn = SparseTensor.from_edge_index(edge, sparse_sizes=(data.num_nodes, data.num_nodes)).to(device)
-                            adj_for_gnn = adj_for_gnn.to_symmetric().coalesce()
+                if use_static_embedding_cache:
+                    # Keep cached node embeddings fixed; optionally use masked adjacency
+                    # only for MPLP structural scoring.
+                    if cache_mask_target_for_mplp_only:
+                        adj_for_gnn = _build_masked_adj_for_batch(batch_indices)
+                    else:
+                        adj_for_gnn = data.adj_t
+                    data_for_gnn = static_data_for_gnn
+                    node_embeddings = static_node_embeddings
+                else:
+                    # --- Optional: Masking Target Edges ---
+                    adj_for_gnn = data.adj_t
+                    if mask_target_edges:
+                        adj_for_gnn = _build_masked_adj_for_batch(batch_indices)
 
-                            # Reset the mask for the next iteration
-                            pos_adjmask[indices_to_mask_in_pos_list] = True
-
-                # Recompute embeddings and prototypes for each batch to maintain the computation graph
-                data_for_gnn = copy.copy(data)
-                data_for_gnn.adj_t = adj_for_gnn
-                node_embeddings = get_node_embeddings(model, data_for_gnn, projector, identity_projection, use_full_adj=False, args=args, rank=rank)
+                    # Recompute embeddings and prototypes for each batch to maintain the computation graph
+                    data_for_gnn = copy.copy(data)
+                    data_for_gnn.adj_t = adj_for_gnn
+                    node_embeddings = get_node_embeddings(
+                        model, data_for_gnn, projector, identity_projection,
+                        use_full_adj=False, args=args, rank=rank
+                    )
 
                 # -----------------------------------------
 

@@ -338,7 +338,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
 
     # Optional NC static embedding cache (full-batch only).
     # In auto mode, enable only when forward is deterministic and parameter-free.
-    nc_cache_mode = getattr(args, 'nc_static_embedding_cache', 'auto') if args is not None else 'auto'
+    nc_cache_mode = getattr(args, 'static_embedding_cache', 'auto') if args is not None else 'auto'
     if nc_cache_mode not in ('off', 'auto', 'force'):
         nc_cache_mode = 'auto'
 

@@ -8,6 +8,7 @@ import sys
 import time
 import copy
 import random
+import secrets
 import torch
 import wandb
 import signal
@@ -65,6 +66,26 @@ def _select_primary_metric(metric_dict, override=None, prefer='auc'):
     if prefer == 'ap':
         return metric_dict.get('ap', metric_dict.get('auc', next(iter(metric_dict.values()))))
     return metric_dict.get('auc', metric_dict.get('ap', next(iter(metric_dict.values()))))
+
+
+def _get_unseen_test_context_seed_base(args):
+    """
+    Return a seed base for unseen-test context resampling.
+    - fixed: reuse args.seed (fully reproducible across runs)
+    - per_run: derive once from OS entropy and cache on args (different each run)
+    """
+    mode = str(getattr(args, 'unseen_test_context_seed_mode', 'per_run')).lower()
+    if mode == 'fixed':
+        return int(getattr(args, 'seed', 42))
+    if mode != 'per_run':
+        print(f"[Unseen Test Context] Unknown seed mode '{mode}', defaulting to 'per_run'")
+
+    cached_seed = getattr(args, '_unseen_test_context_seed_base', None)
+    if cached_seed is None:
+        cached_seed = int(secrets.randbits(31))
+        setattr(args, '_unseen_test_context_seed_base', cached_seed)
+        print(f"[Unseen Test Context] Using run seed base {cached_seed} (mode=per_run)")
+    return int(cached_seed)
 
 
 # Memory and time tracking utilities for Link Prediction
@@ -1615,41 +1636,65 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         else:
             print(f"Using standard loading for test datasets (original features, no PCA cache)")
 
-        for dataset_name in gc_test_datasets:
-            dataset_name = dataset_name.strip()
-            if gc_tracker:
-                gc_tracker.log_memory(f"gc_test_dataset_{dataset_name}_loading_start")
+        gc_test_context_seed_base = _get_unseen_test_context_seed_base(args)
+        print(f"[GC Test Context] Seed mode: {getattr(args, 'unseen_test_context_seed_mode', 'per_run')}, base={gc_test_context_seed_base}")
 
-            # Resolve context shots for this specific dataset
-            context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch=None)
+        # Preserve RNG states so GC test context reseeding does not leak into later stages.
+        py_rng_state = random.getstate()
+        np_rng_state = np.random.get_state()
+        torch_rng_state = torch.random.get_rng_state()
+        cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
 
-            # Use cache-aware loading only for FUG, standard loading for original features
-            if use_cache_aware:
-                try:
-                    single_data_list, single_processed_list = load_all_graph_datasets_cache_aware(
-                        [dataset_name], device, context_k=context_shots,
-                        hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
-                    )
-                    cache_used = cache_status.get(dataset_name, False)
-                    memory_status = " (🚀 Cache used - 48GB saved!)" if cache_used else " (Full loading)"
-                    print(f"  {dataset_name}: Loaded{memory_status}")
-                except ImportError:
-                    print(f"⚠️  Cache-aware module not available for {dataset_name}, using standard loading")
+        try:
+            for dataset_idx, dataset_name in enumerate(gc_test_datasets):
+                dataset_name = dataset_name.strip()
+                if gc_tracker:
+                    gc_tracker.log_memory(f"gc_test_dataset_{dataset_name}_loading_start")
+
+                # Use a deterministic per-dataset offset from the unseen-test seed base.
+                dataset_seed = int(gc_test_context_seed_base + dataset_idx * 1000)
+                random.seed(dataset_seed)
+                np.random.seed(dataset_seed)
+                torch.manual_seed(dataset_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(dataset_seed)
+
+                # Resolve context shots for this specific dataset
+                context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch=None)
+
+                # Use cache-aware loading only for FUG, standard loading for original features
+                if use_cache_aware:
+                    try:
+                        single_data_list, single_processed_list = load_all_graph_datasets_cache_aware(
+                            [dataset_name], device, context_k=context_shots,
+                            hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
+                        )
+                        cache_used = cache_status.get(dataset_name, False)
+                        memory_status = " (🚀 Cache used - 48GB saved!)" if cache_used else " (Full loading)"
+                        print(f"  {dataset_name}: Loaded{memory_status}")
+                    except ImportError:
+                        print(f"⚠️  Cache-aware module not available for {dataset_name}, using standard loading")
+                        single_data_list, single_processed_list = load_all_graph_datasets(
+                            [dataset_name], device, context_k=context_shots
+                        )
+                else:
+                    # Standard loading for original features (no cache)
                     single_data_list, single_processed_list = load_all_graph_datasets(
                         [dataset_name], device, context_k=context_shots
                     )
-            else:
-                # Standard loading for original features (no cache)
-                single_data_list, single_processed_list = load_all_graph_datasets(
-                    [dataset_name], device, context_k=context_shots
-                )
-                print(f"  {dataset_name}: Loaded (original features, no cache)")
+                    print(f"  {dataset_name}: Loaded (original features, no cache)")
 
-            gc_test_data_list.extend(single_data_list)
-            gc_test_processed_data_list.extend(single_processed_list)
-            
-            if gc_tracker:
-                gc_tracker.log_memory(f"gc_test_dataset_{dataset_name}_loaded")
+                gc_test_data_list.extend(single_data_list)
+                gc_test_processed_data_list.extend(single_processed_list)
+                
+                if gc_tracker:
+                    gc_tracker.log_memory(f"gc_test_dataset_{dataset_name}_loaded")
+        finally:
+            random.setstate(py_rng_state)
+            np.random.set_state(np_rng_state)
+            torch.random.set_rng_state(torch_rng_state)
+            if cuda_rng_states is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_states)
         
         if gc_tracker:
             gc_tracker.log_memory("gc_test_data_all_datasets_loaded")
@@ -2478,7 +2523,7 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     all_valid_metrics = []
                     all_test_metrics = []
 
-                    base_seed = int(getattr(args, 'seed', 42))
+                    base_seed = _get_unseen_test_context_seed_base(args)
                     for sample_idx in range(num_context_samples):
                         torch.manual_seed(base_seed + sample_idx)
                         for data, split_idx in zip(nc_data_list, nc_split_idx_list):
@@ -2621,7 +2666,13 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
     
     # Initialize tracker if needed
     if lp_tracker is None:
-        device = next(model.parameters()).device
+        try:
+            device = next(model.parameters()).device
+        except StopIteration:
+            try:
+                device = next(predictor.parameters()).device
+            except StopIteration:
+                device = torch.device('cpu')
         lp_tracker = LinkPredictionTracker(device=device)
     
     with torch.no_grad():
@@ -2629,6 +2680,14 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
             lp_data_list, lp_split_idx_list, lp_context_data, lp_link_data_all = lp_data
         else:
             lp_data_list, lp_split_idx_list, lp_context_data, _, lp_link_data_all = lp_data
+
+        try:
+            eval_device = next(model.parameters()).device
+        except StopIteration:
+            try:
+                eval_device = next(predictor.parameters()).device
+            except StopIteration:
+                eval_device = lp_data_list[0].x.device if len(lp_data_list) > 0 else torch.device('cpu')
             
         if len(lp_data_list) > 0:
             lp_results_list = []
@@ -2669,10 +2728,10 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                     
                     with lp_tracker.time_operation('evaluation'):
                         # Move only required data to GPU (data is on CPU by default now)
-                        data.x = data.x.to(next(model.parameters()).device)
-                        data.adj_t = data.adj_t.to(next(model.parameters()).device)
+                        data.x = data.x.to(eval_device)
+                        data.adj_t = data.adj_t.to(eval_device)
                         if hasattr(data, 'full_adj_t') and data.full_adj_t is not None:
-                            data.full_adj_t = data.full_adj_t.to(next(model.parameters()).device)
+                            data.full_adj_t = data.full_adj_t.to(eval_device)
                         
                         # Record memory before evaluation
                         lp_tracker.record_memory()
@@ -2713,7 +2772,7 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                         else:
                             context_source = link_data_all.get('train', None)
                             context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
-                            base_seed = int(getattr(args, 'seed', 42))
+                            base_seed = _get_unseen_test_context_seed_base(args)
                             sample_metrics = []
                             sample_gates = []
                             sample_struct = []

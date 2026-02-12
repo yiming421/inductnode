@@ -6,6 +6,7 @@ Reuses the existing PFNPredictorNodeCls by treating pooled graph embeddings as n
 import time
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from torch_geometric.nn import global_mean_pool, global_max_pool, global_add_pool
 from torch_sparse import SparseTensor
 import gc
@@ -167,6 +168,89 @@ def apply_feature_dropout_if_enabled(x, args, rank=0, training=True):
         return feature_dropout(x, args.feature_dropout_rate, training=training,
                              dropout_type=dropout_type, verbose=verbose)
     return x
+
+
+def _has_trainable_parameters(module):
+    """Return True if module has any trainable parameter."""
+    if module is None:
+        return False
+    return any(p.requires_grad for p in module.parameters())
+
+
+def _is_puregcn_v1_parameter_free(model_module):
+    """
+    Conservative check for parameter-free PureGCN_v1 forward path.
+
+    Returns:
+        (is_safe, reason)
+    """
+    if model_module is None:
+        return False, "model_missing"
+
+    if model_module.__class__.__name__ != 'PureGCN_v1':
+        return False, "model_not_puregcn_v1"
+
+    if not isinstance(getattr(model_module, 'lin', None), nn.Identity):
+        return False, "input_projection_not_identity"
+
+    if getattr(model_module, 'use_virtual_node', False):
+        return False, "virtual_node_enabled"
+
+    if float(getattr(model_module, 'dp', 0.0)) > 0:
+        return False, "model_dropout_enabled"
+
+    if getattr(model_module, 'norm', False):
+        norms = getattr(model_module, 'norms', None)
+        if norms is None:
+            return False, "missing_norm_layers"
+        for layer_norm in norms:
+            if getattr(layer_norm, 'elementwise_affine', False):
+                return False, "gnn_norm_affine_enabled"
+
+    if _has_trainable_parameters(model_module):
+        return False, "model_has_trainable_params"
+
+    return True, None
+
+
+def _resolve_static_embedding_cache_policy(args, model, identity_projection=None, hard_blockers=None):
+    """Shared cache policy resolution for GC train loops."""
+    cache_mode = getattr(args, 'static_embedding_cache', 'auto') if args is not None else 'auto'
+    if cache_mode not in ('off', 'auto', 'force'):
+        cache_mode = 'auto'
+
+    model_module = model.module if hasattr(model, 'module') else model
+    model_has_trainable_params = _has_trainable_parameters(model_module)
+    identity_has_trainable_params = _has_trainable_parameters(identity_projection)
+    puregcn_cacheable, puregcn_reason = _is_puregcn_v1_parameter_free(model_module)
+
+    blockers = list(hard_blockers or [])
+    cache_notes = []
+    use_static_embedding_cache = False
+
+    if cache_mode == 'off':
+        cache_notes.append('policy_off')
+    elif len(blockers) > 0:
+        cache_notes.extend(blockers)
+    elif cache_mode == 'auto':
+        if not puregcn_cacheable:
+            cache_notes.append(puregcn_reason or 'model_not_cacheable')
+        if model_has_trainable_params:
+            cache_notes.append('model_has_trainable_params')
+        if identity_has_trainable_params:
+            cache_notes.append('identity_projection_has_trainable_params')
+        use_static_embedding_cache = len(cache_notes) == 0
+    else:  # force
+        if model_has_trainable_params:
+            cache_notes.append('force_rejected_model_has_trainable_params')
+        if identity_has_trainable_params:
+            cache_notes.append('force_rejected_identity_projection_has_trainable_params')
+        use_static_embedding_cache = len(cache_notes) == 0
+        if use_static_embedding_cache and not puregcn_cacheable:
+            cache_notes.append(f"forced_without_strict_check:{puregcn_reason or 'unknown'}")
+
+    cache_notes = list(dict.fromkeys(cache_notes))
+    return use_static_embedding_cache, cache_mode, cache_notes
 
 def refresh_gc_context_if_needed(dataset_info, batch_idx, epoch, args, device='cuda', task_idx=None):
     """
@@ -1510,13 +1594,53 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
         gc_vec_task_chunk_size = 0
     pos_weight = None
 
+    edge_dropout_active = (
+        args is not None and
+        getattr(args, 'edge_dropout_enabled', False) and
+        float(getattr(args, 'edge_dropout_rate', 0.0)) > 0
+    )
+    feature_dropout_active = (
+        args is not None and
+        getattr(args, 'feature_dropout_enabled', False) and
+        float(getattr(args, 'feature_dropout_rate', 0.0)) > 0
+    )
+    cache_hard_blockers = []
+    if use_supervised:
+        cache_hard_blockers.append('gc_supervised_mlp_enabled')
+    if edge_dropout_active:
+        cache_hard_blockers.append('edge_dropout_enabled')
+    if feature_dropout_active:
+        cache_hard_blockers.append('feature_dropout_enabled')
+    use_static_embedding_cache, gc_cache_mode, gc_cache_notes = _resolve_static_embedding_cache_policy(
+        args, model, identity_projection=identity_projection, hard_blockers=cache_hard_blockers
+    )
+
     supervised_debug_printed = False
     chunking_enabled = (not use_supervised) and (not use_ridge) and gc_vec_task_chunk_size > 0 and gc_vec_task_chunk_size < num_tasks
+    if chunking_enabled and use_static_embedding_cache:
+        chunking_enabled = False
+        gc_cache_notes.append('chunked_backward_disabled_with_static_cache')
     if chunking_enabled:
         print(f"[GC-VEC] task-chunked backward enabled: chunk_size={gc_vec_task_chunk_size}, num_tasks={num_tasks}")
 
-    for batch in data_loaders['train']:
-        if not use_supervised and use_ridge:
+    gc_cache_notes = list(dict.fromkeys(gc_cache_notes))
+    dataset_name = getattr(dataset, 'name', 'unknown')
+    if use_static_embedding_cache:
+        print(f"[GC Cache] Enabled for {dataset_name} (mode={gc_cache_mode}): context embeddings cached per epoch.")
+        if len(gc_cache_notes) > 0:
+            print(f"[GC Cache] Note: {', '.join(gc_cache_notes)}")
+    else:
+        print(f"[GC Cache] Disabled for {dataset_name} (mode={gc_cache_mode}): {', '.join(gc_cache_notes)}")
+
+    cached_context_embeddings = None
+    cached_context_labels = None
+    cached_context_masks = None
+    cached_w = None
+    cached_pos_embeds_by_task = None
+    cached_neg_embeds_by_task = None
+
+    if use_static_embedding_cache and not use_supervised:
+        if use_ridge:
             if profile_context:
                 context_embeddings, context_labels, context_masks, timing = _create_multitask_context_embeddings(
                     model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
@@ -1536,12 +1660,16 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
                 proto_time_total += time.perf_counter() - proto_start
 
             ridge_start = time.perf_counter()
-            W = _compute_multitask_ridge_weights(context_embeddings, context_labels, context_masks, ridge_alpha=ridge_alpha)
+            cached_w = _compute_multitask_ridge_weights(
+                context_embeddings, context_labels, context_masks, ridge_alpha=ridge_alpha
+            ).detach()
             proto_time_total += time.perf_counter() - ridge_start
-        elif not use_supervised:
+            cached_context_embeddings = context_embeddings.detach()
+            cached_context_labels = context_labels.detach()
+            cached_context_masks = context_masks.detach()
+        else:
             if profile_context:
-                # Recompute prototypes EVERY batch (expensive, but requested)
-                pos_embeds_by_task, neg_embeds_by_task, timing = _create_all_task_context_embeddings(
+                cached_pos_embeds_by_task, cached_neg_embeds_by_task, timing = _create_all_task_context_embeddings(
                     model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
                     return_timing=True, sync_cuda=True
                 )
@@ -1550,14 +1678,75 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
                 proto_overhead_time_total += timing['overhead_time']
                 proto_concat_time_total += timing['concat_time']
                 proto_context_batches_total += timing['num_context_batches']
-                proto_start = time.perf_counter()
             else:
                 proto_start = time.perf_counter()
-                # Recompute prototypes EVERY batch (expensive, but requested)
-                pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
+                cached_pos_embeds_by_task, cached_neg_embeds_by_task = _create_all_task_context_embeddings(
                     model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
                 )
-            proto_time_total += time.perf_counter() - proto_start
+                proto_time_total += time.perf_counter() - proto_start
+
+            cached_pos_embeds_by_task = [
+                emb.detach() if emb is not None else None
+                for emb in cached_pos_embeds_by_task
+            ]
+            cached_neg_embeds_by_task = [
+                emb.detach() if emb is not None else None
+                for emb in cached_neg_embeds_by_task
+            ]
+
+    for batch in data_loaders['train']:
+        if not use_supervised and use_ridge:
+            if use_static_embedding_cache:
+                W = cached_w
+                context_embeddings = cached_context_embeddings
+                context_labels = cached_context_labels
+                context_masks = cached_context_masks
+            else:
+                if profile_context:
+                    context_embeddings, context_labels, context_masks, timing = _create_multitask_context_embeddings(
+                        model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+                        batch_size=context_batch_size, return_timing=True, sync_cuda=True
+                    )
+                    proto_time_total += timing['total_time']
+                    proto_encode_time_total += timing['encode_time']
+                    proto_overhead_time_total += timing['overhead_time']
+                    proto_concat_time_total += timing['concat_time']
+                    proto_context_batches_total += timing['num_context_batches']
+                else:
+                    proto_start = time.perf_counter()
+                    context_embeddings, context_labels, context_masks = _create_multitask_context_embeddings(
+                        model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+                        batch_size=context_batch_size
+                    )
+                    proto_time_total += time.perf_counter() - proto_start
+
+                ridge_start = time.perf_counter()
+                W = _compute_multitask_ridge_weights(context_embeddings, context_labels, context_masks, ridge_alpha=ridge_alpha)
+                proto_time_total += time.perf_counter() - ridge_start
+        elif not use_supervised:
+            if use_static_embedding_cache:
+                pos_embeds_by_task = cached_pos_embeds_by_task
+                neg_embeds_by_task = cached_neg_embeds_by_task
+            else:
+                if profile_context:
+                    # Recompute prototypes EVERY batch (expensive, but requested)
+                    pos_embeds_by_task, neg_embeds_by_task, timing = _create_all_task_context_embeddings(
+                        model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info,
+                        return_timing=True, sync_cuda=True
+                    )
+                    proto_time_total += timing['total_time']
+                    proto_encode_time_total += timing['encode_time']
+                    proto_overhead_time_total += timing['overhead_time']
+                    proto_concat_time_total += timing['concat_time']
+                    proto_context_batches_total += timing['num_context_batches']
+                    proto_start = time.perf_counter()
+                else:
+                    proto_start = time.perf_counter()
+                    # Recompute prototypes EVERY batch (expensive, but requested)
+                    pos_embeds_by_task, neg_embeds_by_task = _create_all_task_context_embeddings(
+                        model, dataset_info['context_graphs'], dataset, pooling_method, device, identity_projection, dataset_info
+                    )
+                proto_time_total += time.perf_counter() - proto_start
         
         batch_start = time.perf_counter()
         optimizer.zero_grad()
@@ -2376,6 +2565,59 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
     # Pre-extract all batches to eliminate DataLoader iterator overhead
     train_batches = list(data_loaders['train'])
 
+    edge_dropout_active = (
+        args is not None and
+        getattr(args, 'edge_dropout_enabled', False) and
+        float(getattr(args, 'edge_dropout_rate', 0.0)) > 0
+    )
+    feature_dropout_active = (
+        args is not None and
+        getattr(args, 'feature_dropout_enabled', False) and
+        float(getattr(args, 'feature_dropout_rate', 0.0)) > 0
+    )
+    context_refresh_active = (
+        args is not None and
+        int(getattr(args, 'context_batch_refresh_interval', 0)) > 0
+    )
+    cache_hard_blockers = []
+    if context_refresh_active:
+        cache_hard_blockers.append('context_batch_refresh_enabled')
+    if edge_dropout_active:
+        cache_hard_blockers.append('edge_dropout_enabled')
+    if feature_dropout_active:
+        cache_hard_blockers.append('feature_dropout_enabled')
+    use_static_embedding_cache, gc_cache_mode, gc_cache_notes = _resolve_static_embedding_cache_policy(
+        args, model, identity_projection=identity_projection, hard_blockers=cache_hard_blockers
+    )
+    gc_cache_notes = list(dict.fromkeys(gc_cache_notes))
+    dataset_name = getattr(dataset_info.get('dataset', None), 'name', 'unknown')
+    if use_static_embedding_cache:
+        print(f"[GC Cache] Enabled for {dataset_name}/task{task_idx} (mode={gc_cache_mode}): one context embedding pass per epoch.")
+        if len(gc_cache_notes) > 0:
+            print(f"[GC Cache] Note: {', '.join(gc_cache_notes)}")
+    else:
+        print(f"[GC Cache] Disabled for {dataset_name}/task{task_idx} (mode={gc_cache_mode}): {', '.join(gc_cache_notes)}")
+
+    cached_context_embeddings = None
+    cached_context_labels = None
+    cached_pfn_data = None
+    cached_class_h = None
+    if use_static_embedding_cache:
+        context_embeddings, context_labels = _create_context_embeddings_computed(
+            model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx,
+            pooling_method, device, identity_projection, dataset_info
+        )
+        cached_context_embeddings = context_embeddings.detach()
+        cached_context_labels = context_labels.detach()
+        cached_pfn_data = prepare_pfn_data_structure(
+            cached_context_embeddings, cached_context_labels, dataset_info['num_classes'], device
+        )
+        cached_class_h = process_node_features(
+            cached_context_embeddings, cached_pfn_data,
+            degree_normalize=False, attention_pool_module=None,
+            mlp_module=None, normalize=normalize_class_h
+        ).detach()
+
     total_batches = len(train_batches)
     for batch_idx, batch_graphs in enumerate(train_batches):
         # Batch-level context refresh
@@ -2451,24 +2693,30 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
         if batch_labels.dtype != torch.long:
             batch_labels = batch_labels.to(torch.long)
         
-        # Create task-specific context embeddings
-        context_embeddings, context_labels = _create_context_embeddings_computed(
-            model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx, 
-            pooling_method, device, identity_projection, dataset_info
-        )
-        
-        # Prepare PFN data structure
-        pfn_data = prepare_pfn_data_structure(context_embeddings, context_labels, 
-                                            dataset_info['num_classes'], device)
-        
-        # Process context embeddings to create class prototypes
-        class_h = process_node_features(
-            context_embeddings, pfn_data,
-            degree_normalize=False,  # Not applicable for graphs
-            attention_pool_module=None,
-            mlp_module=None,
-            normalize=normalize_class_h
-        )
+        if use_static_embedding_cache:
+            context_embeddings = cached_context_embeddings
+            context_labels = cached_context_labels
+            pfn_data = cached_pfn_data
+            class_h = cached_class_h
+        else:
+            # Create task-specific context embeddings
+            context_embeddings, context_labels = _create_context_embeddings_computed(
+                model, dataset_info['context_graphs'], dataset_info['dataset'], task_idx,
+                pooling_method, device, identity_projection, dataset_info
+            )
+            
+            # Prepare PFN data structure
+            pfn_data = prepare_pfn_data_structure(context_embeddings, context_labels,
+                                                dataset_info['num_classes'], device)
+            
+            # Process context embeddings to create class prototypes
+            class_h = process_node_features(
+                context_embeddings, pfn_data,
+                degree_normalize=False,  # Not applicable for graphs
+                attention_pool_module=None,
+                mlp_module=None,
+                normalize=normalize_class_h
+            )
 
         # Use PFN predictor with graph classification head (all samples are valid, no masking needed)
         scores_raw, refined_class_h = predictor(pfn_data, context_embeddings, target_embeddings, context_labels, class_h, task_type='graph_classification')
