@@ -1720,12 +1720,10 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
             # Step 3: Apply PCA to augmented features on inference device
             pca_start = _tta_profile_snapshot()
-            if data_aug.x.shape[1] >= pca_target_dim:
-                U, S, _ = torch.pca_lowrank(data_aug.x, q=pca_target_dim)
-                data_aug.x_pca = torch.mm(U, torch.diag(S))
-            else:
-                U, S, _ = torch.pca_lowrank(data_aug.x, q=data_aug.x.shape[1])
-                data_aug.x_pca = torch.mm(U, torch.diag(S))
+            q = min(pca_target_dim, data_aug.x.shape[0], data_aug.x.shape[1])
+            U, S, _ = torch.pca_lowrank(data_aug.x, q=q)
+            data_aug.x_pca = torch.mm(U, torch.diag(S))
+            if data_aug.x_pca.shape[1] < pca_target_dim:
                 pad_size = pca_target_dim - data_aug.x_pca.shape[1]
                 padding = torch.zeros(data_aug.x_pca.shape[0], pad_size, device=data_aug.x.device)
                 data_aug.x_pca = torch.cat([data_aug.x_pca, padding], dim=1)
