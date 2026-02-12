@@ -1599,6 +1599,10 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         # Keep a dataset-scoped GPU copy for the whole TTA procedure.
         data_to_device_start = _tta_profile_snapshot()
         data_device = data.clone().to(inference_device)
+        if hasattr(data_device, 'x') and data_device.x is not None:
+            data_device.x = data_device.x.to(inference_device)
+        if hasattr(data_device, 'x_original') and data_device.x_original is not None:
+            data_device.x_original = data_device.x_original.to(inference_device)
         if hasattr(data_device, 'y') and data_device.y is not None:
             data_device.y = data_device.y.to(inference_device)
         train_idx = train_idx.to(inference_device)
@@ -1632,6 +1636,14 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
         def _run_one_tta_view(data_version, view_type, view_idx):
             nonlocal infer_wall, infer_cpu
+            if hasattr(data_version, 'x') and data_version.x is not None:
+                data_version.x = data_version.x.to(inference_device)
+            if hasattr(data_version, 'y') and data_version.y is not None:
+                data_version.y = data_version.y.to(inference_device)
+            if hasattr(data_version, 'context_sample') and data_version.context_sample is not None:
+                data_version.context_sample = data_version.context_sample.to(inference_device)
+            if hasattr(data_version, 'adj_t') and data_version.adj_t is not None:
+                data_version.adj_t = data_version.adj_t.to(inference_device)
             infer_start = _tta_profile_snapshot()
             train_logits, valid_logits, test_logits = test_single_with_logits(
                 model, predictor, data_version, train_idx, valid_idx, test_idx,
@@ -1677,9 +1689,11 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             # TTA chain: ORIGINAL -> AUG -> PCA -> MODEL
             data_for_aug = data_device.clone()
             if hasattr(data_device, 'x_original'):
-                data_for_aug.x = data_device.x_original.clone()
+                data_for_aug.x = data_device.x_original.to(inference_device).clone()
             elif rank == 0 and aug_idx == 0:
                 print(f"    WARNING: x_original not found for {getattr(data_device, 'name', 'unknown')}, using data.x (may be PCA-processed!)")
+            if hasattr(data_for_aug, 'x') and data_for_aug.x is not None:
+                data_for_aug.x = data_for_aug.x.to(inference_device)
 
             # Step 2: Apply augmentation (sigma(WX+b)) on inference device
             aug_start = _tta_profile_snapshot()
@@ -1692,6 +1706,8 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 rank=rank,
                 max_hidden_dim=getattr(args, 'augmentation_max_dim', None)
             )
+            if hasattr(data_aug, 'x') and data_aug.x is not None:
+                data_aug.x = data_aug.x.to(inference_device)
             aug_view_wall, aug_view_cpu = _tta_profile_elapsed(aug_start)
             aug_wall += aug_view_wall
             aug_cpu += aug_view_cpu
