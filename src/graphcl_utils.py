@@ -56,16 +56,18 @@ def edge_drop_augmentation(data, drop_ratio=0.2, is_batch=False):
     # Create a copy to avoid modifying original
     aug_data = data.clone()
 
-    # dropout_edge handles both single and batched graphs correctly
-    edge_index, edge_attr = dropout_edge(
+    # dropout_edge returns (edge_index, edge_mask), where edge_mask indexes original edges.
+    edge_index, edge_mask = dropout_edge(
         aug_data.edge_index,
         p=drop_ratio,
-        force_undirected=True,
+        force_undirected=False,
         training=True
     )
     aug_data.edge_index = edge_index
     if hasattr(aug_data, 'edge_attr') and aug_data.edge_attr is not None:
-        aug_data.edge_attr = edge_attr
+        # Keep edge attributes aligned with dropped edges when mask shape matches.
+        if edge_mask is not None and edge_mask.numel() == aug_data.edge_attr.size(0):
+            aug_data.edge_attr = aug_data.edge_attr[edge_mask]
 
     return aug_data
 
@@ -248,5 +250,4 @@ def simclr_loss(z1, z2, temperature=0.5):
         Scalar loss value
     """
     return nt_xent_loss(z1, z2, temperature)
-
 

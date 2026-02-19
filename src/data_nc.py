@@ -170,6 +170,14 @@ def get_project_root():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 
+def build_adj_t(edge_index, num_nodes, make_undirected=True):
+    """Build SparseTensor adjacency with optional symmetrization."""
+    adj_t = SparseTensor.from_edge_index(edge_index, sparse_sizes=(num_nodes, num_nodes))
+    if make_undirected:
+        adj_t = adj_t.to_symmetric()
+    return adj_t.coalesce()
+
+
 def _is_graphpfn_xy_name(name: str) -> bool:
     return name.lower() in {"graphpfn-xy", "graphpfn_xy", "graphpfnxy"}
 
@@ -187,7 +195,36 @@ def _get_graphpfn_xy_root() -> str:
     return os.path.join(get_project_root(), "dataset", "graphpfn-xy")
 
 
-def load_graphpfn_xy_dataset(root_dir: str, max_graphs: int | None = None):
+def _select_graphpfn_xy_files(root: Path, split: str) -> list[Path]:
+    """
+    Deterministic graph-level split:
+      - train split: first 90%
+      - eval split: last 10%
+    """
+    files = sorted(root.glob("graph_*.npz"))
+    total = len(files)
+    if total < 2:
+        raise FileNotFoundError(
+            f"Need at least 2 graph_*.npz files in {root} for 90/10 split, found {total}"
+        )
+    split_point = max(1, int(total * 0.9))
+    split_point = min(split_point, total - 1)
+
+    if split == "train":
+        selected = files[:split_point]
+    elif split == "eval":
+        selected = files[split_point:]
+    else:
+        raise ValueError(f"Unknown split={split}, expected 'train' or 'eval'")
+
+    if not selected:
+        raise FileNotFoundError(
+            f"No graph_*.npz files selected from {root} with split={split}"
+        )
+    return selected
+
+
+def _load_graphpfn_xy_files(files: list[Path], root: Path, make_undirected: bool = True):
     """
     Load GraphPFN synthetic graphs exported by graphpfn/bin/prior/export_xy.py.
 
@@ -195,16 +232,6 @@ def load_graphpfn_xy_dataset(root_dir: str, max_graphs: int | None = None):
       edge_index (2, E), x (N, F), y (N,), train_size (int).
     Returns list of PyG Data objects and split_idx list.
     """
-    root = Path(root_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
-
-    files = sorted(root.glob("graph_*.npz"))
-    if max_graphs is not None:
-        files = files[: max_graphs]
-    if not files:
-        raise FileNotFoundError(f"No graph_*.npz files found in {root}")
-
     data_list = []
     split_idx_list = []
 
@@ -224,9 +251,7 @@ def load_graphpfn_xy_dataset(root_dir: str, max_graphs: int | None = None):
         split_idx = {"train": train_idx, "valid": test_idx, "test": test_idx}
 
         data = Data(x=x, edge_index=edge_index, y=y)
-        data.adj_t = SparseTensor.from_edge_index(
-            edge_index, sparse_sizes=(num_nodes, num_nodes)
-        ).to_symmetric().coalesce()
+        data.adj_t = build_adj_t(edge_index, num_nodes, make_undirected=make_undirected)
         data.name = f"graphpfn_xy_{f.stem}"
         data.is_synthetic = True
 
@@ -234,6 +259,22 @@ def load_graphpfn_xy_dataset(root_dir: str, max_graphs: int | None = None):
         split_idx_list.append(split_idx)
 
     return data_list, split_idx_list
+
+
+def load_graphpfn_xy_dataset_train(root_dir: str, make_undirected: bool = True):
+    root = Path(root_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
+    files = _select_graphpfn_xy_files(root, split="train")
+    return _load_graphpfn_xy_files(files, root, make_undirected=make_undirected)
+
+
+def load_graphpfn_xy_dataset_eval(root_dir: str, make_undirected: bool = True):
+    root = Path(root_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
+    files = _select_graphpfn_xy_files(root, split="eval")
+    return _load_graphpfn_xy_files(files, root, make_undirected=make_undirected)
 
 def rebalance_splits_for_pretraining(split_idx, strategy='smallest_for_valid'):
     """
@@ -297,18 +338,17 @@ def rebalance_splits_for_pretraining(split_idx, strategy='smallest_for_valid'):
         raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def load_ogbn_data(dataset):
+def load_ogbn_data(dataset, make_undirected=True):
     name = dataset
     dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
     data = dataset[0]
-    data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
-    data.adj_t = data.adj_t.to_symmetric().coalesce()
+    data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
     split_idx = dataset.get_idx_split()
     data.name = name
     data.y = data.y.squeeze()
     return data, split_idx
 
-def load_ogbn_data_train(dataset, split_strategy='smallest_for_valid'):
+def load_ogbn_data_train(dataset, split_strategy='smallest_for_valid', make_undirected=True):
     """
     Load OGB node dataset for pretraining.
 
@@ -322,8 +362,7 @@ def load_ogbn_data_train(dataset, split_strategy='smallest_for_valid'):
     name = dataset
     dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
     data = dataset[0]
-    data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
-    data.adj_t = data.adj_t.to_symmetric().coalesce()
+    data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
     split_idx = dataset.get_idx_split()
     data.name = name
     data.y = data.y.squeeze()
@@ -360,7 +399,7 @@ def load_text_enhanced_dataset(dataset_name: str):
     else:
         raise ValueError(f"Data file not found for text-enhanced dataset {dataset_name} at {pt_file}")
 
-def load_data_train(dataset_name: str):
+def load_data_train(dataset_name: str, make_undirected: bool = True):
     
     # --- 1. Check if this is a text-enhanced dataset (lowercase or LLaMA variants) ---
     if dataset_name in ['cora', 'wikics', 'pubmed', 'cora_llama_8b', 'cora_llama_13b']:
@@ -429,12 +468,15 @@ def load_data_train(dataset_name: str):
     elif dataset_name == 'FacebookPagePage':
         dataset = FacebookPagePage(root=os.path.join(root, 'FacebookPagePage'))
     elif dataset_name in ['Roman-empire', 'Amazon-ratings', 'Minesweeper', 'Tolokers', 'Questions']:
-        dataset = HeterophilousGraphDataset(root=os.path.join(root, 'HeterophilousGraphs'), name=dataset_name)
+        dataset = HeterophilousGraphDataset(
+            root=os.path.join(root, 'HeterophilousGraphs'),
+            name=dataset_name,
+            make_undirected=make_undirected,
+        )
     elif dataset_name == 'MAG240M':
         # Load MAG240M subset directly
         data, split_idx = load_mag240m_subset()
-        data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
-        data.adj_t = data.adj_t.to_symmetric().coalesce()
+        data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
         data.name = dataset_name
         return data, split_idx
     elif dataset_name == 'Products':
@@ -490,11 +532,7 @@ def load_data_train(dataset_name: str):
     data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
 
     # --- 3. Perform other processing (e.g., creating adjacency tensor) ---
-    data.adj_t = SparseTensor.from_edge_index(
-        data.edge_index, 
-        sparse_sizes=(data.num_nodes, data.num_nodes)
-    )
-    data.adj_t = data.adj_t.to_symmetric().coalesce()
+    data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
 
     # --- 4. Create the split_idx dictionary with the correct indices ---
     split_idx = {
@@ -506,7 +544,7 @@ def load_data_train(dataset_name: str):
     data.name = dataset_name
     return data, split_idx
 
-def load_data(dataset):
+def load_data(dataset, make_undirected: bool = True, split_id: int | None = None):
     name = dataset
 
     # Dataset name aliases for compatibility
@@ -573,37 +611,53 @@ def load_data(dataset):
     elif dataset == 'FacebookPagePage':
         dataset = FacebookPagePage(root=os.path.join(get_project_root(), 'dataset', 'FacebookPagePage'))
     elif dataset in ['Roman-empire', 'Amazon-ratings', 'Minesweeper', 'Tolokers', 'Questions']:
-        dataset = HeterophilousGraphDataset(root=os.path.join(get_project_root(), 'dataset', 'HeterophilousGraphs'), name=dataset)
+        dataset = HeterophilousGraphDataset(
+            root=os.path.join(get_project_root(), 'dataset', 'HeterophilousGraphs'),
+            name=dataset,
+            make_undirected=make_undirected,
+        )
     elif dataset == 'MAG240M':
         # Load MAG240M subset directly
         data, split_idx = load_mag240m_subset()
-        data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
-        data.adj_t = data.adj_t.to_symmetric().coalesce()
+        data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
         data.name = name
         return data, split_idx
     else:
         raise ValueError(f"Dataset {dataset} not supported.")
     data = dataset[0]
-    data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
-    data.adj_t = data.adj_t.to_symmetric().coalesce()
+    data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
 
     # Check if dataset has predefined splits
     if hasattr(data, 'train_mask') and data.train_mask is not None:
         split_idx = dict()
 
         # Handle 2D masks (e.g., WikiCS has 20 predefined splits as columns)
-        # Use first split (column 0) in such cases
+        # Use selected split (default: column 0) in such cases
         train_mask = data.train_mask
         val_mask = data.val_mask
         test_mask = data.test_mask
 
         if train_mask.dim() == 2:
-            print(f"[load_data] Dataset has 2D train_mask with {train_mask.shape[1]} splits, using split 0")
-            train_mask = train_mask[:, 0]
+            num_splits = int(train_mask.shape[1])
+            selected_split = 0 if split_id is None else int(split_id)
+            if selected_split < 0 or selected_split >= num_splits:
+                raise ValueError(
+                    f"Invalid split_id={selected_split} for dataset {name}. "
+                    f"Valid range: [0, {num_splits - 1}]"
+                )
+            data.predefined_num_splits = num_splits
+            data.predefined_split_id = selected_split
+            print(
+                f"[load_data] Dataset has 2D train_mask with {num_splits} splits, "
+                f"using split {selected_split}"
+            )
+            train_mask = train_mask[:, selected_split]
         if val_mask.dim() == 2:
-            val_mask = val_mask[:, 0]
+            selected_split = 0 if split_id is None else int(split_id)
+            val_mask = val_mask[:, selected_split]
         if test_mask is not None and test_mask.dim() == 2:
-            test_mask = test_mask[:, 0]
+            selected_split = 0 if split_id is None else int(split_id)
+            test_mask = test_mask[:, selected_split]
 
         split_idx['train'] = train_mask.nonzero(as_tuple=False).reshape(-1)
         split_idx['valid'] = val_mask.nonzero(as_tuple=False).reshape(-1)
@@ -665,23 +719,55 @@ def load_data(dataset):
     data.name = name
     return data, split_idx
 
-def load_all_data(train_datasets):
+def load_all_data(train_datasets, make_undirected: bool = True, expand_webkb_splits: bool = False):
     data_list = []
     split_idx_list = []
+    webkb_datasets = {'Cornell', 'Texas', 'Wisconsin'}
+
     for dataset in train_datasets:
         print(dataset, flush=True)
         if _is_graphpfn_xy_name(dataset):
             root = _get_graphpfn_xy_root()
-            max_graphs_env = os.getenv("GRAPHPFN_XY_MAX_GRAPHS")
-            max_graphs = int(max_graphs_env) if max_graphs_env else None
-            data_ext, split_ext = load_graphpfn_xy_dataset(root, max_graphs=max_graphs)
+            data_ext, split_ext = load_graphpfn_xy_dataset_eval(
+                root, make_undirected=make_undirected
+            )
             data_list.extend(data_ext)
             split_idx_list.extend(split_ext)
             continue
+
+        if expand_webkb_splits and dataset in webkb_datasets:
+            # Expand WebKB datasets to all official predefined splits (10 splits).
+            data_first, split_first = load_data(
+                dataset,
+                make_undirected=make_undirected,
+                split_id=0
+            )
+            num_splits = int(getattr(data_first, 'predefined_num_splits', 1))
+
+            if num_splits <= 1:
+                data_list.append(data_first)
+                split_idx_list.append(split_first)
+            else:
+                data_first.name = f"{data_first.name}_split0"
+                data_list.append(data_first)
+                split_idx_list.append(split_first)
+
+                for split_idx in range(1, num_splits):
+                    data_split, split_edge = load_data(
+                        dataset,
+                        make_undirected=make_undirected,
+                        split_id=split_idx
+                    )
+                    data_split.name = f"{data_split.name}_split{split_idx}"
+                    data_list.append(data_split)
+                    split_idx_list.append(split_edge)
+                print(f"[load_all_data] Expanded {dataset} into {num_splits} official splits")
+            continue
+
         if dataset.startswith('ogbn-'):
-            data, split_edge = load_ogbn_data(dataset)
+            data, split_edge = load_ogbn_data(dataset, make_undirected=make_undirected)
         else:
-            data, split_edge = load_data(dataset)
+            data, split_edge = load_data(dataset, make_undirected=make_undirected)
         data_list.append(data)
         split_idx_list.append(split_edge)
     return data_list, split_idx_list
@@ -706,7 +792,8 @@ def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
                         augmentation_activation='random', augmentation_max_depth=1,
                         augmentation_verbose=False, augmentation_use_random_noise=False,
                         augmentation_dropout_rate=0.0, augmentation_use_feature_mixing=False,
-                        augmentation_mix_ratio=0.3, augmentation_mix_alpha=0.5):
+                        augmentation_mix_ratio=0.3, augmentation_mix_alpha=0.5,
+                        make_undirected: bool = True):
     """
     Load training datasets with optional split rebalancing and data augmentation.
 
@@ -718,6 +805,7 @@ def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
         augmentation_hidden_dim_range: Range for random hidden dimension (min, max) tuple
         augmentation_activation_pool: List of activation functions for augmentation
         augmentation_verbose: Print augmentation details
+        make_undirected: If True, symmetrize adjacency; if False, keep directed edges
     """
     # Expand any special dataset names first
     expanded_datasets = expand_dataset_names(train_datasets)
@@ -728,16 +816,20 @@ def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
         print(dataset, flush=True)
         if _is_graphpfn_xy_name(dataset):
             root = _get_graphpfn_xy_root()
-            max_graphs_env = os.getenv("GRAPHPFN_XY_MAX_GRAPHS")
-            max_graphs = int(max_graphs_env) if max_graphs_env else None
-            data_ext, split_ext = load_graphpfn_xy_dataset(root, max_graphs=max_graphs)
+            data_ext, split_ext = load_graphpfn_xy_dataset_train(
+                root, make_undirected=make_undirected
+            )
             data_list.extend(data_ext)
             split_idx_list.extend(split_ext)
             continue
         if dataset.startswith('ogbn-'):
-            data, split_edge = load_ogbn_data_train(dataset, split_strategy=split_strategy)
+            data, split_edge = load_ogbn_data_train(
+                dataset,
+                split_strategy=split_strategy,
+                make_undirected=make_undirected,
+            )
         else:
-            data, split_edge = load_data_train(dataset)
+            data, split_edge = load_data_train(dataset, make_undirected=make_undirected)
         data_list.append(data)
         split_idx_list.append(split_edge)
 

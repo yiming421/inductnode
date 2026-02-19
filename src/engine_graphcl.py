@@ -6,6 +6,7 @@ agreement between differently augmented views of the same graph.
 """
 
 import time
+import inspect
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool, global_max_pool, global_add_pool
@@ -16,13 +17,138 @@ import numpy as np
 from .graphcl_utils import augment_graph, nt_xent_loss
 
 
-def train_graphcl(model, projection_head, data_loader, optimizer, args,
+def _resolve_graphcl_input_dim(args, identity_projection=None):
+    """Resolve feature dimension expected by the GraphCL encoder input path."""
+    if identity_projection is not None:
+        return int(getattr(identity_projection, 'small_dim', getattr(args, 'projection_small_dim', args.hidden)))
+    if getattr(args, 'use_mlp_projection', False):
+        return int(getattr(args, 'mlp_projection_input_dim', args.hidden))
+    return int(getattr(args, 'hidden', 128))
+
+
+def _resolve_graphcl_encoder_output_dim(model, args):
+    """Resolve encoder output dimension used as GraphCL projection-head input."""
+    if model is None:
+        return int(getattr(args, 'hidden', 128))
+
+    module = model.module if hasattr(model, 'module') else model
+
+    # Dynamic encoder wrapper exposes the base GNN as `gnn`.
+    if hasattr(module, 'gnn'):
+        module = module.gnn
+
+    if hasattr(module, 'h_feats'):
+        return int(module.h_feats)
+
+    lin = getattr(module, 'lin', None)
+    if hasattr(lin, 'out_features'):
+        return int(lin.out_features)
+
+    return int(getattr(args, 'hidden', 128))
+
+
+def _resolve_graphcl_predictor_output_dim(args, predictor=None):
+    """Resolve output dimension after PFN predictor embedding transform."""
+    if predictor is None:
+        return int(getattr(args, 'hidden', 128))
+
+    if not hasattr(predictor, 'get_target_embeddings'):
+        raise ValueError(
+            "GraphCL requires a PFN predictor that implements get_target_embeddings "
+            "(expected path: GNN -> PFN -> projection head -> InfoNCE)."
+        )
+
+    hidden_dim = int(getattr(predictor, 'hidden_dim', getattr(args, 'hidden', 128)))
+    if getattr(predictor, 'skip_token_formulation', False):
+        return hidden_dim
+    if getattr(predictor, 'use_full_embedding', False):
+        return int(getattr(predictor, 'embed_dim', hidden_dim * 2))
+    return hidden_dim
+
+
+def _prepare_graphcl_features(x, target_dim):
+    """
+    Convert features to float and adapt feature width to target_dim.
+
+    Returns:
+        (x_prepared, adjustment_note)
+    """
+    if x is None:
+        raise ValueError("GraphCL batch has no node features (x is None).")
+
+    if x.dim() == 1:
+        x = x.unsqueeze(-1)
+
+    if not x.dtype.is_floating_point:
+        x = x.float()
+
+    current_dim = x.size(-1)
+    if current_dim < target_dim:
+        pad = x.new_zeros((x.size(0), target_dim - current_dim))
+        x = torch.cat([x, pad], dim=-1)
+        return x, f"padded {current_dim} -> {target_dim}"
+    if current_dim > target_dim:
+        x = x[:, :target_dim]
+        return x, f"truncated {current_dim} -> {target_dim}"
+    return x, None
+
+
+def _graphcl_forward_model(model, x, adj_t, batch):
+    """
+    Forward through encoder with call signature compatible across backbones.
+
+    Backbones in this repo use mixed signatures, e.g.:
+      - PureGCN_v1/GraphGPS/FAGCN: forward(x, adj_t, batch=None)
+      - UnifiedGNN:               forward(x, adj_t, e_feat=None)
+      - GCN and others:           forward(x, adj_t)
+    """
+    try:
+        param_names = list(inspect.signature(model.forward).parameters.keys())
+    except (TypeError, ValueError):
+        param_names = []
+
+    # Bound method signature excludes `self`.
+    if len(param_names) >= 3 and param_names[2] == 'batch':
+        return model(x, adj_t, batch=batch)
+
+    # UnifiedGNN's 3rd arg is edge feature/weight, not batch assignment.
+    return model(x, adj_t)
+
+
+def _graphcl_pfn_transform(graph_embeddings, predictor):
+    """
+    Transform graph embeddings through PFN predictor before contrastive projection.
+
+    Uses instance-level pseudo classes within each batch:
+      - context_x = target_x = graph_embeddings
+      - context_y = [0, 1, ..., B-1]
+      - class_x   = graph_embeddings
+    """
+    if predictor is None or not hasattr(predictor, 'get_target_embeddings'):
+        raise ValueError(
+            "GraphCL requires PFN predictor with get_target_embeddings "
+            "(expected path: GNN -> PFN -> projection head -> InfoNCE)."
+        )
+
+    batch_size = graph_embeddings.size(0)
+    context_y = torch.arange(batch_size, device=graph_embeddings.device, dtype=torch.long)
+    class_x = graph_embeddings
+    return predictor.get_target_embeddings(
+        context_x=graph_embeddings,
+        target_x=graph_embeddings,
+        context_y=context_y,
+        class_x=class_x
+    )
+
+
+def train_graphcl(model, predictor, projection_head, data_loader, optimizer, args,
                   device='cuda', identity_projection=None, rank=0, lambda_=1.0):
     """
     Train GraphCL for one epoch.
 
     Args:
         model: GNN encoder (e.g., PureGCN_v1)
+        predictor: PFN predictor (mandatory for GraphCL path)
         projection_head: MLP projection head for contrastive learning
         data_loader: DataLoader for graphs
         optimizer: Optimizer
@@ -36,6 +162,12 @@ def train_graphcl(model, projection_head, data_loader, optimizer, args,
         dict: Training statistics (loss, etc.)
     """
     model.train()
+    if predictor is None or not hasattr(predictor, 'get_target_embeddings'):
+        raise ValueError(
+            "GraphCL requires PFN predictor with get_target_embeddings "
+            "(expected path: GNN -> PFN -> projection head -> InfoNCE)."
+        )
+    predictor.train()
     projection_head.train()
     if identity_projection is not None:
         identity_projection.train()
@@ -43,12 +175,15 @@ def train_graphcl(model, projection_head, data_loader, optimizer, args,
     total_loss = 0
     num_batches = 0
     start_time = time.time()
+    expected_input_dim = _resolve_graphcl_input_dim(args, identity_projection)
 
     for batch_idx, batch_data in enumerate(data_loader):
         batch_data = batch_data.to(device)
 
-        # Get node features
-        x = batch_data.x
+        # Get node features and align with encoder input dimension.
+        x, dim_adjustment = _prepare_graphcl_features(batch_data.x, expected_input_dim)
+        if rank == 0 and batch_idx == 0 and dim_adjustment is not None:
+            print(f"[GraphCL] Input feature adjustment: {dim_adjustment}")
 
         # Apply identity projection ONCE if needed
         if identity_projection is not None:
@@ -95,24 +230,34 @@ def train_graphcl(model, projection_head, data_loader, optimizer, args,
             sparse_sizes=(num_nodes_2, num_nodes_2)
         ).to_symmetric().coalesce()
 
-        # Forward pass through GNN encoder for both views
-        output_1 = model(x1, adj_t_1, batch_1)
-        output_2 = model(x2, adj_t_2, batch_2)
+        # Forward pass through GNN encoder for both views.
+        output_1 = _graphcl_forward_model(model, x1, adj_t_1, batch_1)
+        output_2 = _graphcl_forward_model(model, x2, adj_t_2, batch_2)
 
         # Handle virtual node case (model returns tuple if virtual node is used)
         if isinstance(output_1, tuple):
-            node_emb_1, _ = output_1  # Discard virtual node output
+            node_emb_1, virtual_emb_1 = output_1
         else:
             node_emb_1 = output_1
+            virtual_emb_1 = None
 
         if isinstance(output_2, tuple):
-            node_emb_2, _ = output_2  # Discard virtual node output
+            node_emb_2, virtual_emb_2 = output_2
         else:
             node_emb_2 = output_2
+            virtual_emb_2 = None
 
         # Pool to graph-level embeddings
-        graph_emb_1 = pool_graph_embeddings(node_emb_1, batch_1, args.graph_pooling)  # (batch_size, hidden_dim)
-        graph_emb_2 = pool_graph_embeddings(node_emb_2, batch_2, args.graph_pooling)  # (batch_size, hidden_dim)
+        graph_emb_1 = pool_graph_embeddings(
+            node_emb_1, batch_1, args.graph_pooling, virtualnode_embeddings=virtual_emb_1
+        )  # (batch_size, hidden_dim)
+        graph_emb_2 = pool_graph_embeddings(
+            node_emb_2, batch_2, args.graph_pooling, virtualnode_embeddings=virtual_emb_2
+        )  # (batch_size, hidden_dim)
+
+        # Mandatory PFN transform before contrastive projection.
+        graph_emb_1 = _graphcl_pfn_transform(graph_emb_1, predictor)
+        graph_emb_2 = _graphcl_pfn_transform(graph_emb_2, predictor)
 
         # Project to contrastive space using MLP projection head
         z1 = projection_head(graph_emb_1)  # (batch_size, projection_dim)
@@ -131,6 +276,7 @@ def train_graphcl(model, projection_head, data_loader, optimizer, args,
         # Gradient clipping if specified
         if hasattr(args, 'clip_grad') and args.clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            torch.nn.utils.clip_grad_norm_(predictor.parameters(), args.clip_grad)
             torch.nn.utils.clip_grad_norm_(projection_head.parameters(), args.clip_grad)
             if identity_projection is not None:
                 torch.nn.utils.clip_grad_norm_(identity_projection.parameters(), args.clip_grad)
@@ -156,7 +302,7 @@ def train_graphcl(model, projection_head, data_loader, optimizer, args,
     }
 
 
-def pool_graph_embeddings(node_embeddings, batch, pooling_method='mean'):
+def pool_graph_embeddings(node_embeddings, batch, pooling_method='mean', virtualnode_embeddings=None):
     """
     Pool node embeddings to graph-level embeddings.
 
@@ -164,10 +310,14 @@ def pool_graph_embeddings(node_embeddings, batch, pooling_method='mean'):
         node_embeddings: Node embeddings (num_nodes, hidden_dim)
         batch: Batch assignment for each node
         pooling_method: Pooling method ('mean', 'max', 'sum')
+        virtualnode_embeddings: Optional virtual node embeddings (num_graphs, hidden_dim)
 
     Returns:
         Graph embeddings (batch_size, hidden_dim)
     """
+    if virtualnode_embeddings is not None:
+        return virtualnode_embeddings
+
     if pooling_method == 'mean':
         return global_mean_pool(node_embeddings, batch)
     elif pooling_method == 'max':
@@ -217,7 +367,7 @@ def prepare_graphcl_data(datasets, args, device='cuda', rank=0):
     return data_loader
 
 
-def create_graphcl_projection_head(args, device='cuda'):
+def create_graphcl_projection_head(args, model=None, predictor=None, device='cuda'):
     """
     Create projection head for GraphCL using the MLP class from model.py.
 
@@ -230,7 +380,9 @@ def create_graphcl_projection_head(args, device='cuda'):
     """
     from .model import MLP
 
-    hidden_dim = args.hidden
+    encoder_dim = _resolve_graphcl_encoder_output_dim(model, args)
+    predictor_dim = _resolve_graphcl_predictor_output_dim(args, predictor=predictor)
+    hidden_dim = predictor_dim
     projection_dim = args.graphcl_projection_dim
     dropout = args.dp if hasattr(args, 'dp') else 0.0
     norm = args.norm if hasattr(args, 'norm') else False
@@ -246,6 +398,9 @@ def create_graphcl_projection_head(args, device='cuda'):
         tailact=False,  # No activation after final layer
         norm_affine=args.mlp_norm_affine if hasattr(args, 'mlp_norm_affine') else True
     ).to(device)
+    projection_head.in_dim = hidden_dim
+    projection_head.encoder_in_dim = encoder_dim
+    projection_head.predictor_in_dim = predictor_dim
 
     return projection_head
 
@@ -296,7 +451,7 @@ def load_graphcl_datasets(dataset_names, args, device='cuda', rank=0):
     return datasets
 
 
-def evaluate_graphcl(model, projection_head, data_loader, args, device='cuda',
+def evaluate_graphcl(model, predictor, projection_head, data_loader, args, device='cuda',
                     identity_projection=None, rank=0):
     """
     Evaluate GraphCL (compute contrastive loss on validation/test set).
@@ -317,19 +472,28 @@ def evaluate_graphcl(model, projection_head, data_loader, args, device='cuda',
         dict: Evaluation statistics
     """
     model.eval()
+    if predictor is None or not hasattr(predictor, 'get_target_embeddings'):
+        raise ValueError(
+            "GraphCL requires PFN predictor with get_target_embeddings "
+            "(expected path: GNN -> PFN -> projection head -> InfoNCE)."
+        )
+    predictor.eval()
     projection_head.eval()
     if identity_projection is not None:
         identity_projection.eval()
 
     total_loss = 0
     num_batches = 0
+    expected_input_dim = _resolve_graphcl_input_dim(args, identity_projection)
 
     with torch.no_grad():
         for batch_idx, batch_data in enumerate(data_loader):
             batch_data = batch_data.to(device)
 
-            # Get node features
-            x = batch_data.x
+            # Get node features and align with encoder input dimension.
+            x, dim_adjustment = _prepare_graphcl_features(batch_data.x, expected_input_dim)
+            if rank == 0 and batch_idx == 0 and dim_adjustment is not None:
+                print(f"[GraphCL-Eval] Input feature adjustment: {dim_adjustment}")
 
             # Apply identity projection if needed
             if identity_projection is not None:
@@ -375,22 +539,32 @@ def evaluate_graphcl(model, projection_head, data_loader, args, device='cuda',
             ).to_symmetric().coalesce()
 
             # Forward pass
-            output_1 = model(x1, adj_t_1, batch_1)
-            output_2 = model(x2, adj_t_2, batch_2)
+            output_1 = _graphcl_forward_model(model, x1, adj_t_1, batch_1)
+            output_2 = _graphcl_forward_model(model, x2, adj_t_2, batch_2)
 
             # Handle virtual node case
             if isinstance(output_1, tuple):
-                node_emb_1, _ = output_1
+                node_emb_1, virtual_emb_1 = output_1
             else:
                 node_emb_1 = output_1
+                virtual_emb_1 = None
 
             if isinstance(output_2, tuple):
-                node_emb_2, _ = output_2
+                node_emb_2, virtual_emb_2 = output_2
             else:
                 node_emb_2 = output_2
+                virtual_emb_2 = None
 
-            graph_emb_1 = pool_graph_embeddings(node_emb_1, batch_1, args.graph_pooling)
-            graph_emb_2 = pool_graph_embeddings(node_emb_2, batch_2, args.graph_pooling)
+            graph_emb_1 = pool_graph_embeddings(
+                node_emb_1, batch_1, args.graph_pooling, virtualnode_embeddings=virtual_emb_1
+            )
+            graph_emb_2 = pool_graph_embeddings(
+                node_emb_2, batch_2, args.graph_pooling, virtualnode_embeddings=virtual_emb_2
+            )
+
+            # Mandatory PFN transform before contrastive projection.
+            graph_emb_1 = _graphcl_pfn_transform(graph_emb_1, predictor)
+            graph_emb_2 = _graphcl_pfn_transform(graph_emb_2, predictor)
 
             z1 = projection_head(graph_emb_1)
             z2 = projection_head(graph_emb_2)

@@ -178,7 +178,36 @@ def load_checkpoint_config(checkpoint_path):
     return info, checkpoint
 
 
-def override_args_from_checkpoint(args, checkpoint_args, rank=0):
+def infer_lp_head_type_from_predictor_state_dict(predictor_state_dict):
+    """Infer LP head type from predictor state_dict keys."""
+    if not isinstance(predictor_state_dict, dict):
+        return None
+
+    keys = predictor_state_dict.keys()
+    if any(k.startswith('lp_head.std_head.') or
+           k.startswith('lp_head.mplp_struct_branch.') or
+           k.startswith('lp_head.ncn_cn_branch.')
+           for k in keys):
+        return 'hybrid3'
+    if any(k.startswith('lp_head.struct_encode.') or
+           k.startswith('lp_head.feat_encode.') or
+           k.startswith('lp_head.classifier.')
+           for k in keys):
+        return 'mplp'
+    if any(k.startswith('lp_head.xcnlin.') or
+           k.startswith('lp_head.xijlin.') or
+           k.startswith('lp_head.lin.') or
+           k.startswith('lp_head.lin_mlp.')
+           for k in keys):
+        return 'ncn'
+    if any(k.startswith('lp_head.linear.') or
+           k.startswith('lp_head.proj.')
+           for k in keys):
+        return 'standard'
+    return None
+
+
+def override_args_from_checkpoint(args, checkpoint_args, rank=0, predictor_state_dict=None):
     """Override current arguments with checkpoint configuration"""
 
     if rank == 0:
@@ -225,9 +254,56 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
         'graphgps_attn_type', getattr(args, 'graphgps_attn_type', 'multihead')
     )
 
-    # Override head_num_layers if present in checkpoint (added for backwards compatibility)
-    if 'head_num_layers' in checkpoint_args:
-        args.head_num_layers = checkpoint_args['head_num_layers']
+    # Predictor architecture/behavior options that must match checkpoint
+    optional_override_keys = [
+        'head_num_layers',
+        'nc_head_num_layers',
+        'lp_head_num_layers',
+        'use_first_half_embedding',
+        'use_full_embedding',
+        'skip_token_formulation',
+        'transformer_norm_type',
+        'ffn_expansion_ratio',
+        'use_matching_network',
+        'matching_network_projection',
+        'matching_network_temperature',
+        'matching_network_learnable_temp',
+        'nc_sim',
+        'nc_ridge_alpha',
+        'lp_sim',
+        'lp_ridge_alpha',
+        'gc_sim',
+        'gc_ridge_alpha',
+        'lp_use_linear_predictor',
+        'lp_head_type',
+        'mplp_signature_dim',
+        'mplp_num_hops',
+        'mplp_feature_combine',
+        'mplp_prop_type',
+        'mplp_signature_sampling',
+        'mplp_use_subgraph',
+        'mplp_use_degree',
+        'mplp_context_calibrate',
+        'mplp_calib_train_static',
+        'mplp_calib_shuffle_labels',
+        'mplp_calib_reg',
+        'mplp_calib_w_min',
+        'mplp_calib_w_max',
+        'ncn_beta',
+        'ncn_cndeg',
+        'lp_concat_common_neighbors',
+    ]
+    for key in optional_override_keys:
+        if key in checkpoint_args:
+            setattr(args, key, checkpoint_args[key])
+
+    # Backward-compat for checkpoints saved before lp_head_type was persisted.
+    if 'lp_head_type' not in checkpoint_args:
+        inferred_lp_head_type = infer_lp_head_type_from_predictor_state_dict(predictor_state_dict)
+        if inferred_lp_head_type is not None:
+            args.lp_head_type = inferred_lp_head_type
+            if rank == 0:
+                print(f"  Inferred lp_head_type from predictor weights: {inferred_lp_head_type}")
 
     if rank == 0:
         print("Model configuration successfully overridden from checkpoint!")
@@ -237,7 +313,7 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0):
 
 def create_gnn_from_config(model_config, args_dict, input_dim):
     """Creates a GNN model from a configuration dictionary."""
-    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS
+    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, FAGCN
     model_type = model_config.get('model_type') or args_dict.get('model')
     
     if model_type == 'PureGCN':
@@ -264,6 +340,20 @@ def create_gnn_from_config(model_config, args_dict, input_dim):
             local_conv=args_dict.get('graphgps_local_conv', 'GCN'),
             attn_type=args_dict.get('graphgps_attn_type', 'multihead'),
             gin_aggr=args_dict.get('gin_aggr', 'sum'),
+        )
+    elif model_type == 'FAGCN':
+        model = FAGCN(
+            in_feats=input_dim,
+            h_feats=args_dict['hidden'],
+            prop_step=args_dict['num_layers'],
+            dropout=args_dict['dp'],
+            norm=args_dict['norm'],
+            relu=True,
+            res=args_dict.get('res', False),
+            norm_affine=args_dict.get('gnn_norm_affine', True),
+            activation=args_dict.get('activation', 'relu'),
+            eps=args_dict.get('fagcn_eps', 0.1),
+            attn_dropout=args_dict.get('fagcn_attn_dropout', 0.0),
         )
     else:
         raise ValueError(f"Unknown GNN model type: {model_type}")
@@ -316,7 +406,7 @@ def create_pfn_components_from_config(args_dict, device='cpu'):
 
 def create_model_from_args(args, input_dim, device):
     """Creates a GNN model and all PFN components from command-line arguments."""
-    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, AttentionPool, MLP, IdentityProjection
+    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, FAGCN, AttentionPool, MLP, IdentityProjection
     
     # GNN Model
     if args.model == 'PureGCN':
@@ -338,6 +428,20 @@ def create_model_from_args(args, input_dim, device):
             local_conv=getattr(args, 'graphgps_local_conv', 'GCN'),
             attn_type=getattr(args, 'graphgps_attn_type', 'multihead'),
             gin_aggr=getattr(args, 'gin_aggr', 'sum'),
+        )
+    elif args.model == 'FAGCN':
+        model = FAGCN(
+            in_feats=input_dim,
+            h_feats=args.hidden,
+            prop_step=args.num_layers,
+            dropout=args.dp,
+            norm=args.norm,
+            relu=True,
+            res=args.res,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            eps=getattr(args, 'fagcn_eps', 0.1),
+            attn_dropout=getattr(args, 'fagcn_attn_dropout', 0.0),
         )
     else:
         raise ValueError(f"Unknown model type: {args.model}")
@@ -398,6 +502,16 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
     # Encapsulate args into an object for easier handling
     from argparse import Namespace
     args = Namespace(**args_dict)
+
+    # Backward-compat: infer LP head type for old checkpoints missing this arg.
+    if 'lp_head_type' not in args_dict:
+        inferred_lp_head_type = infer_lp_head_type_from_predictor_state_dict(
+            checkpoint.get('predictor_state_dict')
+        )
+        if inferred_lp_head_type is not None:
+            args.lp_head_type = inferred_lp_head_type
+            args_dict['lp_head_type'] = inferred_lp_head_type
+            print(f"Inferred lp_head_type from predictor weights: {inferred_lp_head_type}")
 
     # 2. Create the model and all components with the saved architecture
     model = create_gnn_from_config(model_config, args_dict, input_dim).to(device)

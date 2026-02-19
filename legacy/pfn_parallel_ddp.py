@@ -59,7 +59,12 @@ def run_ddp(rank, world_size, args, results_dict=None):
         # Override current args with checkpoint's configuration
         if 'args' in checkpoint:
             checkpoint_args = checkpoint['args']
-            args = override_args_from_checkpoint(args, checkpoint_args, rank)
+            args = override_args_from_checkpoint(
+                args,
+                checkpoint_args,
+                rank,
+                predictor_state_dict=checkpoint.get('predictor_state_dict')
+            )
         else:
             if rank == 0:
                 print("Warning: No argument configuration found in checkpoint, using current arguments")
@@ -470,7 +475,12 @@ def run_single_gpu(args, device='cuda:0'):
         # Override current args with checkpoint's configuration
         if 'args' in checkpoint:
             checkpoint_args = checkpoint['args']
-            args = override_args_from_checkpoint(args, checkpoint_args, rank=0)
+            args = override_args_from_checkpoint(
+                args,
+                checkpoint_args,
+                rank=0,
+                predictor_state_dict=checkpoint.get('predictor_state_dict')
+            )
         else:
             print("Warning: No argument configuration found in checkpoint, using current arguments")
 

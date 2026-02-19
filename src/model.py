@@ -2,7 +2,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GINConv, MessagePassing, SAGEConv, GATConv, GPSConv
+from torch_geometric.nn import GCNConv, GINConv, MessagePassing, SAGEConv, GATConv, GPSConv, FAConv
 from torch_geometric.utils import degree
 from torch_sparse.matmul import spmm_add
 from torch_sparse import SparseTensor
@@ -19,6 +19,22 @@ def get_activation_fn(activation_name):
         return F.silu
     else:
         raise ValueError(f"Unsupported activation function: {activation_name}")
+
+
+def _resolve_gat_concat_params(hidden_dim: int, requested_heads: int = 4):
+    """
+    Resolve (heads, out_channels_per_head) so that GAT with concat=True keeps
+    total output width equal to hidden_dim.
+    """
+    heads = max(1, int(requested_heads))
+    if hidden_dim % heads == 0:
+        return heads, hidden_dim // heads
+
+    for h in range(heads - 1, 0, -1):
+        if hidden_dim % h == 0:
+            return h, hidden_dim // h
+
+    return 1, hidden_dim
 
 
 def _fit_mplp_calib_sgd(
@@ -437,6 +453,73 @@ class GCN(nn.Module):
         return h
 
 
+class FAGCN(nn.Module):
+    """
+    Frequency Adaptive GCN backbone.
+
+    Uses PyG's FAConv layers with initial residual signal (x0) and optional
+    normalization/activation/dropout between layers.
+    """
+    def __init__(self, in_feats, h_feats, prop_step=2, dropout=0.2,
+                 norm=False, relu=True, res=False, norm_affine=True,
+                 activation='relu', eps=0.1, attn_dropout=0.0):
+        super(FAGCN, self).__init__()
+        self.lin = nn.Linear(in_feats, h_feats) if in_feats != h_feats else nn.Identity()
+        self.prop_step = prop_step
+        self.dropout = float(dropout)
+        self.norm = bool(norm)
+        self.res = bool(res)
+
+        if relu:
+            self.activation_fn = get_activation_fn(activation)
+        else:
+            self.activation_fn = None
+
+        self.convs = nn.ModuleList([
+            FAConv(
+                channels=h_feats,
+                eps=float(eps),
+                dropout=float(attn_dropout),
+            )
+            for _ in range(prop_step)
+        ])
+
+        if self.norm:
+            self.norms = nn.ModuleList([
+                nn.LayerNorm(h_feats, elementwise_affine=norm_affine)
+                for _ in range(prop_step)
+            ])
+
+    @staticmethod
+    def _prepare_fa_graph(adj_t):
+        if isinstance(adj_t, SparseTensor):
+            # Preserve canonical PyG adj_t semantics (transposed sparse layout).
+            return adj_t
+        if isinstance(adj_t, torch.Tensor):
+            return adj_t
+        raise TypeError(f"Unsupported adjacency type for FAGCN: {type(adj_t)}")
+
+    def forward(self, in_feat, adj_t, batch=None):
+        x = self.lin(in_feat)
+        x0 = x
+        graph = self._prepare_fa_graph(adj_t)
+
+        for i, conv in enumerate(self.convs):
+            x = conv(x, x0, graph)
+
+            if self.res and i > 0:
+                x = x + x0
+
+            if self.norm:
+                x = self.norms[i](x)
+            if self.activation_fn is not None:
+                x = self.activation_fn(x)
+            if self.dropout > 0:
+                x = F.dropout(x, p=self.dropout, training=self.training)
+
+        return x
+
+
 class GraphGPS(nn.Module):
     """
     GraphGPS backbone built from stacked PyG GPSConv layers.
@@ -500,7 +583,13 @@ class GraphGPS(nn.Module):
         if conv_type == 'SAGE':
             return SAGEConv(in_dim, out_dim, aggr='mean')
         if conv_type == 'GAT':
-            return GATConv(in_dim, out_dim, heads=1, concat=False)
+            gat_heads, gat_out = _resolve_gat_concat_params(out_dim, requested_heads=self.heads)
+            if gat_heads != self.heads:
+                print(
+                    f"[GraphGPS] Adjusted local GAT heads from {self.heads} to {gat_heads} "
+                    f"to keep hidden={out_dim} with concat=True"
+                )
+            return GATConv(in_dim, gat_out, heads=gat_heads, concat=True)
         if conv_type == 'GIN':
             mlp = MLP(in_dim, out_dim, out_dim, 2, self.dropout, self.norm)
             return GINConv(mlp, aggr=self.gin_aggr)
@@ -1606,14 +1695,9 @@ class GraphClassificationHead(nn.Module):
             logits: [num_target_graphs, num_classes]
             class_emb: [num_classes, hidden_dim] - class prototypes
         """
-        # TEMPORARY: Completely disable head to test
-        # # Normalize inputs before projection (separate norms for target and context)
-        # target_label_emb = self.target_input_norm(target_label_emb)
-        # context_label_emb = self.context_input_norm(context_label_emb)
-
-        # # Project embeddings through task-specific head
-        # target_label_emb = self.proj(target_label_emb)
-        # context_label_emb = self.proj(context_label_emb)
+        # Project embeddings through task-specific head (match NC head behavior)
+        target_label_emb = self.proj(target_label_emb)
+        context_label_emb = self.proj(context_label_emb)
 
         # Fix: Ensure 2D shape (MLP.squeeze() can remove batch dim when batch_size=1)
         if target_label_emb.dim() == 1:
@@ -3132,7 +3216,8 @@ class UnifiedGNN(nn.Module):
             bias = not self.no_parameters
             return SAGEConv(in_dim, out_dim, 'mean', bias=bias)
         elif self.conv_type == 'GAT':
-            return GATConv(in_dim, out_dim, heads=1, concat=False)
+            gat_heads, gat_out = _resolve_gat_concat_params(out_dim, requested_heads=4)
+            return GATConv(in_dim, gat_out, heads=gat_heads, concat=True)
         elif self.conv_type == 'GIN':
             mlp = MLP(in_dim, out_dim, out_dim, 2, dropout, self.norm)
             return GINConv(mlp, aggr=self.gin_aggr)

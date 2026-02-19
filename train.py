@@ -22,7 +22,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Core imports - reuse from existing scripts
-from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN, GraphGPS
+from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN, GraphGPS, FAGCN
 from src.model_graphpfn import ParameterFreeGCN
 from src.graphpfn import GraphPFNConfig, GraphPFNPredictor
 from src.data_nc import load_all_data, load_all_data_train
@@ -807,11 +807,13 @@ def refresh_contexts_if_needed_batch(batch_idx, epoch, args, data_dict, task_typ
 
 
 def setup_graph_dataset_environment(args):
-    """Configure graph dataset embeddings (FUG, TSGFM, or TAGDataset) if requested."""
-    if not args.enable_gc:
-        # Clear all environment variables if graph classification is disabled
+    """Configure graph dataset embeddings for graph-related tasks (GC and/or GraphCL)."""
+    graph_data_needed = bool(getattr(args, 'enable_gc', False) or getattr(args, 'enable_graphcl', False))
+    if not graph_data_needed:
+        # Clear all environment variables if no graph-related task is enabled
         os.environ.pop('USE_FUG_EMB', None)
         os.environ.pop('TAG_DATASET_ROOT', None)
+        os.environ.pop('USE_ORIGINAL_FEATURES', None)
         return
         
     # Priority: Original Features > FUG > TAGDataset > TSGFM
@@ -934,6 +936,13 @@ def create_unified_model(args, input_dim, device):
         print("⚠️  WARNING: Disabling identity_projection (incompatible with GraphPFN)")
         args.use_identity_projection = False
 
+    # Virtual node support is currently implemented only in PureGCN_v1.
+    # Fail fast to avoid silently running a different model than requested.
+    if getattr(args, 'use_virtual_node', False) and args.model != 'PureGCN_v1':
+        raise ValueError(
+            f"--use_virtual_node=True is supported only with --model=PureGCN_v1; got --model={args.model}"
+        )
+
     # Determine the actual hidden dimension for GNN input
     # Priority: FUG embeddings > identity projection > raw features
     if getattr(args, 'use_external_embeddings_nc', False):
@@ -1020,6 +1029,20 @@ def create_unified_model(args, input_dim, device):
             local_conv=getattr(args, 'graphgps_local_conv', 'GCN'),
             attn_type=getattr(args, 'graphgps_attn_type', 'multihead'),
             gin_aggr=getattr(args, 'gin_aggr', 'sum')
+        )
+    elif args.model == 'FAGCN':
+        model = FAGCN(
+            in_feats=gnn_input_dim,
+            h_feats=hidden,
+            prop_step=args.num_layers,
+            dropout=args.dp,
+            norm=args.norm,
+            relu=True,
+            res=args.res,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            eps=getattr(args, 'fagcn_eps', 0.1),
+            attn_dropout=getattr(args, 'fagcn_attn_dropout', 0.0),
         )
     else:
         raise NotImplementedError(f"Model {args.model} not implemented")
@@ -1191,6 +1214,13 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         print("Loading node classification datasets...")
         nc_train_datasets = args.nc_train_dataset.split(',')
         nc_test_datasets = args.nc_test_dataset.split(',')
+        nc_make_undirected = getattr(args, 'nc_graph_direction', 'undirected') != 'directed'
+        nc_direction_label = 'undirected' if nc_make_undirected else 'directed'
+        print(f"NC graph direction mode: {nc_direction_label}")
+        webkb_datasets = {'Cornell', 'Texas', 'Wisconsin'}
+        expand_webkb_splits = any(ds.strip() in webkb_datasets for ds in nc_test_datasets)
+        if expand_webkb_splits:
+            print("NC test split mode: using all official WebKB splits")
 
         # Auto-fix: Change 'legacy' to 'small_valid' for large datasets to prevent infinite loops
         if args.split_rebalance_strategy == 'legacy':
@@ -1215,12 +1245,17 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 augmentation_dropout_rate=args.augmentation_dropout_rate,
                 augmentation_use_feature_mixing=args.augmentation_use_feature_mixing,
                 augmentation_mix_ratio=args.augmentation_mix_ratio,
-                augmentation_mix_alpha=args.augmentation_mix_alpha
+                augmentation_mix_alpha=args.augmentation_mix_alpha,
+                make_undirected=nc_make_undirected
             )
         else:
             print("  Skipping NC training data loading (using pretrained model)")
 
-        nc_test_data_list, nc_test_split_idx_list = load_all_data(nc_test_datasets)
+        nc_test_data_list, nc_test_split_idx_list = load_all_data(
+            nc_test_datasets,
+            make_undirected=nc_make_undirected,
+            expand_webkb_splits=expand_webkb_splits
+        )
 
         # 2) Load GPSE/LapPE/RWSE embeddings (if enabled)
         if args.use_gpse or args.use_lappe or args.use_rwse:
@@ -1533,9 +1568,21 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
     # === Graph Classification Data ===
     gc_train_data_list, gc_train_processed_data_list = [], []
     gc_test_data_list, gc_test_processed_data_list = [], []
-    
-    if args.enable_gc:
+
+    gc_training_enabled = bool(getattr(args, 'enable_gc', False))
+    gc_downstream_eval_enabled = bool(
+        getattr(args, 'enable_graphcl', False) and
+        int(getattr(args, 'graphcl_downstream_eval_interval', 0)) > 0
+    )
+    gc_data_loading_enabled = gc_training_enabled or gc_downstream_eval_enabled
+
+    if gc_data_loading_enabled:
         print("Loading graph classification datasets...")
+        if gc_downstream_eval_enabled and not gc_training_enabled:
+            print(
+                f"GC training disabled; loading GC test datasets for GraphCL downstream eval "
+                f"every {int(getattr(args, 'graphcl_downstream_eval_interval', 0))} epochs."
+            )
         
         if gc_tracker:
             gc_tracker.log_memory("gc_data_loading_start")
@@ -1546,11 +1593,11 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         if gc_tracker:
             gc_tracker.log_memory("gc_environment_setup_complete")
         
-        gc_train_datasets = args.gc_train_dataset.split(',')
+        gc_train_datasets = args.gc_train_dataset.split(',') if gc_training_enabled else []
         gc_test_datasets = args.gc_test_dataset.split(',')
         
         # Load training data for graph classification (skip if using pretrained model)
-        if not skip_training_data:
+        if gc_training_enabled and not skip_training_data:
             if gc_tracker:
                 gc_tracker.log_memory("gc_train_data_loading_start")
 
@@ -1605,7 +1652,10 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                         dataset_info['gc_supervised_head'] = None
         else:
             gc_train_data_list, gc_train_processed_data_list = [], []
-            print("  Skipping GC training data loading (using pretrained model)")
+            if gc_training_enabled and skip_training_data:
+                print("  Skipping GC training data loading (using pretrained model)")
+            elif not gc_training_enabled:
+                print("  Skipping GC training data loading (GC training disabled)")
         
         # Load test data for graph classification
         if gc_tracker:
@@ -1729,7 +1779,7 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 if getattr(args, 'gc_supervised_mlp', False):
                     dataset_info['gc_supervised_head'] = None
     else:
-        print("Graph classification task disabled, skipping dataset loading...")
+        print("Graph classification data loading disabled, skipping dataset loading...")
 
     # Create mini-batch loaders for NC training datasets
     nc_train_loaders = []
@@ -2382,7 +2432,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
         # Train GraphCL for one epoch on the data loader
         graphcl_results = train_graphcl(
-            model, graphcl_projection_head, graphcl_data_loader, opt_graphcl, args,
+            model, predictor, graphcl_projection_head, graphcl_data_loader, opt_graphcl, args,
             device=device, identity_projection=identity_projection, rank=0, lambda_=args.lambda_graphcl
         )
         total_graphcl_loss = torch.tensor(graphcl_results['loss'], device=device)  # Loss already includes lambda scaling
@@ -3411,6 +3461,8 @@ def run_joint_training(args, device='cuda:0'):
     print(f"  Link Prediction: {'✓' if getattr(args, 'enable_lp', True) else '✗'} (lambda: {args.lambda_lp})")
     print(f"  Graph Classification: {'✓' if getattr(args, 'enable_gc', True) else '✗'} (lambda: {args.lambda_gc})")
     print(f"  GraphCL (Contrastive): {'✓' if getattr(args, 'enable_graphcl', False) else '✗'} (lambda: {getattr(args, 'lambda_graphcl', 0.0)})")
+    if getattr(args, 'enable_graphcl', False) and int(getattr(args, 'graphcl_downstream_eval_interval', 0)) > 0:
+        print(f"  GraphCL Downstream GC Eval: every {int(getattr(args, 'graphcl_downstream_eval_interval', 0))} epochs")
     
     # Initialize link prediction tracker early if link prediction is enabled
     if getattr(args, 'enable_lp', True) and lp_tracker is None:
@@ -3456,7 +3508,12 @@ def run_joint_training(args, device='cuda:0'):
         # Override current args with checkpoint's configuration
         if 'args' in checkpoint:
             checkpoint_args = checkpoint['args']
-            args = override_args_from_checkpoint(args, checkpoint_args, rank=0)
+            args = override_args_from_checkpoint(
+                args,
+                checkpoint_args,
+                rank=0,
+                predictor_state_dict=checkpoint.get('predictor_state_dict')
+            )
         else:
             print("Warning: No argument configuration found in checkpoint, using current arguments")
     
@@ -3536,8 +3593,22 @@ def run_joint_training(args, device='cuda:0'):
     graphcl_data_loader = None
     if getattr(args, 'enable_graphcl', False):
         print(f"\n=== Setting up GraphCL ===")
+        if not hasattr(predictor, 'get_target_embeddings'):
+            raise ValueError(
+                "GraphCL requires PFN predictor with get_target_embeddings "
+                "(expected path: GNN -> PFN -> projection head -> InfoNCE). "
+                "Current predictor is incompatible."
+            )
+        # GraphCL may be enabled even when GC is disabled; ensure dataset backend env is configured.
+        setup_graph_dataset_environment(args)
         # Load GraphCL datasets
         dataset_names = [name.strip() for name in args.graphcl_dataset.split(',')]
+        if getattr(args, 'enable_gc', False):
+            gc_test_names = {name.strip() for name in str(getattr(args, 'gc_test_dataset', '')).split(',') if name.strip()}
+            overlap = sorted(set(dataset_names) & gc_test_names)
+            if overlap:
+                print(f"⚠️  WARNING: GraphCL datasets overlap with GC test datasets: {overlap}")
+                print("⚠️  This can leak unseen-test information into self-supervised training.")
         graphcl_datasets = load_graphcl_datasets(dataset_names, args, device=device, rank=0)
 
         # Prepare data loader
@@ -3545,8 +3616,14 @@ def run_joint_training(args, device='cuda:0'):
             graphcl_data_loader = prepare_graphcl_data(graphcl_datasets, args, device=device, rank=0)
 
             # Create projection head
-            graphcl_projection_head = create_graphcl_projection_head(args, device=device)
-            print(f"GraphCL projection head created: {args.hidden}D -> {args.graphcl_projection_dim}D")
+            graphcl_projection_head = create_graphcl_projection_head(
+                args, model=model, predictor=predictor, device=device
+            )
+            graphcl_in_dim = getattr(graphcl_projection_head, 'in_dim', args.hidden)
+            encoder_dim = getattr(graphcl_projection_head, 'encoder_in_dim', graphcl_in_dim)
+            predictor_dim = getattr(graphcl_projection_head, 'predictor_in_dim', graphcl_in_dim)
+            print(f"GraphCL projection head created: {predictor_dim}D -> {args.graphcl_projection_dim}D")
+            print(f"GraphCL representation path: encoder {encoder_dim}D -> PFN {predictor_dim}D -> projection {args.graphcl_projection_dim}D")
             print(f"GraphCL datasets loaded: {len(graphcl_datasets)} datasets, {len(graphcl_data_loader.dataset)} graphs")
         else:
             print("Warning: No GraphCL datasets loaded, disabling GraphCL")
@@ -3897,23 +3974,42 @@ def run_joint_training(args, device='cuda:0'):
         
         # Periodic evaluation on unseen datasets (controlled by eval_interval)
         unseen_metrics = {}
-        if epoch % args.eval_interval == 0:
+        run_regular_unseen_eval = (epoch % args.eval_interval == 0)
+        graphcl_downstream_interval = int(getattr(args, 'graphcl_downstream_eval_interval', 0))
+        run_graphcl_downstream_gc_eval = (
+            getattr(args, 'enable_graphcl', False)
+            and graphcl_downstream_interval > 0
+            and ((epoch + 1) % graphcl_downstream_interval == 0)
+            and len(data_dict['gc_test'][0]) > 0
+        )
+
+        if run_regular_unseen_eval or run_graphcl_downstream_gc_eval:
             # Evaluate on unseen test datasets
             nc_unseen_results = {}
             lp_unseen_results = {}
             gc_unseen_results = {}
-            
-            if getattr(args, 'enable_nc', True) and data_dict['nc_test'][0] is not None:
+
+            if run_graphcl_downstream_gc_eval and not run_regular_unseen_eval:
+                print(
+                    f"\n[GraphCL Downstream Eval] Epoch {epoch}: running GC test evaluation "
+                    f"(interval={graphcl_downstream_interval})"
+                )
+
+            if run_regular_unseen_eval and getattr(args, 'enable_nc', True) and data_dict['nc_test'][0] is not None:
                 nc_unseen_results = evaluate_node_classification(
                     model, predictor, data_dict['nc_test'], args, 'test', identity_projection, projector
                 )
-            
-            if getattr(args, 'enable_lp', True) and data_dict['lp_test'][0] is not None:
+
+            if run_regular_unseen_eval and getattr(args, 'enable_lp', True) and data_dict['lp_test'][0] is not None:
                 lp_unseen_results = evaluate_link_prediction_task(
                     model, predictor, data_dict['lp_test'], args, 'test', identity_projection
                 )
-            
-            if getattr(args, 'enable_gc', True) and len(data_dict['gc_test'][0]) > 0:
+
+            should_eval_gc_unseen = (
+                len(data_dict['gc_test'][0]) > 0 and
+                ((run_regular_unseen_eval and getattr(args, 'enable_gc', True)) or run_graphcl_downstream_gc_eval)
+            )
+            if should_eval_gc_unseen:
                 gc_unseen_results = evaluate_graph_classification_task(
                     model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker
                 )
@@ -3931,7 +4027,11 @@ def run_joint_training(args, device='cuda:0'):
             # Get dataset names for logging
             nc_test_datasets = args.nc_test_dataset.split(',') if getattr(args, 'enable_nc', True) and hasattr(args, 'nc_test_dataset') else []
             lp_test_datasets = args.lp_test_dataset.split(',') if getattr(args, 'enable_lp', True) and hasattr(args, 'lp_test_dataset') else []
-            gc_test_datasets = args.gc_test_dataset.split(',') if getattr(args, 'enable_gc', True) and hasattr(args, 'gc_test_dataset') else []
+            gc_test_datasets = (
+                args.gc_test_dataset.split(',')
+                if (hasattr(args, 'gc_test_dataset') and (getattr(args, 'enable_gc', True) or run_graphcl_downstream_gc_eval))
+                else []
+            )
             
             unseen_metrics = {
                 'test_unseen/nc_metric': nc_test_unseen,
@@ -3939,6 +4039,8 @@ def run_joint_training(args, device='cuda:0'):
                 'test_unseen/gc_metric': gc_test_unseen,
                 'test_unseen/combined_score': combined_test_unseen
             }
+            if run_graphcl_downstream_gc_eval:
+                unseen_metrics['graphcl_downstream/gc_metric'] = gc_test_unseen
             lp_gate_unseen = lp_unseen_results.get('mplp_gate_mean', None)
             if lp_gate_unseen is not None:
                 unseen_metrics['test_unseen/lp_mplp_gate_mean'] = lp_gate_unseen

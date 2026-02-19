@@ -40,8 +40,10 @@ class HeterophilousGraphDataset(InMemoryDataset):
 
     url = 'https://github.com/yandex-research/heterophilous-graphs/raw/main/data'
 
-    def __init__(self, root, name, transform=None, pre_transform=None, force_reload=False):
+    def __init__(self, root, name, transform=None, pre_transform=None,
+                 make_undirected=True, force_reload=False):
         self.name = name.lower().replace('-', '_')
+        self.make_undirected = bool(make_undirected)
         assert self.name in [
             'roman_empire',
             'amazon_ratings',
@@ -67,7 +69,8 @@ class HeterophilousGraphDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return 'data.pt'
+        suffix = 'undirected' if self.make_undirected else 'directed'
+        return f'data_{suffix}.pt'
 
     def download(self):
         """Download the dataset from GitHub"""
@@ -86,7 +89,8 @@ class HeterophilousGraphDataset(InMemoryDataset):
         x = torch.from_numpy(raw['node_features'])
         y = torch.from_numpy(raw['node_labels'])
         edge_index = torch.from_numpy(raw['edges']).t().contiguous()
-        edge_index = to_undirected(edge_index, num_nodes=x.size(0))
+        if self.make_undirected:
+            edge_index = to_undirected(edge_index, num_nodes=x.size(0))
         train_mask = torch.from_numpy(raw['train_masks']).t().contiguous()
         val_mask = torch.from_numpy(raw['val_masks']).t().contiguous()
         test_mask = torch.from_numpy(raw['test_masks']).t().contiguous()
@@ -102,4 +106,5 @@ class HeterophilousGraphDataset(InMemoryDataset):
         torch.save((data, slices), self.processed_paths[0])
 
     def __repr__(self):
-        return f'{self.__class__.__name__}(name={self.name})'
+        direction = 'undirected' if self.make_undirected else 'directed'
+        return f'{self.__class__.__name__}(name={self.name}, direction={direction})'

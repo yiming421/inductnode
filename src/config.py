@@ -29,7 +29,8 @@ def parse_joint_training_args():
     parser.add_argument('--claim_all_gpu_memory', type=str2bool, default=False, help='Claim all available GPU memory at startup to prevent competition')
 
     # === Model Architecture ===
-    parser.add_argument('--model', type=str, default='PureGCN_v1', choices=['PureGCN_v1', 'GCN', 'UnifiedGNN', 'GraphGPS'])
+    parser.add_argument('--model', type=str, default='PureGCN_v1',
+                       choices=['PureGCN_v1', 'GCN', 'UnifiedGNN', 'GraphGPS', 'FAGCN'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN', 'MPLP'])
     parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
@@ -75,6 +76,12 @@ def parse_joint_training_args():
     parser.add_argument('--graphgps_attn_type', type=str, default='multihead',
                        choices=['multihead', 'performer'],
                        help='Global attention type for GraphGPS')
+
+    # === FAGCN Specific Arguments ===
+    parser.add_argument('--fagcn_eps', type=float, default=0.1,
+                       help='Initial residual coefficient epsilon for FAGCN')
+    parser.add_argument('--fagcn_attn_dropout', type=float, default=0.2,
+                       help='Attention dropout inside FAGCN frequency-adaptive convolution')
     
     # === Training Configuration ===
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'])
@@ -126,6 +133,9 @@ def parse_joint_training_args():
                        help='Node classification training datasets')
     parser.add_argument('--nc_test_dataset', type=str, default='Cora,Citeseer,Pubmed,WikiCS', 
                        help='Node classification test datasets')
+    parser.add_argument('--nc_graph_direction', type=str, default='undirected',
+                       choices=['undirected', 'directed'],
+                       help='Node classification graph direction mode for adjacency/message passing ablation')
     parser.add_argument('--lp_train_dataset', type=str, default='ogbn-arxiv,CS,Physics,Computers,Photo,Flickr,USA,Brazil,Europe,Wiki,BlogCatalog,DBLP,FacebookPagePage,Actor,DeezerEurope,LastFMAsia', 
                        help='Link prediction training datasets')
     parser.add_argument('--lp_test_dataset', type=str, default='Cora,Citeseer,Pubmed,ogbl-collab', 
@@ -365,12 +375,12 @@ def parse_joint_training_args():
     parser.add_argument('--train_neg_ratio', type=int, default=3, help='Negative sampling ratio for training')
     parser.add_argument('--context_k', type=int, default=5, help='Number of context samples for link prediction')
     parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
-    parser.add_argument('--mask_target_edges', type=str2bool, default=False, help='Mask target edges during message passing')
+    parser.add_argument('--mask_target_edges', type=str2bool, default=True, help='Mask target edges during message passing')
     parser.add_argument('--lp_cache_mask_target_only_for_mplp', type=str2bool, default=False,
                        help='Experimental LP mode: with static embedding cache enabled, keep cached node embeddings but mask batch target edges only in MPLP structural adjacency')
     parser.add_argument('--lp_metric', type=str, default='auto', choices=['auto', 'auc', 'acc', 'hits@20', 'hits@50', 'hits@100', 'mrr'],
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
-    parser.add_argument('--lp_head_type', type=str, default='standard', choices=['standard', 'mplp', 'ncn', 'hybrid3'], help='Type of link prediction head')
+    parser.add_argument('--lp_head_type', type=str, default='mplp', choices=['standard', 'mplp', 'ncn', 'hybrid3'], help='Type of link prediction head')
     
     # === MPLP Head Configuration ===
     parser.add_argument('--mplp_signature_dim', type=int, default=1024, help='Dimension of random signature vectors for MPLP')
@@ -403,7 +413,7 @@ def parse_joint_training_args():
     parser.add_argument('--ncn_beta', type=float, default=1.0,
                         help='Scaling factor for NCN common-neighbor features')
     # === Graph Classification Specific ===
-    parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp', help='Graph classification training datasets')
+    parser.add_argument('--gc_train_dataset', type=str, default='bace,bbbp,tox21,toxcast,clintox,muv,sider', help='Graph classification training datasets')
     parser.add_argument('--gc_test_dataset', type=str, default='hiv,pcba', help='Graph classification test datasets')
     parser.add_argument('--gc_batch_size', type=int, default=1024, help='Graph classification batch size')
     parser.add_argument('--gc_test_batch_size', type=int, default=4096, help='Graph classification test batch size')
@@ -418,11 +428,11 @@ def parse_joint_training_args():
                        help='Use supervised MLP head for graph classification (bypasses PFN/transformer)')
     parser.add_argument('--gc_profile_context', type=str2bool, default=False,
                        help='Profile context prototype computation time (encode vs overhead) in vectorized GC')
-    parser.add_argument('--gc_vec_task_chunk_size', type=int, default=0,
+    parser.add_argument('--gc_vec_task_chunk_size', type=int, default=10,
                        help='Task chunk size for vectorized GC PFN backward (0 = disabled, keeps original all-task backward)')
     parser.add_argument('--gc_log_train_metrics', type=str2bool, default=True,
                        help='Log graph classification train metrics each epoch (can be expensive for large datasets)')
-    parser.add_argument('--gc_train_eval_max_batches', type=int, default=20,
+    parser.add_argument('--gc_train_eval_max_batches', type=int, default=10,
                        help='Max batches to use when computing GC train metrics (0 = all batches)')
     parser.add_argument('--gc_train_eval_shuffle', type=str2bool, default=True,
                        help='Shuffle train eval loader when using batch sampling for GC train metrics')
@@ -492,12 +502,14 @@ def parse_joint_training_args():
                        help='Augmentation ratio for first view (e.g., edge drop ratio or feature mask ratio)')
     parser.add_argument('--graphcl_aug2_ratio', type=float, default=0.2,
                        help='Augmentation ratio for second view')
-    parser.add_argument('--graphcl_temperature', type=float, default=0.5,
+    parser.add_argument('--graphcl_temperature', type=float, default=0.2,
                        help='Temperature parameter for InfoNCE contrastive loss')
     parser.add_argument('--graphcl_projection_dim', type=int, default=128,
                        help='Projection head output dimension for GraphCL (maps graph embeddings to contrastive space)')
     parser.add_argument('--graphcl_batch_size', type=int, default=256,
                        help='Batch size for GraphCL task')
+    parser.add_argument('--graphcl_downstream_eval_interval', type=int, default=5,
+                       help='Evaluate downstream GC test performance every N epochs during GraphCL training (0=disabled)')
     
     # === Profiling and Performance ===
     parser.add_argument('--enable_profiling', type=str2bool, default=False,
