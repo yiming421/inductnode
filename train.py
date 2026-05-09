@@ -22,7 +22,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Core imports - reuse from existing scripts
-from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN, GraphGPS, FAGCN
+from src.model import PureGCN_v1, PFNPredictorNodeCls, GCN, IdentityProjection, UnifiedGNN, GraphGPS, FAGCN, SIGN
 from src.model_graphpfn import ParameterFreeGCN
 from src.graphpfn import GraphPFNConfig, GraphPFNPredictor
 from src.data_nc import load_all_data, load_all_data_train
@@ -33,10 +33,11 @@ from src.data_utils_graphpfn import process_data_graphpfn
 from src.data_minibatch import MiniBatchNCLoader, compute_nc_loss_with_loader
 from src.engine_nc import train_all, test_all, test_all_induct  # Node classification engines
 from src.engine_nc_graphpfn import train_all_graphpfn, test_all_graphpfn  # GraphPFN engines
-from src.engine_lp import train_link_prediction, evaluate_link_prediction  # Link prediction engines
+from src.engine_lp import train_link_prediction, evaluate_link_prediction, evaluate_link_prediction_with_tta  # Link prediction engines
 from src.engine_gc import (
     train_graph_classification_single_task,
     evaluate_graph_classification_single_task,
+    evaluate_graph_classification_single_task_with_tta,
     aggregate_task_metrics,
     format_metric_results
 )
@@ -86,6 +87,266 @@ def _get_unseen_test_context_seed_base(args):
         setattr(args, '_unseen_test_context_seed_base', cached_seed)
         print(f"[Unseen Test Context] Using run seed base {cached_seed} (mode=per_run)")
     return int(cached_seed)
+
+
+GC_GNN_OVERRIDE_ATTRS = {
+    'model': 'gc_model',
+    'num_layers': 'gc_num_layers',
+    'unified_model_type': 'gc_unified_model_type',
+    'conv_type': 'gc_conv_type',
+    'multilayer': 'gc_multilayer',
+    'linear': 'gc_linear',
+    'use_gin': 'gc_use_gin',
+    'gin_aggr': 'gc_gin_aggr',
+    'graphgps_heads': 'gc_graphgps_heads',
+    'graphgps_local_conv': 'gc_graphgps_local_conv',
+    'graphgps_attn_type': 'gc_graphgps_attn_type',
+}
+
+
+def _resolve_gnn_dims(args, input_dim):
+    """Resolve the effective encoder hidden/input dimensions after projection settings."""
+    lp_lappe_direct_up_project = bool(
+        getattr(args, 'lp_lappe_direct_up_project', False)
+        and getattr(args, 'lp_use_lappe_as_feature', False)
+    )
+
+    if getattr(args, 'use_external_embeddings_nc', False):
+        hidden = args.hidden
+    elif lp_lappe_direct_up_project and not args.use_identity_projection:
+        hidden = args.hidden
+    elif args.use_identity_projection:
+        hidden = args.projection_large_dim
+    else:
+        hidden = args.hidden
+
+    gnn_input_dim = input_dim if getattr(args, 'use_mlp_projection', False) else hidden
+    return hidden, gnn_input_dim
+
+
+def _create_gnn_backbone(args, gnn_input_dim, hidden, device):
+    """Create a task encoder without predictor/projection modules."""
+    if getattr(args, 'use_virtual_node', False) and args.model != 'PureGCN_v1':
+        raise ValueError(
+            f"--use_virtual_node=True is supported only with PureGCN_v1; got model={args.model}"
+        )
+
+    # Use ParameterFreeGCN when using GraphPFN (handles arbitrary dimensions).
+    if getattr(args, 'use_graphpfn', False):
+        print("\n=== Using ParameterFreeGCN for GraphPFN ===")
+        model = ParameterFreeGCN(
+            num_layers=args.num_layers,
+            dropout=args.dp,
+            use_norm=args.norm,
+            use_residual=args.res,
+        )
+        print(f"ParameterFreeGCN: num_layers={args.num_layers}, dropout={args.dp}, "
+              f"norm={args.norm}, residual={args.res}")
+    elif args.model == 'PureGCN_v1':
+        model = PureGCN_v1(
+            gnn_input_dim, args.num_layers, hidden, args.dp, args.norm,
+            args.res, args.relu, args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            use_virtual_node=getattr(args, 'use_virtual_node', False)
+        )
+    elif args.model == 'GCN':
+        model = GCN(
+            gnn_input_dim, hidden, args.norm, args.relu, args.num_layers, args.dp,
+            args.multilayer, args.use_gin, args.res, args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu')
+        )
+    elif args.model == 'UnifiedGNN':
+        model = UnifiedGNN(
+            model_type=getattr(args, 'unified_model_type', 'gcn'),
+            in_feats=gnn_input_dim,
+            h_feats=hidden,
+            prop_step=getattr(args, 'num_layers', 2),
+            conv=getattr(args, 'conv_type', 'GCN'),
+            gin_aggr=getattr(args, 'gin_aggr', 'sum'),
+            multilayer=getattr(args, 'multilayer', False),
+            norm=getattr(args, 'norm', False),
+            relu=getattr(args, 'relu', False),
+            dropout=getattr(args, 'dp', 0.2),
+            residual=getattr(args, 'residual', 1.0),
+            linear=getattr(args, 'linear', False),
+            alpha=getattr(args, 'alpha', 0.5),
+            exp=getattr(args, 'exp', False),
+            res=getattr(args, 'res', False),
+            supports_edge_weight=getattr(args, 'supports_edge_weight', False),
+            no_parameters=getattr(args, 'no_parameters', False),
+            input_norm=getattr(args, 'input_norm', False),
+            activation=getattr(args, 'activation', 'relu')
+        )
+    elif args.model == 'GraphGPS':
+        model = GraphGPS(
+            in_feats=gnn_input_dim,
+            h_feats=hidden,
+            prop_step=args.num_layers,
+            dropout=args.dp,
+            norm=args.norm,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            heads=getattr(args, 'graphgps_heads', 4),
+            local_conv=getattr(args, 'graphgps_local_conv', 'GCN'),
+            attn_type=getattr(args, 'graphgps_attn_type', 'multihead'),
+            gin_aggr=getattr(args, 'gin_aggr', 'sum')
+        )
+    elif args.model == 'FAGCN':
+        model = FAGCN(
+            in_feats=gnn_input_dim,
+            h_feats=hidden,
+            prop_step=args.num_layers,
+            dropout=args.dp,
+            norm=args.norm,
+            relu=True,
+            res=args.res,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            eps=getattr(args, 'fagcn_eps', 0.1),
+            attn_dropout=getattr(args, 'fagcn_attn_dropout', 0.0),
+        )
+    elif args.model == 'SIGN':
+        model = SIGN(
+            in_feats=gnn_input_dim,
+            h_feats=hidden,
+            prop_step=getattr(args, 'sign_k', 3),
+            dropout=args.dp,
+            norm=args.norm,
+            relu=True,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            sign_low_layers=getattr(args, 'sign_low_layers', 0),
+            sign_high_layers=getattr(args, 'sign_high_layers', 0),
+            sign_project_dim=getattr(args, 'sign_project_dim', 64),
+        )
+    else:
+        raise NotImplementedError(f"Model {args.model} not implemented")
+
+    if args.use_dynamic_encoder:
+        from src.model import GNNWithDE
+
+        de_output_dim = hidden
+        de_dropout = args.dp
+        de_activation = getattr(args, 'activation', 'relu')
+
+        print(f"\n{'='*70}")
+        print("Wrapping model with Dynamic Encoder:")
+        print(f"  - Sample size: {args.de_sample_size}")
+        print(f"  - Hidden dim: {args.de_hidden_dim}")
+        print(f"  - Output dim: {de_output_dim} (matches GNN input)")
+        print(f"  - Activation: {de_activation} (matches main model)")
+        print(f"  - Dropout: {de_dropout} (matches main model)")
+        print(f"  - Lambda DE: {args.lambda_de}")
+        print(f"  - Update sample every: {args.de_update_sample_every_n_steps} steps")
+        print(f"{'='*70}\n")
+
+        model = GNNWithDE(
+            gnn_model=model,
+            de_sample_size=args.de_sample_size,
+            de_hidden_dim=args.de_hidden_dim,
+            de_output_dim=de_output_dim,
+            de_activation=de_activation,
+            de_use_layernorm=True,
+            de_dropout=de_dropout,
+            de_norm_affine=True,
+            lambda_de=args.lambda_de,
+            update_sample_every_n_steps=args.de_update_sample_every_n_steps
+        )
+
+    return model.to(device)
+
+
+def _build_gc_gnn_args(args):
+    """Return graph-task encoder args with optional GC-specific overrides applied."""
+    gc_args = copy.deepcopy(args)
+    for base_attr, override_attr in GC_GNN_OVERRIDE_ATTRS.items():
+        override_val = getattr(args, override_attr, None)
+        if override_val is not None:
+            setattr(gc_args, base_attr, override_val)
+
+    if getattr(args, 'gc_use_separate_gnn', False) and getattr(gc_args, 'use_graphpfn', False):
+        gc_args.use_graphpfn = False
+
+    return gc_args
+
+
+def _format_gnn_summary(args):
+    model_name = getattr(args, 'model', 'unknown')
+    parts = [model_name]
+    if model_name == 'UnifiedGNN':
+        parts.append(f"conv={getattr(args, 'conv_type', 'GCN')}")
+    elif model_name == 'GCN' and getattr(args, 'use_gin', False):
+        parts.append("gin_variant=True")
+    elif model_name == 'GraphGPS':
+        parts.append(f"local={getattr(args, 'graphgps_local_conv', 'GCN')}")
+    parts.append(f"layers={getattr(args, 'num_layers', 'na')}")
+    return ", ".join(parts)
+
+
+def _iter_unique_trainable_params(modules):
+    seen = set()
+    for module in modules:
+        if module is None:
+            continue
+        for param in module.parameters():
+            if not param.requires_grad:
+                continue
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            yield param
+
+
+def _collect_de_params(modules):
+    params = []
+    seen = set()
+    for module in modules:
+        if module is None or not hasattr(module, 'de'):
+            continue
+        nested_modules = [module.de]
+        if hasattr(module, 'proj_layer_norm'):
+            nested_modules.append(module.proj_layer_norm)
+        for nested in nested_modules:
+            for param in nested.parameters():
+                if not param.requires_grad:
+                    continue
+                param_id = id(param)
+                if param_id in seen:
+                    continue
+                seen.add(param_id)
+                params.append(param)
+    return params
+
+
+def _build_optimizer_parameters(modules, base_lr, use_dynamic_encoder=False, de_lr_scale=1.0):
+    de_params = _collect_de_params(modules) if use_dynamic_encoder else []
+    de_param_ids = {id(param) for param in de_params}
+    other_params = [
+        param for param in _iter_unique_trainable_params(modules)
+        if id(param) not in de_param_ids
+    ]
+
+    if de_params:
+        param_groups = []
+        if other_params:
+            param_groups.append({'params': other_params, 'lr': base_lr})
+        param_groups.append({'params': de_params, 'lr': base_lr * de_lr_scale})
+        return param_groups
+
+    return other_params
+
+
+def _get_module_device(module, fallback_module=None):
+    """Best-effort device resolution for modules that may be parameter-free."""
+    for candidate in (module, fallback_module):
+        if candidate is None:
+            continue
+        try:
+            return next(candidate.parameters()).device
+        except StopIteration:
+            continue
+    return torch.device('cpu')
 
 
 # Memory and time tracking utilities for Link Prediction
@@ -943,11 +1204,15 @@ def create_unified_model(args, input_dim, device):
             f"--use_virtual_node=True is supported only with --model=PureGCN_v1; got --model={args.model}"
         )
 
-    # Determine the actual hidden dimension for GNN input
-    # Priority: FUG embeddings > identity projection > raw features
+    # Determine the actual hidden dimension for GNN input.
+    lp_lappe_direct_up_project = bool(
+        getattr(args, 'lp_lappe_direct_up_project', False)
+        and getattr(args, 'lp_use_lappe_as_feature', False)
+    )
+    hidden, gnn_input_dim = _resolve_gnn_dims(args, input_dim)
+
     if getattr(args, 'use_external_embeddings_nc', False):
         # FUG embeddings mode: use MLP projector to map 1024 -> hidden
-        hidden = args.hidden
         from src.model import MLP
         projector = MLP(
             in_channels=1024,  # FUG generates uniform 1024-dim embeddings
@@ -959,130 +1224,21 @@ def create_unified_model(args, input_dim, device):
         )
         projector = projector.to(device)
         print(f"Created FUG projector: 1024 -> {args.hidden} (MLP with 2 layers)")
+    elif lp_lappe_direct_up_project and not args.use_identity_projection:
+        # LP-only direct LapPE up-projection path:
+        # keep GNN hidden dimension unchanged and map LapPE -> hidden via IdentityProjection.
+        hidden = args.hidden
+        lappe_in_dim = max(1, int(getattr(args, 'lp_lappe_dim', 32)))
+        identity_projection = IdentityProjection(lappe_in_dim, hidden)
+        identity_projection = identity_projection.to(device)
+        print(f"Created LP LapPE direct up-projection: {lappe_in_dim} -> {hidden}")
     elif args.use_identity_projection:
-        hidden = args.projection_large_dim
         identity_projection = IdentityProjection(args.projection_small_dim, args.projection_large_dim)
         identity_projection = identity_projection.to(device)
-    else:
-        hidden = args.hidden
-    
-    # Override input dim if using MLP projection (debug mode)
     if getattr(args, 'use_mlp_projection', False):
-        gnn_input_dim = input_dim
         print(f"Model Input Override: Using MLP projection input dim {gnn_input_dim} -> {hidden}")
-    else:
-        gnn_input_dim = hidden
 
-    # Create GNN backbone
-    # Use ParameterFreeGCN when using GraphPFN (handles arbitrary dimensions)
-    if getattr(args, 'use_graphpfn', False):
-        print("\n=== Using ParameterFreeGCN for GraphPFN ===")
-        model = ParameterFreeGCN(
-            num_layers=args.num_layers,
-            dropout=args.dp,
-            use_norm=args.norm,
-            use_residual=args.res,
-        )
-        print(f"ParameterFreeGCN: num_layers={args.num_layers}, dropout={args.dp}, "
-              f"norm={args.norm}, residual={args.res}")
-    elif args.model == 'PureGCN_v1':
-        model = PureGCN_v1(gnn_input_dim, args.num_layers, hidden, args.dp, args.norm,
-                          args.res, args.relu, args.gnn_norm_affine,
-                          activation=getattr(args, 'activation', 'relu'),
-                          use_virtual_node=getattr(args, 'use_virtual_node', False))
-    elif args.model == 'GCN':
-        model = GCN(gnn_input_dim, hidden, args.norm, args.relu, args.num_layers, args.dp,
-                   args.multilayer, args.use_gin, args.res, args.gnn_norm_affine,
-                   activation=getattr(args, 'activation', 'relu'))
-    elif args.model == 'UnifiedGNN':
-        model = UnifiedGNN(
-            model_type=getattr(args, 'unified_model_type', 'gcn'),
-            in_feats=gnn_input_dim,
-            h_feats=hidden,
-            prop_step=getattr(args, 'num_layers', 2),  # Reuse num_layers as prop_step
-            conv=getattr(args, 'conv_type', 'GCN'),
-            gin_aggr=getattr(args, 'gin_aggr', 'sum'),
-            multilayer=getattr(args, 'multilayer', False),
-            norm=getattr(args, 'norm', False),
-            relu=getattr(args, 'relu', False),
-            dropout=getattr(args, 'dp', 0.2),
-            residual=getattr(args, 'residual', 1.0),
-            linear=getattr(args, 'linear', False),
-            alpha=getattr(args, 'alpha', 0.5),
-            exp=getattr(args, 'exp', False),
-            res=getattr(args, 'res', False),
-            supports_edge_weight=getattr(args, 'supports_edge_weight', False),
-            no_parameters=getattr(args, 'no_parameters', False),
-            input_norm=getattr(args, 'input_norm', False),
-            activation=getattr(args, 'activation', 'relu')
-        )
-    elif args.model == 'GraphGPS':
-        model = GraphGPS(
-            in_feats=gnn_input_dim,
-            h_feats=hidden,
-            prop_step=args.num_layers,
-            dropout=args.dp,
-            norm=args.norm,
-            norm_affine=args.gnn_norm_affine,
-            activation=getattr(args, 'activation', 'relu'),
-            heads=getattr(args, 'graphgps_heads', 4),
-            local_conv=getattr(args, 'graphgps_local_conv', 'GCN'),
-            attn_type=getattr(args, 'graphgps_attn_type', 'multihead'),
-            gin_aggr=getattr(args, 'gin_aggr', 'sum')
-        )
-    elif args.model == 'FAGCN':
-        model = FAGCN(
-            in_feats=gnn_input_dim,
-            h_feats=hidden,
-            prop_step=args.num_layers,
-            dropout=args.dp,
-            norm=args.norm,
-            relu=True,
-            res=args.res,
-            norm_affine=args.gnn_norm_affine,
-            activation=getattr(args, 'activation', 'relu'),
-            eps=getattr(args, 'fagcn_eps', 0.1),
-            attn_dropout=getattr(args, 'fagcn_attn_dropout', 0.0),
-        )
-    else:
-        raise NotImplementedError(f"Model {args.model} not implemented")
-
-    # Wrap with Dynamic Encoder if enabled
-    if args.use_dynamic_encoder:
-        from src.model import GNNWithDE
-
-        # DE output dim should match GNN input dim (hidden)
-        de_output_dim = hidden
-
-        # DE dropout should match main model dropout
-        de_dropout = args.dp
-
-        # DE activation should match main model activation
-        de_activation = getattr(args, 'activation', 'relu')
-
-        print(f"\n{'='*70}")
-        print(f"Wrapping model with Dynamic Encoder:")
-        print(f"  - Sample size: {args.de_sample_size}")
-        print(f"  - Hidden dim: {args.de_hidden_dim}")
-        print(f"  - Output dim: {de_output_dim} (matches GNN input)")
-        print(f"  - Activation: {de_activation} (matches main model)")
-        print(f"  - Dropout: {de_dropout} (matches main model)")
-        print(f"  - Lambda DE: {args.lambda_de}")
-        print(f"  - Update sample every: {args.de_update_sample_every_n_steps} steps")
-        print(f"{'='*70}\n")
-
-        model = GNNWithDE(
-            gnn_model=model,
-            de_sample_size=args.de_sample_size,
-            de_hidden_dim=args.de_hidden_dim,
-            de_output_dim=de_output_dim,
-            de_activation=de_activation,
-            de_use_layernorm=True,  # Always use LayerNorm
-            de_dropout=de_dropout,
-            de_norm_affine=True,  # Always use affine
-            lambda_de=args.lambda_de,
-            update_sample_every_n_steps=args.de_update_sample_every_n_steps
-        )
+    model = _create_gnn_backbone(args, gnn_input_dim, hidden, device)
 
     # Create unified predictor (same for both tasks)
     if getattr(args, 'use_graphpfn', False):
@@ -1129,6 +1285,7 @@ def create_unified_model(args, input_dim, device):
             use_full_embedding=getattr(args, 'use_full_embedding', False),
             norm_type=getattr(args, 'transformer_norm_type', 'post'),
             ffn_expansion_ratio=getattr(args, 'ffn_expansion_ratio', 4),
+            transformer_ffn_only=getattr(args, 'transformer_ffn_only', False),
             use_matching_network=getattr(args, 'use_matching_network', False),
             matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
             matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
@@ -1143,6 +1300,7 @@ def create_unified_model(args, input_dim, device):
             head_num_layers=getattr(args, 'head_num_layers', 2),
             nc_head_num_layers=getattr(args, 'nc_head_num_layers', None),
             lp_head_num_layers=getattr(args, 'lp_head_num_layers', None),
+            gc_head_num_layers=getattr(args, 'gc_head_num_layers', None),
             lp_head_type=getattr(args, 'lp_head_type', 'standard'),
             mplp_signature_dim=getattr(args, 'mplp_signature_dim', 64),
             mplp_num_hops=getattr(args, 'mplp_num_hops', 2),
@@ -1167,7 +1325,6 @@ def create_unified_model(args, input_dim, device):
     else:
         raise NotImplementedError(f"Predictor {args.predictor} not implemented")
     
-    model = model.to(device)
     predictor = predictor.to(device)
 
     return model, predictor, identity_projection, projector
@@ -1202,25 +1359,178 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         split_idx['train'] = split_idx['train'].cpu()
         split_idx['valid'] = split_idx['valid'].cpu()
         split_idx['test'] = split_idx['test'].cpu()
+
+    def clone_lp_split_idx(split_idx):
+        """Clone LP split tensors so duplicated views share identical edge splits."""
+        cloned = {}
+        for split_name, split_data in split_idx.items():
+            if isinstance(split_data, dict):
+                cloned[split_name] = {}
+                for key, value in split_data.items():
+                    if isinstance(value, torch.Tensor):
+                        cloned[split_name][key] = value.clone()
+                    else:
+                        cloned[split_name][key] = copy.deepcopy(value)
+            else:
+                cloned[split_name] = copy.deepcopy(split_data)
+        return cloned
+
+    def expand_lp_train_dual_views(data_list, split_idx_list, noise_dim):
+        """
+        Expand LP training datasets into paired feature/no-feature views.
+        The no-feature view uses orthogonal noise but keeps graph/splits identical.
+        """
+        expanded_data = []
+        expanded_splits = []
+
+        for idx, (data_obj, split_idx) in enumerate(zip(data_list, split_idx_list)):
+            base_name = getattr(data_obj, 'name', f'lp_dataset_{idx}')
+            data_obj.lp_view_type = 'feat'
+            data_obj.lp_base_dataset_name = base_name
+
+            expanded_data.append(data_obj)
+            expanded_splits.append(split_idx)
+
+            nofeat_data = copy.deepcopy(data_obj)
+            # Share immutable graph structure tensors to avoid unnecessary memory duplication.
+            if hasattr(data_obj, 'adj_t'):
+                nofeat_data.adj_t = data_obj.adj_t
+            if hasattr(data_obj, 'edge_index'):
+                nofeat_data.edge_index = data_obj.edge_index
+            if hasattr(data_obj, 'full_adj_t') and data_obj.full_adj_t is not None:
+                nofeat_data.full_adj_t = data_obj.full_adj_t
+
+            nofeat_data.name = f"{base_name}__nofeat"
+            nofeat_data.lp_view_type = 'nofeat'
+            nofeat_data.lp_base_dataset_name = base_name
+            nofeat_data.lp_force_orthogonal_noise = True
+            nofeat_data.lp_force_orthogonal_noise_dim = int(noise_dim)
+
+            nofeat_split = clone_lp_split_idx(split_idx)
+
+            expanded_data.append(nofeat_data)
+            expanded_splits.append(nofeat_split)
+
+        return expanded_data, expanded_splits
+
+    def attach_lappe_embeddings_to_lp_data(data_list, split_name):
+        """
+        Attach precomputed LapPE tensors to LP data objects.
+        Uses lp_base_dataset_name for dual-view copies to resolve embedding files.
+        """
+        if not data_list:
+            return 0
+
+        from src.data_nc import attach_gpse_embeddings
+        from src.lappe_generator import generate_and_save_lappe_for_data
+
+        dataset_names = []
+        for idx, data_obj in enumerate(data_list):
+            dataset_name = getattr(data_obj, 'lp_base_dataset_name', getattr(data_obj, 'name', f'lp_{split_name}_{idx}'))
+            dataset_names.append(dataset_name)
+
+        success_count = attach_gpse_embeddings(
+            data_list,
+            dataset_names,
+            gpse_dir=args.gpse_dir,
+            verbose=args.gpse_verbose,
+            use_gpse=False,
+            use_lappe=True,
+            use_rwse=False
+        )
+
+        # Optional: generate missing LapPE on-demand (no separate script needed).
+        generate_if_missing = bool(getattr(args, 'lp_generate_lappe_if_missing', True))
+        if generate_if_missing:
+            missing_indices = []
+            for i, data_obj in enumerate(data_list):
+                lappe = getattr(data_obj, 'lappe_embeddings', None)
+                if lappe is None:
+                    missing_indices.append(i)
+                    continue
+                if hasattr(lappe, 'ndim') and lappe.ndim == 2 and int(lappe.size(1)) == 0:
+                    missing_indices.append(i)
+                    continue
+
+            if missing_indices:
+                dim = max(1, int(getattr(args, 'lp_lappe_dim', 32)))
+                generated_cache = {}
+                print(
+                    f"[LP LapPE] Missing/invalid LapPE for {len(missing_indices)} {split_name} views; "
+                    f"auto-generating (dim={dim})..."
+                )
+                for i in missing_indices:
+                    data_obj = data_list[i]
+                    dataset_name = dataset_names[i]
+                    if dataset_name in generated_cache:
+                        lappe_tensor, save_path, method, meta = generated_cache[dataset_name]
+                    else:
+                        try:
+                            lappe_tensor, save_path, method, meta = generate_and_save_lappe_for_data(
+                                data=data_obj,
+                                dataset_name=dataset_name,
+                                output_root=args.gpse_dir,
+                                dim=dim,
+                                skip_zero_freq=True,
+                                eigvec_abs=False,
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"[LP LapPE] Failed to generate strict non-zero LapPE for {dataset_name} "
+                                f"(dim={dim}). {exc}"
+                            ) from exc
+                        generated_cache[dataset_name] = (lappe_tensor, save_path, method, meta)
+                    data_obj.lappe_embeddings = lappe_tensor
+                    print(
+                        f"  [LP LapPE] Generated {dataset_name}: {tuple(lappe_tensor.shape)} "
+                        f"(method={method}, solved_k={meta.get('solved_k', 'na')}, "
+                        f"zero_eigs={meta.get('num_zero_eigs_in_solved_k', 'na')}, "
+                        f"fallback={meta.get('fallback_applied', False)}) -> {save_path}"
+                    )
+
+                # Recount after generation.
+                success_count = 0
+                for data_obj in data_list:
+                    lappe = getattr(data_obj, 'lappe_embeddings', None)
+                    if lappe is not None and hasattr(lappe, 'ndim') and lappe.ndim == 2 and int(lappe.size(1)) > 0:
+                        success_count += 1
+
+        print(
+            f"[LP LapPE] Attached LapPE embeddings for {success_count}/{len(data_list)} "
+            f"{split_name} LP views"
+        )
+        return success_count
     
     # === Node Classification Data ===
     nc_train_data_list, nc_train_split_idx_list = None, None
     nc_test_data_list, nc_test_split_idx_list = None, None
+    nc_valid_data_list, nc_valid_split_idx_list = None, None
     # Ensure local initialization before any reference to avoid UnboundLocalError
     nc_train_external_embeddings = None
     nc_test_external_embeddings = None
+    nc_valid_external_embeddings = None
     
     if args.enable_nc:
         print("Loading node classification datasets...")
-        nc_train_datasets = args.nc_train_dataset.split(',')
-        nc_test_datasets = args.nc_test_dataset.split(',')
+        nc_train_datasets = [d.strip() for d in args.nc_train_dataset.split(',') if d.strip()]
+        nc_test_datasets = [d.strip() for d in args.nc_test_dataset.split(',') if d.strip()]
+        nc_valid_datasets = [d.strip() for d in str(getattr(args, 'nc_valid_dataset', '')).split(',') if d.strip()]
+        # Default behavior for synthetic GraphPFN-XY training:
+        # if no explicit NC hold-out valid datasets are provided, automatically use
+        # GraphPFN-XY eval graphs as held-out validation.
+        if not nc_valid_datasets and any(d.lower() in {"graphpfn-xy", "graphpfn_xy", "graphpfnxy"} for d in nc_train_datasets):
+            nc_valid_datasets = ['graphpfn_xy']
+            print("NC hold-out valid dataset not provided; defaulting to graphpfn_xy eval graphs.")
         nc_make_undirected = getattr(args, 'nc_graph_direction', 'undirected') != 'directed'
         nc_direction_label = 'undirected' if nc_make_undirected else 'directed'
         print(f"NC graph direction mode: {nc_direction_label}")
         webkb_datasets = {'Cornell', 'Texas', 'Wisconsin'}
         expand_webkb_splits = any(ds.strip() in webkb_datasets for ds in nc_test_datasets)
+        expand_webkb_splits_valid = any(ds.strip() in webkb_datasets for ds in nc_valid_datasets)
         if expand_webkb_splits:
             print("NC test split mode: using all official WebKB splits")
+        if expand_webkb_splits_valid:
+            print("NC held-out validation split mode: using all official WebKB splits")
 
         # Auto-fix: Change 'legacy' to 'small_valid' for large datasets to prevent infinite loops
         if args.split_rebalance_strategy == 'legacy':
@@ -1246,7 +1556,9 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 augmentation_use_feature_mixing=args.augmentation_use_feature_mixing,
                 augmentation_mix_ratio=args.augmentation_mix_ratio,
                 augmentation_mix_alpha=args.augmentation_mix_alpha,
-                make_undirected=nc_make_undirected
+                make_undirected=nc_make_undirected,
+                graphpfn_xy_num_graphs=args.num_graphs,
+                graphpfn_xy_dir=args.graphpfn_xy_dir,
             )
         else:
             print("  Skipping NC training data loading (using pretrained model)")
@@ -1254,12 +1566,23 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         nc_test_data_list, nc_test_split_idx_list = load_all_data(
             nc_test_datasets,
             make_undirected=nc_make_undirected,
-            expand_webkb_splits=expand_webkb_splits
+            expand_webkb_splits=expand_webkb_splits,
+            graphpfn_xy_num_graphs=args.num_graphs,
+            graphpfn_xy_dir=args.graphpfn_xy_dir,
         )
+        if nc_valid_datasets:
+            nc_valid_data_list, nc_valid_split_idx_list = load_all_data(
+                nc_valid_datasets,
+                make_undirected=nc_make_undirected,
+                expand_webkb_splits=expand_webkb_splits_valid,
+                graphpfn_xy_num_graphs=args.num_graphs,
+                graphpfn_xy_dir=args.graphpfn_xy_dir,
+            )
+            print(f"Loaded {len(nc_valid_data_list)} NC held-out validation datasets")
 
         # 2) Load GPSE/LapPE/RWSE embeddings (if enabled)
         if args.use_gpse or args.use_lappe or args.use_rwse:
-            from src.data import attach_gpse_embeddings
+            from src.data_nc import attach_gpse_embeddings
 
             pe_types = []
             if args.use_gpse: pe_types.append('GPSE')
@@ -1290,6 +1613,18 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 use_rwse=args.use_rwse
             )
             print(f"  ✓ {pe_str} embeddings loaded for {test_count}/{len(nc_test_data_list)} test datasets\n")
+
+            if nc_valid_data_list is not None:
+                valid_count = attach_gpse_embeddings(
+                    nc_valid_data_list,
+                    nc_valid_datasets,
+                    gpse_dir=args.gpse_dir,
+                    verbose=args.gpse_verbose,
+                    use_gpse=args.use_gpse,
+                    use_lappe=args.use_lappe,
+                    use_rwse=args.use_rwse
+                )
+                print(f"  ✓ {pe_str} embeddings loaded for {valid_count}/{len(nc_valid_data_list)} held-out validation datasets")
 
         # 3) Load external embeddings (if enabled) before processing datasets so they can be used
         if getattr(args, 'use_external_embeddings_nc', False):
@@ -1337,6 +1672,24 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                         else:
                             print(f"  No external embeddings found for {dataset_name} (expected: {emb_file})")
                             nc_test_external_embeddings.append(None)
+                if nc_valid_data_list is not None:
+                    nc_valid_external_embeddings = []
+                    for data in nc_valid_data_list:
+                        dataset_name = getattr(data, 'name', 'unknown')
+                        emb_file = os.path.join(args.fug_root, dataset_name, f"{dataset_name}.pt")
+                        if os.path.exists(emb_file):
+                            try:
+                                external_embeddings = torch.load(emb_file, map_location='cpu')
+                                print(f"  Loaded external embeddings for {dataset_name}: {external_embeddings.shape}")
+                                if external_embeddings.size(0) != data.num_nodes:
+                                    print(f"  WARNING: {dataset_name} embedding count {external_embeddings.size(0)} != dataset nodes {data.num_nodes}")
+                                nc_valid_external_embeddings.append(external_embeddings)
+                            except Exception as e:
+                                print(f"  Failed to load external embeddings for {dataset_name}: {e}")
+                                nc_valid_external_embeddings.append(None)
+                        else:
+                            print(f"  No external embeddings found for {dataset_name} (expected: {emb_file})")
+                            nc_valid_external_embeddings.append(None)
 
         # 3) Process training data (now embeddings are ready if enabled)
         if not skip_training_data:
@@ -1424,6 +1777,49 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
 
             # Move processed tensors back to CPU to free GPU memory until evaluation
             move_nc_tensors_to_cpu(data, split_idx)
+
+        # 5) Process held-out validation data (optional)
+        if nc_valid_data_list is not None:
+            for i, (data, split_idx) in enumerate(zip(nc_valid_data_list, nc_valid_split_idx_list)):
+                data.x = data.x.to(device)
+                data.adj_t = data.adj_t.to(device)
+                data.y = data.y.to(device)
+
+                external_emb = nc_valid_external_embeddings[i] if nc_valid_external_embeddings else None
+
+                context_shots = resolve_context_shots(data.name, 'nc', args, epoch=None)
+
+                if getattr(args, 'use_graphpfn', False):
+                    process_data_graphpfn(
+                        data,
+                        split_idx,
+                        context_num=context_shots,
+                        pca_target_dim=args.hidden,
+                        normalize_data=args.normalize_data,
+                        use_full_pca=args.use_full_pca,
+                        pca_device=args.pca_device,
+                        incremental_pca_batch_size=args.incremental_pca_batch_size,
+                        rank=0,
+                        process_test_only=False,
+                        use_orthogonal_noise=args.use_orthogonal_noise,
+                    )
+                else:
+                    process_data(
+                        data, split_idx, args.hidden, context_shots, False, args.use_full_pca,
+                        args.normalize_data, False, 32, 0, args.padding_strategy,
+                        args.use_batchnorm, args.use_identity_projection, args.projection_small_dim, args.projection_large_dim, args.pca_device,
+                        args.incremental_pca_batch_size, external_emb, args.use_random_orthogonal,
+                        args.use_sparse_random, args.sparse_random_density,
+                        args.plot_tsne, args.tsne_save_dir, args.use_pca_whitening, args.whitening_epsilon,
+                        args.use_quantile_normalization, args.quantile_norm_before_padding,
+                        getattr(args, 'use_external_embeddings_nc', False),
+                        args.use_dynamic_encoder,
+                        process_test_only=False,
+                        use_orthogonal_noise=args.use_orthogonal_noise,
+                        args=args
+                    )
+
+                move_nc_tensors_to_cpu(data, split_idx)
     else:
         print("Node classification task disabled, skipping dataset loading...")
 
@@ -1434,11 +1830,15 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
     lp_train_context_data, lp_train_masks, lp_train_link_data_all = [], [], []
     lp_test_data_list, lp_test_split_idx_list = None, None
     lp_test_context_data, lp_test_link_data_all = [], []
+    lp_valid_data_list, lp_valid_split_idx_list = None, None
+    lp_valid_context_data, lp_valid_link_data_all = [], []
+    lp_valid_masks = []
     
     if args.enable_lp:
         print("Loading link prediction datasets...")
-        lp_train_datasets = args.lp_train_dataset.split(',')
-        lp_test_datasets = args.lp_test_dataset.split(',')
+        lp_train_datasets = [d.strip() for d in args.lp_train_dataset.split(',') if d.strip()]
+        lp_test_datasets = [d.strip() for d in args.lp_test_dataset.split(',') if d.strip()]
+        lp_valid_datasets = [d.strip() for d in str(getattr(args, 'lp_valid_dataset', '')).split(',') if d.strip()]
         
         # Initialize link prediction tracker
         if lp_tracker is None:
@@ -1455,6 +1855,19 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
             with lp_tracker.time_operation('data_preparation'):
                 lp_train_data_list, lp_train_split_idx_list = load_all_data_link(lp_train_datasets, device='cpu')
                 print(f"[MEMORY_FIX] Loaded {len(lp_train_data_list)} training datasets on CPU (was loading to GPU before!)")
+                if getattr(args, 'lp_use_orthogonal_noise', False):
+                    noise_dim = max(1, int(getattr(args, 'lp_orthogonal_noise_dim', 128)))
+                    lp_train_data_list, lp_train_split_idx_list = expand_lp_train_dual_views(
+                        lp_train_data_list,
+                        lp_train_split_idx_list,
+                        noise_dim=noise_dim
+                    )
+                    print(
+                        f"[LP Dual-View] Expanded LP training datasets to {len(lp_train_data_list)} views "
+                        f"(feature + no-feature, noise_dim={noise_dim})"
+                    )
+                if getattr(args, 'lp_use_lappe_as_feature', False):
+                    attach_lappe_embeddings_to_lp_data(lp_train_data_list, split_name='train')
         else:
             lp_train_data_list, lp_train_split_idx_list = [], []
             print("  Skipping LP training data loading (using pretrained model)")
@@ -1500,7 +1913,8 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 
                 with lp_tracker.time_operation('context_selection'):
                     # Resolve context shots for this specific dataset
-                    context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
+                    context_dataset_name = getattr(data, 'lp_base_dataset_name', data.name)
+                    context_shots = resolve_context_shots(context_dataset_name, 'lp', args, epoch=None)
                     context_data, train_mask = select_link_context(link_data['train'], context_shots, args.context_neg_ratio,
                                                                    args.remove_context_from_train)
                 
@@ -1520,6 +1934,8 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         with lp_tracker.time_operation('data_preparation'):
             lp_test_data_list, lp_test_split_idx_list = load_all_data_link(lp_test_datasets, device='cpu')
             print(f"[MEMORY_FIX] Loaded {len(lp_test_data_list)} test datasets on CPU (was loading to GPU before!)")
+            if getattr(args, 'lp_use_lappe_as_feature', False):
+                attach_lappe_embeddings_to_lp_data(lp_test_data_list, split_name='test')
         
         # Process link prediction test data
         lp_test_context_data = []
@@ -1556,18 +1972,58 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
             
             with lp_tracker.time_operation('context_selection'):
                 # Resolve context shots for this specific dataset
-                context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
+                context_dataset_name = getattr(data, 'lp_base_dataset_name', data.name)
+                context_shots = resolve_context_shots(context_dataset_name, 'lp', args, epoch=None)
                 context_data, _ = select_link_context(link_data['train'], context_shots, args.context_neg_ratio, False)
             
             lp_test_context_data.append(context_data)
             lp_test_link_data_all.append(link_data)
             lp_tracker.operation_counts['datasets_processed'] += 1
+
+        # Load/process held-out validation data for LP model selection (optional)
+        if lp_valid_datasets:
+            with lp_tracker.time_operation('data_preparation'):
+                lp_valid_data_list, lp_valid_split_idx_list = load_all_data_link(lp_valid_datasets, device='cpu')
+                print(f"[MEMORY_FIX] Loaded {len(lp_valid_data_list)} held-out LP validation datasets on CPU")
+                if getattr(args, 'lp_use_lappe_as_feature', False):
+                    attach_lappe_embeddings_to_lp_data(lp_valid_data_list, split_name='valid')
+
+            for i, (data, split_idx) in enumerate(zip(lp_valid_data_list, lp_valid_split_idx_list)):
+                with lp_tracker.time_operation('data_preparation'):
+                    original_x_device = data.x.device
+                    if data.x.device.type == 'cpu':
+                        print(f"[MEMORY_FIX] Moving {data.name} features to GPU for fast PCA computation")
+                        data.x = data.x.to(device)
+
+                    process_link_data(data, args, rank=0)
+                    data.x = data.x.to(original_x_device)
+
+                    if hasattr(data, 'x_pca') and data.x_pca is not None:
+                        data.x_pca = data.x_pca.to(original_x_device)
+                        print(f"[MEMORY_FIX] Moved {data.name} x_pca back to CPU")
+                    if hasattr(data, 'context_sample') and data.context_sample is not None:
+                        data.context_sample = data.context_sample.to(original_x_device)
+                        print(f"[MEMORY_FIX] Moved {data.name} context_sample back to CPU")
+
+                    print(f"[MEMORY_FIX] Moved {data.name} processed features back to CPU")
+                    link_data = prepare_link_data(data, split_idx)
+
+                with lp_tracker.time_operation('context_selection'):
+                    context_dataset_name = getattr(data, 'lp_base_dataset_name', data.name)
+                    context_shots = resolve_context_shots(context_dataset_name, 'lp', args, epoch=None)
+                    context_data, _ = select_link_context(link_data['train'], context_shots, args.context_neg_ratio, False)
+
+                lp_valid_context_data.append(context_data)
+                lp_valid_link_data_all.append(link_data)
+                lp_valid_masks.append(None)
+                lp_tracker.operation_counts['datasets_processed'] += 1
     else:
         print("Link prediction task disabled, skipping dataset loading...")
     
     # === Graph Classification Data ===
     gc_train_data_list, gc_train_processed_data_list = [], []
     gc_test_data_list, gc_test_processed_data_list = [], []
+    gc_valid_data_list, gc_valid_processed_data_list = [], []
 
     gc_training_enabled = bool(getattr(args, 'enable_gc', False))
     gc_downstream_eval_enabled = bool(
@@ -1595,6 +2051,7 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
         
         gc_train_datasets = args.gc_train_dataset.split(',') if gc_training_enabled else []
         gc_test_datasets = args.gc_test_dataset.split(',')
+        gc_valid_datasets = [d.strip() for d in str(getattr(args, 'gc_valid_dataset', '')).split(',') if d.strip()]
         
         # Load training data for graph classification (skip if using pretrained model)
         if gc_training_enabled and not skip_training_data:
@@ -1778,6 +2235,67 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
                 dataset_info['task_filtered_splits_test_only'] = task_filtered_splits_test
                 if getattr(args, 'gc_supervised_mlp', False):
                     dataset_info['gc_supervised_head'] = None
+
+        # Load/process held-out validation data for GC model selection (optional)
+        if gc_valid_datasets:
+            if gc_tracker:
+                gc_tracker.log_memory("gc_valid_data_loading_start")
+
+            print("Loading held-out validation data for graph classification...")
+
+            # Reuse cache-aware path when available, consistent with GC train/test loading.
+            use_cache_aware = (hasattr(args, 'use_ogb_fug') and args.use_ogb_fug) and \
+                              not (hasattr(args, 'use_original_features') and args.use_original_features)
+
+            if use_cache_aware:
+                from src.data_graph_cache_aware import load_all_graph_datasets_cache_aware
+                for dataset_name in gc_valid_datasets:
+                    context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch=None)
+                    try:
+                        single_data_list, single_processed_list = load_all_graph_datasets_cache_aware(
+                            [dataset_name], device, context_k=context_shots,
+                            hidden_dim=args.hidden, pca_cache_dir=args.pca_cache_dir
+                        )
+                    except ImportError:
+                        single_data_list, single_processed_list = load_all_graph_datasets(
+                            [dataset_name], device, context_k=context_shots
+                        )
+                    gc_valid_data_list.extend(single_data_list)
+                    gc_valid_processed_data_list.extend(single_processed_list)
+            else:
+                for dataset_name in gc_valid_datasets:
+                    context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch=None)
+                    single_data_list, single_processed_list = load_all_graph_datasets(
+                        [dataset_name], device, context_k=context_shots
+                    )
+                    gc_valid_data_list.extend(single_data_list)
+                    gc_valid_processed_data_list.extend(single_processed_list)
+
+            if len(gc_valid_data_list) > 0:
+                if gc_tracker:
+                    gc_tracker.log_memory("gc_valid_data_processing_start")
+
+                gc_valid_data_list, gc_valid_processed_data_list, _ = process_datasets_for_models(
+                    gc_valid_data_list, gc_valid_processed_data_list, args, device, test_datasets=True
+                )
+
+                if gc_tracker:
+                    gc_tracker.log_memory("gc_valid_data_processed")
+
+                print("Precomputing task-filtered splits for held-out validation datasets...")
+                for dataset_info in gc_valid_processed_data_list:
+                    # For held-out validation, only filter validation split.
+                    task_filtered_splits_valid = create_task_filtered_datasets(
+                        dataset_info['dataset'],
+                        dataset_info['split_idx'],
+                        "val"
+                    )
+                    dataset_info['task_filtered_splits'] = task_filtered_splits_valid
+                    dataset_info['task_filtered_splits_test_only'] = task_filtered_splits_valid
+                    if getattr(args, 'gc_supervised_mlp', False):
+                        dataset_info['gc_supervised_head'] = None
+
+                print(f"Loaded {len(gc_valid_data_list)} GC held-out validation datasets")
     else:
         print("Graph classification data loading disabled, skipping dataset loading...")
 
@@ -1794,11 +2312,14 @@ def load_and_preprocess_data(args, device, skip_training_data=False, gc_tracker=
     data_dict = {
         'nc_train': (nc_train_data_list, nc_train_split_idx_list, nc_train_external_embeddings),
         'nc_test': (nc_test_data_list, nc_test_split_idx_list, nc_test_external_embeddings),
+        'nc_valid': (nc_valid_data_list, nc_valid_split_idx_list, nc_valid_external_embeddings),
         'nc_train_loaders': nc_train_loaders,  # Add loaders to data_dict
         'lp_train': (lp_train_data_list, lp_train_split_idx_list, lp_train_context_data, lp_train_masks, lp_train_link_data_all),
         'lp_test': (lp_test_data_list, lp_test_split_idx_list, lp_test_context_data, lp_test_link_data_all),
+        'lp_valid': (lp_valid_data_list, lp_valid_split_idx_list, lp_valid_context_data, lp_valid_masks, lp_valid_link_data_all),
         'gc_train': (gc_train_data_list, gc_train_processed_data_list),
-        'gc_test': (gc_test_data_list, gc_test_processed_data_list)
+        'gc_test': (gc_test_data_list, gc_test_processed_data_list),
+        'gc_valid': (gc_valid_data_list, gc_valid_processed_data_list)
     }
 
     if gc_tracker:
@@ -1860,7 +2381,8 @@ def get_hierarchical_task_schedule(epoch, args):
 
 def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, args, epoch,
                        identity_projection=None, projector=None, nc_loaders=None, optimizer_nc=None, optimizer_lp=None, optimizer_gc=None,
-                       optimizer_graphcl=None, graphcl_projection_head=None, graphcl_data_loader=None):
+                       optimizer_graphcl=None, graphcl_projection_head=None, graphcl_data_loader=None,
+                       gc_model=None):
     """
     Perform one joint training step combining all three tasks.
 
@@ -1877,6 +2399,8 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
     model.train()
     predictor.train()
+    gc_encoder = gc_model if gc_model is not None else model
+    gc_encoder.train()
 
     # Use task-specific optimizers if provided, otherwise use unified optimizer
     opt_nc = optimizer_nc if optimizer_nc is not None else optimizer
@@ -2314,7 +2838,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
             # Train using multi-dataset sampling
             total_gc_loss = train_graph_classification_multi_dataset_sampling(
-                model, predictor, gc_processed_data_list, all_splits, opt_gc,
+                gc_encoder, predictor, gc_processed_data_list, all_splits, opt_gc,
                 temperature,
                 pooling_method=args.graph_pooling,
                 device=device,
@@ -2362,7 +2886,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
                     )
                     from src.engine_gc import train_graph_classification_multitask_vectorized
                     dataset_loss = train_graph_classification_multitask_vectorized(
-                        model, predictor, dataset_info, unfiltered_loaders, opt_gc,
+                        gc_encoder, predictor, dataset_info, unfiltered_loaders, opt_gc,
                         pooling_method=args.graph_pooling, device=device,
                         clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
                         normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
@@ -2394,7 +2918,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
                         # Train on this specific task
                         task_loss = train_graph_classification_single_task(
-                            model, predictor, dataset_info, task_data_loaders, opt_gc, task_idx,
+                            gc_encoder, predictor, dataset_info, task_data_loaders, opt_gc, task_idx,
                             pooling_method=args.graph_pooling, device=device,
                             clip_grad=args.clip_grad, orthogonal_push=args.orthogonal_push,
                             normalize_class_h=args.normalize_class_h, identity_projection=identity_projection,
@@ -2432,7 +2956,7 @@ def joint_training_step(model, predictor, nc_data, lp_data, gc_data, optimizer, 
 
         # Train GraphCL for one epoch on the data loader
         graphcl_results = train_graphcl(
-            model, predictor, graphcl_projection_head, graphcl_data_loader, opt_graphcl, args,
+            gc_encoder, predictor, graphcl_projection_head, graphcl_data_loader, opt_graphcl, args,
             device=device, identity_projection=identity_projection, rank=0, lambda_=args.lambda_graphcl
         )
         total_graphcl_loss = torch.tensor(graphcl_results['loss'], device=device)  # Loss already includes lambda scaling
@@ -2722,6 +3246,16 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                     dataset_accs = {}  # {dataset_name: accuracy}
 
                     for i, (loader, split_idx) in enumerate(zip(nc_loaders, nc_split_idx_list)):
+                        data_obj = nc_data_list[i] if nc_data_list is not None and i < len(nc_data_list) else None
+                        if data_obj is None and hasattr(loader, 'data'):
+                            data_obj = loader.data
+                        dataset_name = getattr(data_obj, 'name', f'dataset_{i}')
+
+                        target_idx = split_idx.get(split, None)
+                        if target_idx is None or len(target_idx) == 0:
+                            print(f"  [NC Seen Eval] Skipping {dataset_name}: no {split} nodes")
+                            continue
+
                         if loader.is_minibatch():
                             # Mini-batch evaluation
                             eval_result = evaluate_with_loader(
@@ -2737,9 +3271,6 @@ def evaluate_node_classification(model, predictor, nc_data, args, split='valid',
                                 eval_acc = eval_result
                             eval_accs.append(eval_acc)
                         else:
-                            data_obj = nc_data_list[i] if nc_data_list is not None and i < len(nc_data_list) else None
-                            if data_obj is None and hasattr(loader, 'data'):
-                                data_obj = loader.data
                             # Fall back to full-batch for small datasets
                             # Use GraphPFN engine if enabled
                             if getattr(args, 'use_graphpfn', False):
@@ -2881,12 +3412,40 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
                         lp_tracker.record_memory()
 
                         def _eval_with_context(context_edges):
-                            lp_results = evaluate_link_prediction(
+                            eval_fn = evaluate_link_prediction_with_tta if (
+                                split == 'test' and getattr(args, 'lp_use_test_time_augmentation', False)
+                            ) else evaluate_link_prediction
+                            eval_kwargs = {}
+                            if eval_fn is evaluate_link_prediction_with_tta:
+                                eval_kwargs['num_augmentations'] = (
+                                    getattr(args, 'lp_tta_num_augmentations', None)
+                                    if getattr(args, 'lp_tta_num_augmentations', None) is not None
+                                    else getattr(args, 'tta_num_augmentations', 5)
+                                )
+                                eval_kwargs['normalize_views'] = getattr(args, 'lp_tta_normalize_views', False)
+                                eval_kwargs['use_batchnorm'] = getattr(args, 'use_batchnorm', False)
+                                eval_kwargs['linear_projection'] = getattr(args, 'lp_tta_linear_projection', False)
+                                eval_kwargs['context_gate'] = getattr(args, 'lp_tta_context_gate', False)
+                                eval_kwargs['context_gate_tolerance'] = getattr(args, 'lp_tta_context_gate_tolerance', 0.0)
+                                eval_kwargs['train_gate'] = getattr(args, 'lp_tta_train_gate', False)
+                                eval_kwargs['train_gate_edges'] = link_data_all.get('train', None)
+                                eval_kwargs['train_gate_pos_samples'] = getattr(args, 'lp_tta_train_gate_pos_samples', 256)
+                                eval_kwargs['train_gate_neg_ratio'] = getattr(args, 'lp_tta_train_gate_neg_ratio', 1.0)
+                                eval_kwargs['train_gate_hits_k'] = getattr(args, 'lp_tta_train_gate_hits_k', 20)
+                                eval_kwargs['train_gate_tolerance'] = getattr(args, 'lp_tta_train_gate_tolerance', 0.0)
+                                eval_kwargs['lp_edge_probe_debug'] = getattr(args, 'lp_edge_probe_debug', False)
+                                eval_kwargs['lp_edge_probe_samples'] = getattr(args, 'lp_edge_probe_samples', 512)
+                            else:
+                                eval_kwargs['lp_edge_probe_debug'] = getattr(args, 'lp_edge_probe_debug', False)
+                                eval_kwargs['lp_edge_probe_samples'] = getattr(args, 'lp_edge_probe_samples', 512)
+                                eval_kwargs['lp_edge_probe_label'] = 'eval'
+                            lp_results = eval_fn(
                                 model, predictor, data, link_data_all[split_key], context_edges,
                                 args.test_batch_size, None, None, None, identity_projection,
                                 0, True, degree=False, k_values=[20, 50, 100],
                                 use_full_adj_for_test=(split == 'test'), lp_metric=args.lp_metric,
-                                lp_concat_common_neighbors=getattr(args, 'lp_concat_common_neighbors', False)
+                                lp_concat_common_neighbors=getattr(args, 'lp_concat_common_neighbors', False),
+                                **eval_kwargs
                             )
                             return (
                                 lp_results.get('default_metric', 0.0),
@@ -3133,7 +3692,8 @@ def evaluate_link_prediction_task(model, predictor, lp_data, args, split='valid'
     return results
 
 
-def evaluate_graph_classification_task(model, predictor, gc_data, args, split='valid', identity_projection=None, gc_tracker=None):
+def evaluate_graph_classification_task(model, predictor, gc_data, args, split='valid', identity_projection=None, gc_tracker=None,
+                                       gc_model=None):
     """
     Evaluate graph classification task only.
     
@@ -3145,8 +3705,10 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
     eval_start_time = time.time()
     print(f"Starting graph classification evaluation ({split} split)...")
     
-    model.eval()
+    gc_encoder = gc_model if gc_model is not None else model
+    gc_encoder.eval()
     predictor.eval()
+    gc_device = _get_module_device(gc_encoder, predictor)
     
     if gc_tracker:
         gc_tracker.log_memory(f"eval_{split}_start")
@@ -3219,11 +3781,27 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             use_index_tracking=use_index_tracking
                         )
 
-                    task_eval_results = evaluate_graph_classification_multitask_vectorized(
-                        model, predictor, dataset_info, task_eval_loaders,
-                        pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
+                    gc_vec_eval_fn = evaluate_graph_classification_multitask_vectorized
+                    gc_vec_eval_kwargs = {}
+                    if split == 'test' and getattr(args, 'gc_use_test_time_augmentation', False):
+                        from src.engine_gc import evaluate_graph_classification_multitask_vectorized_with_tta
+                        gc_vec_eval_fn = evaluate_graph_classification_multitask_vectorized_with_tta
+                        gc_vec_eval_kwargs = {
+                            'num_augmentations': (
+                                getattr(args, 'gc_tta_num_augmentations', None)
+                                if getattr(args, 'gc_tta_num_augmentations', None) is not None
+                                else getattr(args, 'tta_num_augmentations', 5)
+                            ),
+                            'normalize_views': getattr(args, 'gc_tta_normalize_views', False),
+                            'use_batchnorm': getattr(args, 'use_batchnorm', False),
+                            'linear_projection': getattr(args, 'gc_tta_linear_projection', False),
+                        }
+
+                    task_eval_results = gc_vec_eval_fn(
+                        gc_encoder, predictor, dataset_info, task_eval_loaders,
+                        pooling_method=args.graph_pooling, device=gc_device,
                         normalize_class_h=args.normalize_class_h, dataset_name=dataset_name,
-                        identity_projection=identity_projection, args=args
+                        identity_projection=identity_projection, args=args, **gc_vec_eval_kwargs
                     )
 
                     result_key = 'val' if split == 'valid' else split
@@ -3293,8 +3871,8 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             with record_function(f"gc_eval_{dataset_name}_task_{task_idx}"):
                                 # Evaluate this specific task
                                 task_eval_results = evaluate_graph_classification_single_task(
-                                    model, predictor, dataset_info, task_eval_loaders, task_idx,
-                                    pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
+                                    gc_encoder, predictor, dataset_info, task_eval_loaders, task_idx,
+                                    pooling_method=args.graph_pooling, device=gc_device,
                                     normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
                                 )
                             prof.stop()
@@ -3316,10 +3894,26 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                                     print(f"        {line}")
                         else:
                             # Evaluate this specific task
-                            task_eval_results = evaluate_graph_classification_single_task(
-                                model, predictor, dataset_info, task_eval_loaders, task_idx,
-                                pooling_method=args.graph_pooling, device=model.parameters().__next__().device,
-                                normalize_class_h=args.normalize_class_h, dataset_name=dataset_name, identity_projection=identity_projection
+                            gc_eval_fn = evaluate_graph_classification_single_task_with_tta if (
+                                split == 'test' and getattr(args, 'gc_use_test_time_augmentation', False)
+                            ) else evaluate_graph_classification_single_task
+                            gc_eval_kwargs = {}
+                            if gc_eval_fn is evaluate_graph_classification_single_task_with_tta:
+                                gc_eval_kwargs = {
+                                    'num_augmentations': (
+                                        getattr(args, 'gc_tta_num_augmentations', None)
+                                        if getattr(args, 'gc_tta_num_augmentations', None) is not None
+                                        else getattr(args, 'tta_num_augmentations', 5)
+                                    ),
+                                    'normalize_views': getattr(args, 'gc_tta_normalize_views', False),
+                                    'use_batchnorm': getattr(args, 'use_batchnorm', False),
+                                    'linear_projection': getattr(args, 'gc_tta_linear_projection', False),
+                                }
+                            task_eval_results = gc_eval_fn(
+                                gc_encoder, predictor, dataset_info, task_eval_loaders, task_idx,
+                                pooling_method=args.graph_pooling, device=gc_device,
+                                normalize_class_h=args.normalize_class_h, dataset_name=dataset_name,
+                                identity_projection=identity_projection, args=args, **gc_eval_kwargs
                             )
                             eval_time = time.time() - eval_start_time
                             
@@ -3412,7 +4006,8 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
 
 
 def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='valid',
-                    identity_projection=None, projector=None, gc_tracker=None, nc_loaders=None, epoch=0):
+                    identity_projection=None, projector=None, gc_tracker=None, nc_loaders=None, epoch=0,
+                    gc_model=None):
     """
     Evaluate enabled tasks and return metrics.
 
@@ -3438,7 +4033,9 @@ def joint_evaluation(model, predictor, nc_data, lp_data, gc_data, args, split='v
     
     # Evaluate graph classification
     if hasattr(args, 'enable_gc') and args.enable_gc and gc_data is not None and len(gc_data[0]) > 0:
-            gc_results = evaluate_graph_classification_task(model, predictor, gc_data, args, split, identity_projection, gc_tracker)
+            gc_results = evaluate_graph_classification_task(
+                model, predictor, gc_data, args, split, identity_projection, gc_tracker, gc_model=gc_model
+            )
             results['gc_metrics'] = gc_results
     
     return results
@@ -3461,6 +4058,11 @@ def run_joint_training(args, device='cuda:0'):
     print(f"  Link Prediction: {'✓' if getattr(args, 'enable_lp', True) else '✗'} (lambda: {args.lambda_lp})")
     print(f"  Graph Classification: {'✓' if getattr(args, 'enable_gc', True) else '✗'} (lambda: {args.lambda_gc})")
     print(f"  GraphCL (Contrastive): {'✓' if getattr(args, 'enable_graphcl', False) else '✗'} (lambda: {getattr(args, 'lambda_graphcl', 0.0)})")
+    if getattr(args, 'gc_use_separate_gnn', False):
+        gc_args_preview = _build_gc_gnn_args(args)
+        print(f"  Graph Task Backbone: separate ({_format_gnn_summary(gc_args_preview)})")
+    else:
+        print(f"  Graph Task Backbone: shared ({_format_gnn_summary(args)})")
     if getattr(args, 'enable_graphcl', False) and int(getattr(args, 'graphcl_downstream_eval_interval', 0)) > 0:
         print(f"  GraphCL Downstream GC Eval: every {int(getattr(args, 'graphcl_downstream_eval_interval', 0))} epochs")
     
@@ -3530,12 +4132,228 @@ def run_joint_training(args, device='cuda:0'):
         gc_tracker.record_memory()
         after_data_stats = gc_tracker.get_memory_stats()
         print(f"After Data Loading - GPU: {after_data_stats['gpu_allocated']:.2f}GB, CPU: {after_data_stats['cpu_memory']:.2f}GB")
+
+    # Resolve model-selection validation source
+    nc_holdout_valid_available = (
+        getattr(args, 'enable_nc', True) and
+        data_dict.get('nc_valid', (None, None, None))[0] is not None and
+        len(data_dict['nc_valid'][0]) > 0
+    )
+    lp_holdout_valid_available = (
+        getattr(args, 'enable_lp', True) and
+        data_dict.get('lp_valid', (None, None, [], [], []))[0] is not None and
+        len(data_dict['lp_valid'][0]) > 0
+    )
+    gc_holdout_valid_available = (
+        getattr(args, 'enable_gc', True) and
+        data_dict.get('gc_valid', ([], []))[0] is not None and
+        len(data_dict['gc_valid'][0]) > 0
+    )
+    has_any_holdout_valid = nc_holdout_valid_available or lp_holdout_valid_available or gc_holdout_valid_available
+
+    requested_selection_source = getattr(args, 'model_selection_source', 'auto')
+    if requested_selection_source == 'seen':
+        model_selection_source = 'seen'
+    elif requested_selection_source == 'holdout':
+        if has_any_holdout_valid:
+            model_selection_source = 'holdout'
+        else:
+            print("⚠️  model_selection_source=holdout but no held-out validation datasets loaded; falling back to seen validation.")
+            model_selection_source = 'seen'
+    else:  # auto
+        model_selection_source = 'holdout' if has_any_holdout_valid else 'seen'
+
+    print(f"Model selection source: {model_selection_source}")
+    if model_selection_source == 'holdout':
+        print(
+            f"  Hold-out availability - NC: {'✓' if nc_holdout_valid_available else '✗'}, "
+            f"LP: {'✓' if lp_holdout_valid_available else '✗'}, "
+            f"GC: {'✓' if gc_holdout_valid_available else '✗'}"
+        )
+
+    # When selecting checkpoints from held-out datasets, use all nodes from NC training
+    # datasets as training targets (no seen-split reservation needed for model selection).
+    if model_selection_source == 'holdout' and nc_holdout_valid_available:
+        nc_train_data = data_dict.get('nc_train', (None, None, None))
+        nc_train_data_list, nc_train_split_idx_list, _ = nc_train_data
+        if nc_train_data_list is not None and nc_train_split_idx_list is not None:
+            print("NC hold-out selection active: expanding NC train split to all nodes for training datasets.")
+            for i, (data, split_idx) in enumerate(zip(nc_train_data_list, nc_train_split_idx_list)):
+                if split_idx is None or 'train' not in split_idx:
+                    continue
+                old_train_count = len(split_idx['train'])
+                num_nodes = int(getattr(data, 'num_nodes', old_train_count))
+                train_device = split_idx['train'].device
+                split_idx['train'] = torch.arange(num_nodes, dtype=torch.long, device=train_device)
+                dataset_name = getattr(data, 'name', f'dataset_{i}')
+                print(f"  {dataset_name}: train nodes {old_train_count:,} -> {num_nodes:,}")
+
+            # Rebuild NC loaders so minibatch input nodes reflect the expanded train split.
+            nc_train_loaders = []
+            print("Rebuilding NC mini-batch loaders after NC train-split expansion...")
+            for i, (data, split_idx) in enumerate(zip(nc_train_data_list, nc_train_split_idx_list)):
+                dataset_name = getattr(data, 'name', f'dataset_{i}')
+                print(f"  [{i+1}/{len(nc_train_data_list)}] {dataset_name}:")
+                loader = MiniBatchNCLoader(data, split_idx, args, device)
+                nc_train_loaders.append(loader)
+            data_dict['nc_train_loaders'] = nc_train_loaders
+
+    # Apply the same held-out training design to LP: use all seen positive edges
+    # (train+valid+test) from LP training datasets when hold-out model selection is active.
+    if model_selection_source == 'holdout' and lp_holdout_valid_available:
+        lp_train_data = data_dict.get('lp_train', (None, None, [], [], []))
+        (
+            lp_train_data_list,
+            lp_train_split_idx_list,
+            lp_train_context_data,
+            lp_train_masks,
+            lp_train_link_data_all,
+        ) = lp_train_data
+        if lp_train_data_list is not None and lp_train_split_idx_list is not None:
+            from torch_geometric.utils import to_undirected
+            from torch_sparse import SparseTensor
+
+            print("LP hold-out selection active: expanding LP train positives to all seen positives.")
+
+            for i, (data, split_idx) in enumerate(zip(lp_train_data_list, lp_train_split_idx_list)):
+                if not isinstance(split_idx, dict) or 'train' not in split_idx:
+                    continue
+
+                merged_edges = []
+                for split_name in ('train', 'valid', 'test'):
+                    split_part = split_idx.get(split_name, None)
+                    if isinstance(split_part, dict) and 'edge' in split_part:
+                        edge_tensor = split_part['edge']
+                        if isinstance(edge_tensor, torch.Tensor) and edge_tensor.numel() > 0:
+                            edge_pairs = edge_tensor if edge_tensor.dim() == 2 and edge_tensor.size(1) == 2 else edge_tensor.t()
+                            if edge_pairs.dim() == 2 and edge_pairs.size(1) == 2:
+                                merged_edges.append(edge_pairs)
+
+                if not merged_edges:
+                    continue
+
+                old_train_edge_count = int(split_idx['train']['edge'].size(0)) if isinstance(split_idx['train'], dict) and 'edge' in split_idx['train'] else 0
+                merged = torch.cat(merged_edges, dim=0)
+
+                # Canonicalize to undirected (min, max) and deduplicate.
+                u = torch.minimum(merged[:, 0], merged[:, 1])
+                v = torch.maximum(merged[:, 0], merged[:, 1])
+                merged_unique = torch.unique(torch.stack([u, v], dim=1), dim=0)
+
+                split_idx['train']['edge'] = merged_unique.to(split_idx['train']['edge'].device)
+
+                # If metadata from original train split exists, it no longer matches merged edge count.
+                for stale_key in ('weight', 'year'):
+                    if stale_key in split_idx['train']:
+                        split_idx['train'].pop(stale_key, None)
+
+                # Keep graph structure consistent with expanded train positives.
+                edge_index = to_undirected(split_idx['train']['edge'].t(), num_nodes=data.num_nodes)
+                data.edge_index = edge_index.to(data.edge_index.device if hasattr(data, 'edge_index') else data.x.device)
+                data.adj_t = SparseTensor.from_edge_index(
+                    data.edge_index,
+                    sparse_sizes=(data.num_nodes, data.num_nodes)
+                )
+                data.adj_t = data.adj_t.to_symmetric().coalesce().to(data.x.device)
+
+                # Rebuild LP prepared train data and context after split mutation.
+                link_data = prepare_link_data(data, split_idx)
+                context_shots = resolve_context_shots(data.name, 'lp', args, epoch=None)
+                context_data, train_mask = select_link_context(
+                    link_data['train'], context_shots, args.context_neg_ratio, args.remove_context_from_train
+                )
+
+                if i < len(lp_train_link_data_all):
+                    lp_train_link_data_all[i] = link_data
+                if i < len(lp_train_context_data):
+                    lp_train_context_data[i] = context_data
+                if i < len(lp_train_masks):
+                    lp_train_masks[i] = train_mask
+
+                dataset_name = getattr(data, 'name', f'dataset_{i}')
+                print(
+                    f"  {dataset_name}: train positives {old_train_edge_count:,} -> "
+                    f"{int(split_idx['train']['edge'].size(0)):,}"
+                )
+
+            data_dict['lp_train'] = (
+                lp_train_data_list,
+                lp_train_split_idx_list,
+                lp_train_context_data,
+                lp_train_masks,
+                lp_train_link_data_all,
+            )
+
+    # Apply the same held-out training design to GC: use all seen graphs
+    # (train+val+test when available) as GC training targets.
+    if model_selection_source == 'holdout' and gc_holdout_valid_available:
+        gc_train_data = data_dict.get('gc_train', ([], []))
+        gc_train_data_list, gc_train_processed_data_list = gc_train_data
+        if gc_train_processed_data_list:
+            from src.data_gc import prepare_graph_data_for_pfn
+
+            print("GC hold-out selection active: expanding GC train split to all seen graphs.")
+
+            for i, dataset_info in enumerate(gc_train_processed_data_list):
+                dataset = dataset_info.get('dataset', None)
+                split_idx = dataset_info.get('split_idx', None)
+                if dataset is None or not isinstance(split_idx, dict) or 'train' not in split_idx:
+                    continue
+
+                merged_indices = []
+                for split_name in ('train', 'val', 'test'):
+                    if split_name in split_idx:
+                        idx_tensor = torch.as_tensor(split_idx[split_name], dtype=torch.long)
+                        if idx_tensor.numel() > 0:
+                            merged_indices.append(idx_tensor)
+
+                if not merged_indices:
+                    continue
+
+                old_train_count = len(split_idx['train'])
+                split_idx['train'] = torch.unique(torch.cat(merged_indices, dim=0))
+                dataset_name = getattr(dataset, 'name', f'gc_dataset_{i}')
+
+                # Rebuild task-aware context graphs from the updated train split.
+                context_shots = resolve_context_shots(dataset_name, 'gc', args, epoch=None)
+                refreshed = prepare_graph_data_for_pfn(
+                    dataset,
+                    split_idx,
+                    context_k=context_shots,
+                    device=device,
+                )
+                dataset_info['split_idx'] = refreshed['split_idx']
+                dataset_info['context_graphs'] = refreshed['context_graphs']
+                dataset_info['context_labels'] = refreshed['context_labels']
+                dataset_info['is_multitask'] = refreshed['is_multitask']
+                dataset_info['num_tasks'] = refreshed['num_tasks']
+                dataset_info['task_filtered_splits'] = create_task_filtered_datasets(
+                    dataset_info['dataset'],
+                    dataset_info['split_idx']
+                )
+
+                print(f"  {dataset_name}: train graphs {old_train_count:,} -> {len(dataset_info['split_idx']['train']):,}")
+
+            data_dict['gc_train'] = (gc_train_data_list, gc_train_processed_data_list)
     
     # Create unified model
     with lp_tracker.time_operation('data_preparation') if lp_tracker else nullcontext():
         model_input_dim = args.mlp_projection_input_dim if getattr(args, 'use_mlp_projection', False) else args.hidden
         model, predictor, identity_projection, projector = create_unified_model(
             args, model_input_dim, device)
+        gc_model = None
+        if getattr(args, 'gc_use_separate_gnn', False) and (
+            getattr(args, 'enable_gc', False) or getattr(args, 'enable_graphcl', False)
+        ):
+            gc_args = _build_gc_gnn_args(args)
+            if getattr(args, 'use_graphpfn', False):
+                print("GC separate backbone: disabling GraphPFN encoder shortcut for the graph path.")
+            gc_hidden, gc_input_dim = _resolve_gnn_dims(args, model_input_dim)
+            if getattr(gc_args, 'use_mlp_projection', False):
+                print(f"GC Model Input Override: Using MLP projection input dim {gc_input_dim} -> {gc_hidden}")
+            gc_model = _create_gnn_backbone(gc_args, gc_input_dim, gc_hidden, device)
+            print(f"Created separate graph-task backbone: {_format_gnn_summary(gc_args)}")
+        graph_task_model = gc_model if gc_model is not None else model
 
     # Attach supervised GC heads (if enabled) after model creation
     if getattr(args, 'gc_supervised_mlp', False) and getattr(args, 'enable_gc', True):
@@ -3563,7 +4381,7 @@ def run_joint_training(args, device='cuda:0'):
                 head = GraphClassificationMLPHead(
                     in_dim=args.hidden,
                     out_dim=out_dim,
-                    num_layers=max(1, getattr(args, 'head_num_layers', 2)),
+                    num_layers=max(1, getattr(args, 'gc_head_num_layers', getattr(args, 'head_num_layers', 2))),
                     dropout=args.dp,
                     norm=args.norm,
                     norm_affine=args.mlp_norm_affine
@@ -3617,7 +4435,7 @@ def run_joint_training(args, device='cuda:0'):
 
             # Create projection head
             graphcl_projection_head = create_graphcl_projection_head(
-                args, model=model, predictor=predictor, device=device
+                args, model=graph_task_model, predictor=predictor, device=device
             )
             graphcl_in_dim = getattr(graphcl_projection_head, 'in_dim', args.hidden)
             encoder_dim = getattr(graphcl_projection_head, 'encoder_in_dim', graphcl_in_dim)
@@ -3643,38 +4461,20 @@ def run_joint_training(args, device='cuda:0'):
             head = dataset_info.get('gc_supervised_head')
             if head is not None and head not in gc_supervised_heads:
                 gc_supervised_heads.append(head)
+    shared_task_modules = [model, predictor, identity_projection, projector]
+    graph_task_modules = [graph_task_model, predictor, identity_projection, projector]
+    graphcl_modules = [graph_task_model, predictor, identity_projection, graphcl_projection_head]
+    all_modules = [model, gc_model, predictor, identity_projection, projector, graphcl_projection_head]
+    all_modules.extend(gc_supervised_heads)
 
-    if args.use_dynamic_encoder and hasattr(model, 'de'):
-        # Separate DE parameters from main model
-        de_params = list(model.de.parameters())
-        if hasattr(model, 'proj_layer_norm'):
-            de_params.extend(list(model.proj_layer_norm.parameters()))
-        de_param_ids = set(id(p) for p in de_params)
+    if args.use_dynamic_encoder and (hasattr(model, 'de') or (gc_model is not None and hasattr(gc_model, 'de'))):
+        print(f"DE learning rate: scaled to {de_lr_scale:.0%} of each optimizer base LR")
 
-        # Collect non-DE parameters
-        other_params = []
-        for module in [model, predictor, identity_projection, projector, graphcl_projection_head]:
-            if module is not None:
-                for p in module.parameters():
-                    if id(p) not in de_param_ids:
-                        other_params.append(p)
-        for head in gc_supervised_heads:
-            other_params.extend(list(head.parameters()))
-
-        # Parameter groups: DE gets lower lr
-        param_groups = [
-            {'params': other_params, 'lr': args.lr},
-            {'params': de_params, 'lr': args.lr * de_lr_scale},
-        ]
-        parameters = param_groups
-        print(f"DE learning rate: {args.lr * de_lr_scale:.2e} ({de_lr_scale:.0%} of base lr)")
-    else:
-        parameters = []
-        for module in [model, predictor, identity_projection, projector, graphcl_projection_head]:
-            if module is not None:
-                parameters.extend(list(module.parameters()))
-        for head in gc_supervised_heads:
-            parameters.extend(list(head.parameters()))
+    all_parameters = _build_optimizer_parameters(
+        all_modules, args.lr,
+        use_dynamic_encoder=args.use_dynamic_encoder,
+        de_lr_scale=de_lr_scale
+    )
 
     if args.use_separate_optimizers:
         # Separate optimizers mode: one optimizer per task
@@ -3685,16 +4485,43 @@ def run_joint_training(args, device='cuda:0'):
 
         print(f"Using separate optimizers - NC LR: {lr_nc:.2e}, LP LR: {lr_lp:.2e}, GC LR: {lr_gc:.2e}, GraphCL LR: {lr_graphcl:.2e}")
 
+        nc_parameters = _build_optimizer_parameters(
+            shared_task_modules, lr_nc,
+            use_dynamic_encoder=args.use_dynamic_encoder,
+            de_lr_scale=de_lr_scale
+        )
+        lp_parameters = _build_optimizer_parameters(
+            shared_task_modules, lr_lp,
+            use_dynamic_encoder=args.use_dynamic_encoder,
+            de_lr_scale=de_lr_scale
+        )
+        gc_parameters = _build_optimizer_parameters(
+            graph_task_modules + gc_supervised_heads, lr_gc,
+            use_dynamic_encoder=args.use_dynamic_encoder,
+            de_lr_scale=de_lr_scale
+        )
+        graphcl_parameters = _build_optimizer_parameters(
+            graphcl_modules, lr_graphcl,
+            use_dynamic_encoder=args.use_dynamic_encoder,
+            de_lr_scale=de_lr_scale
+        ) if getattr(args, 'enable_graphcl', False) else None
+
         if args.optimizer == 'adam':
-            optimizer_nc = torch.optim.Adam(parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
-            optimizer_lp = torch.optim.Adam(parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
-            optimizer_gc = torch.optim.Adam(parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
-            optimizer_graphcl = torch.optim.Adam(parameters, lr=lr_graphcl, weight_decay=args.weight_decay, eps=args.eps) if getattr(args, 'enable_graphcl', False) else None
+            optimizer_nc = torch.optim.Adam(nc_parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_lp = torch.optim.Adam(lp_parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_gc = torch.optim.Adam(gc_parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_graphcl = (
+                torch.optim.Adam(graphcl_parameters, lr=lr_graphcl, weight_decay=args.weight_decay, eps=args.eps)
+                if graphcl_parameters is not None else None
+            )
         elif args.optimizer == 'adamw':
-            optimizer_nc = torch.optim.AdamW(parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
-            optimizer_lp = torch.optim.AdamW(parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
-            optimizer_gc = torch.optim.AdamW(parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
-            optimizer_graphcl = torch.optim.AdamW(parameters, lr=lr_graphcl, weight_decay=args.weight_decay, eps=args.eps) if getattr(args, 'enable_graphcl', False) else None
+            optimizer_nc = torch.optim.AdamW(nc_parameters, lr=lr_nc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_lp = torch.optim.AdamW(lp_parameters, lr=lr_lp, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_gc = torch.optim.AdamW(gc_parameters, lr=lr_gc, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer_graphcl = (
+                torch.optim.AdamW(graphcl_parameters, lr=lr_graphcl, weight_decay=args.weight_decay, eps=args.eps)
+                if graphcl_parameters is not None else None
+            )
 
         def create_scheduler(opt):
             if args.schedule == 'cosine':
@@ -3720,9 +4547,9 @@ def run_joint_training(args, device='cuda:0'):
         print(f"Using unified optimizer with LR: {args.lr:.2e}")
 
         if args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer = torch.optim.Adam(all_parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
         elif args.optimizer == 'adamw':
-            optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
+            optimizer = torch.optim.AdamW(all_parameters, lr=args.lr, weight_decay=args.weight_decay, eps=args.eps)
 
         if args.schedule == 'cosine':
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -3740,10 +4567,10 @@ def run_joint_training(args, device='cuda:0'):
         scheduler_nc = scheduler_lp = scheduler_gc = scheduler_graphcl = None
     
     # Count total parameters (handle both list and param_groups)
-    if isinstance(parameters, list) and len(parameters) > 0 and isinstance(parameters[0], dict):
-        total_params = sum(p.numel() for group in parameters for p in group['params'])
+    if isinstance(all_parameters, list) and len(all_parameters) > 0 and isinstance(all_parameters[0], dict):
+        total_params = sum(p.numel() for group in all_parameters for p in group['params'])
     else:
-        total_params = sum(p.numel() for p in parameters)
+        total_params = sum(p.numel() for p in all_parameters)
     print(f"Total parameters: {total_params:,}")
     
     # Load checkpoint states if checkpoint was provided
@@ -3751,7 +4578,7 @@ def run_joint_training(args, device='cuda:0'):
         print("Loading model states from checkpoint...")
         best_epoch, best_valid, final_test = load_checkpoint_states(
             checkpoint, model, predictor, optimizer, identity_projection=identity_projection,
-            scheduler=scheduler, rank=0
+            scheduler=scheduler, gc_model=gc_model, rank=0
         )
         print(f"Checkpoint loaded - Best epoch: {best_epoch}, Best valid: {best_valid:.4f}, Final test: {final_test:.4f}")
         
@@ -3761,6 +4588,8 @@ def run_joint_training(args, device='cuda:0'):
 
             # Ensure models are in evaluation mode for inference
             model.eval()
+            if gc_model is not None:
+                gc_model.eval()
             predictor.eval()
             if identity_projection is not None:
                 identity_projection.eval()
@@ -3788,7 +4617,8 @@ def run_joint_training(args, device='cuda:0'):
             # Graph Classification Test on unseen datasets
             if getattr(args, 'enable_gc', True) and len(data_dict['gc_test'][0]) > 0:
                 gc_test_results = evaluate_graph_classification_task(
-                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker
+                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker,
+                    gc_model=gc_model
                 )
             
             # Print and log final results
@@ -3883,7 +4713,8 @@ def run_joint_training(args, device='cuda:0'):
             optimizer_gc=optimizer_gc if args.use_separate_optimizers else None,
             optimizer_graphcl=optimizer_graphcl if args.use_separate_optimizers else None,
             graphcl_projection_head=graphcl_projection_head,
-            graphcl_data_loader=graphcl_data_loader
+            graphcl_data_loader=graphcl_data_loader,
+            gc_model=gc_model
         )
 
         # Monitor projector gradients and weights (for FUG embeddings debugging)
@@ -3944,7 +4775,7 @@ def run_joint_training(args, device='cuda:0'):
         seen_valid_results = joint_evaluation(
             model, predictor, data_dict['nc_train'], data_dict['lp_train'], data_dict['gc_train'],
             args, 'valid', identity_projection, projector, gc_tracker,
-            nc_loaders=data_dict.get('nc_train_loaders', None), epoch=epoch
+            nc_loaders=data_dict.get('nc_train_loaders', None), epoch=epoch, gc_model=gc_model
         )
 
         # Compute combined validation score on seen datasets
@@ -3953,21 +4784,46 @@ def run_joint_training(args, device='cuda:0'):
         gc_valid_seen = seen_valid_results['gc_metrics'].get('valid', 0.0) if seen_valid_results['gc_metrics'] else 0.0
         combined_valid_seen = nc_valid_seen + lp_valid_seen + gc_valid_seen
 
+        holdout_valid_results = {'nc_metrics': {}, 'lp_metrics': {}, 'gc_metrics': {}}
+        if model_selection_source == 'holdout':
+            holdout_valid_results = joint_evaluation(
+                model, predictor, data_dict['nc_valid'], data_dict['lp_valid'], data_dict['gc_valid'],
+                args, 'valid', identity_projection, projector, gc_tracker,
+                nc_loaders=None, epoch=epoch, gc_model=gc_model
+            )
+
+        nc_valid_holdout = holdout_valid_results['nc_metrics'].get('valid', 0.0) if holdout_valid_results['nc_metrics'] else 0.0
+        lp_valid_holdout = holdout_valid_results['lp_metrics'].get('valid', 0.0) if holdout_valid_results['lp_metrics'] else 0.0
+        gc_valid_holdout = holdout_valid_results['gc_metrics'].get('valid', 0.0) if holdout_valid_results['gc_metrics'] else 0.0
+
+        # Per-task fallback: if a hold-out dataset is missing for a task, use seen validation for that task.
+        if model_selection_source == 'holdout':
+            nc_valid_select = nc_valid_holdout if nc_holdout_valid_available else nc_valid_seen
+            lp_valid_select = lp_valid_holdout if lp_holdout_valid_available else lp_valid_seen
+            gc_valid_select = gc_valid_holdout if gc_holdout_valid_available else gc_valid_seen
+        else:
+            nc_valid_select = nc_valid_seen
+            lp_valid_select = lp_valid_seen
+            gc_valid_select = gc_valid_seen
+        combined_valid_select = nc_valid_select + lp_valid_select + gc_valid_select
+
         # Optional: Log GC train metrics for diagnostics
         gc_train_seen = None
         if (getattr(args, 'enable_gc', True) and getattr(args, 'gc_log_train_metrics', True)
             and data_dict['gc_train'] is not None and len(data_dict['gc_train'][0]) > 0):
             gc_train_results = evaluate_graph_classification_task(
-                model, predictor, data_dict['gc_train'], args, 'train', identity_projection, gc_tracker
+                model, predictor, data_dict['gc_train'], args, 'train', identity_projection, gc_tracker,
+                gc_model=gc_model
             )
             gc_train_seen = gc_train_results.get('train', 0.0)
         
-        # Save best model based on seen validation performance
-        if combined_valid_seen > best_valid_score:
-            best_valid_score = combined_valid_seen
+        # Save best model using configured selection validation source
+        if combined_valid_select > best_valid_score:
+            best_valid_score = combined_valid_select
             best_epoch = epoch
             best_model_state = {
                 'model': copy.deepcopy(model.state_dict()),
+                'gc_model': copy.deepcopy(gc_model.state_dict()) if gc_model is not None else None,
                 'predictor': copy.deepcopy(predictor.state_dict()),
                 'identity_projection': copy.deepcopy(identity_projection.state_dict()) if identity_projection is not None else None,
             }
@@ -4011,7 +4867,8 @@ def run_joint_training(args, device='cuda:0'):
             )
             if should_eval_gc_unseen:
                 gc_unseen_results = evaluate_graph_classification_task(
-                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker
+                    model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker,
+                    gc_model=gc_model
                 )
             
             nc_test_unseen = nc_unseen_results.get('test', 0.0)
@@ -4168,7 +5025,15 @@ def run_joint_training(args, device='cuda:0'):
                          f"GC Loss: {train_results['gc_loss']:.4f} | "
                          f"GraphCL Loss: {train_results['graphcl_loss']:.4f} | "
                          f"Combined: {train_results['combined_loss']:.4f} | "
-                         f"NC Valid (Seen): {nc_valid_seen:.4f} | LP Valid (Seen): {lp_valid_seen:.4f} | GC Valid (Seen): {gc_valid_seen:.4f}")
+                         f"NC Valid (Seen): {nc_valid_seen:.4f} | LP Valid (Seen): {lp_valid_seen:.4f} | GC Valid (Seen): {gc_valid_seen:.4f} | "
+                         f"Valid Select ({model_selection_source}): {combined_valid_select:.4f}")
+
+            if model_selection_source == 'holdout':
+                log_message += (
+                    f" | NC Valid (Holdout): {nc_valid_holdout:.4f}"
+                    f" | LP Valid (Holdout): {lp_valid_holdout:.4f}"
+                    f" | GC Valid (Holdout): {gc_valid_holdout:.4f}"
+                )
 
             if gc_train_seen is not None:
                 gc_train_str = format_metric_results(gc_train_seen) if isinstance(gc_train_seen, dict) else f"{gc_train_seen:.4f}"
@@ -4212,8 +5077,21 @@ def run_joint_training(args, device='cuda:0'):
                 'valid_seen/lp_metric': lp_valid_seen,
                 'valid_seen/gc_metric': gc_valid_seen,
                 'valid_seen/combined_score': combined_valid_seen,
+                'valid_select/nc_metric': nc_valid_select,
+                'valid_select/lp_metric': lp_valid_select,
+                'valid_select/gc_metric': gc_valid_select,
+                'valid_select/combined_score': combined_valid_select,
+                'valid_select/is_holdout': 1 if model_selection_source == 'holdout' else 0,
                 'lr': optimizer.param_groups[0]['lr']
             }
+
+            if model_selection_source == 'holdout':
+                wandb_log.update({
+                    'valid_holdout/nc_metric': nc_valid_holdout,
+                    'valid_holdout/lp_metric': lp_valid_holdout,
+                    'valid_holdout/gc_metric': gc_valid_holdout,
+                    'valid_holdout/combined_score': nc_valid_holdout + lp_valid_holdout + gc_valid_holdout
+                })
 
             lp_gate_train = train_results.get('lp_gate_mean_train', None)
             if lp_gate_train is not None:
@@ -4367,6 +5245,8 @@ def run_joint_training(args, device='cuda:0'):
         logger.info(f"Loading best model from epoch {best_epoch}", LogLevel.INFO)
         print(f"\nLoading best model from epoch {best_epoch}")
         model.load_state_dict(best_model_state['model'])
+        if gc_model is not None and best_model_state.get('gc_model') is not None:
+            gc_model.load_state_dict(best_model_state['gc_model'])
         predictor.load_state_dict(best_model_state['predictor'])
         if identity_projection is not None and best_model_state['identity_projection'] is not None:
             identity_projection.load_state_dict(best_model_state['identity_projection'])
@@ -4394,7 +5274,8 @@ def run_joint_training(args, device='cuda:0'):
     # Graph Classification Test on unseen datasets
     if getattr(args, 'enable_gc', True) and len(data_dict['gc_test'][0]) > 0:
         gc_test_results = evaluate_graph_classification_task(
-            model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker
+            model, predictor, data_dict['gc_test'], args, 'test', identity_projection, gc_tracker,
+            gc_model=gc_model
         )
     
     # Print and log final results
@@ -4469,7 +5350,7 @@ def run_joint_training(args, device='cuda:0'):
             model, predictor, optimizer,  # Include optimizer state
             args, best_metrics, best_epoch,
             projector=projector,
-            identity_projection=identity_projection, rank=0
+            identity_projection=identity_projection, gc_model=gc_model, rank=0
         )
 
         # Update wandb log with checkpoint path (only if checkpoint was saved)

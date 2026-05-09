@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, GINConv, MessagePassing, SAGEConv, GATConv, GPSConv, FAConv
+from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.utils import degree
 from torch_sparse.matmul import spmm_add
 from torch_sparse import SparseTensor
@@ -520,6 +521,162 @@ class FAGCN(nn.Module):
         return x
 
 
+class SIGN(nn.Module):
+    """
+    SIGN-style decoupled propagation backbone with selectable low/high channels.
+
+    Channel definitions (k = 1..K):
+      - Low-pass:  L0 = X, Lk = A_norm * L{k-1}
+      - High-pass: Hk = L{k-1} - Lk
+
+    Uses low+high channels together:
+      - selected low channels:  [L0..L_low]
+      - selected high channels: [H1..H_high]
+    where L_low / H_high are controlled by sign_low_layers / sign_high_layers
+    (0 means use all available up to K).
+    """
+
+    def __init__(
+        self,
+        in_feats,
+        h_feats,
+        prop_step=3,
+        dropout=0.2,
+        norm=False,
+        relu=True,
+        norm_affine=True,
+        activation='relu',
+        sign_low_layers=0,
+        sign_high_layers=0,
+        sign_project_dim=64,
+    ):
+        super(SIGN, self).__init__()
+        self.prop_step = int(prop_step)
+        if self.prop_step <= 0:
+            raise ValueError(f"SIGN expects prop_step > 0, got {self.prop_step}.")
+
+        self.dropout = float(dropout)
+        self.norm = bool(norm)
+
+        self.sign_low_layers = int(sign_low_layers)
+        self.sign_high_layers = int(sign_high_layers)
+        if self.sign_low_layers < 0 or self.sign_high_layers < 0:
+            raise ValueError("SIGN expects sign_low_layers >= 0 and sign_high_layers >= 0.")
+        if self.sign_low_layers > self.prop_step:
+            raise ValueError(
+                f"SIGN sign_low_layers={self.sign_low_layers} exceeds prop_step={self.prop_step}."
+            )
+        if self.sign_high_layers > self.prop_step:
+            raise ValueError(
+                f"SIGN sign_high_layers={self.sign_high_layers} exceeds prop_step={self.prop_step}."
+            )
+
+        self.sign_project_dim = int(sign_project_dim)
+        if self.sign_project_dim <= 0:
+            raise ValueError(f"SIGN expects sign_project_dim > 0, got {self.sign_project_dim}.")
+
+        if relu:
+            self.activation_fn = get_activation_fn(activation)
+        else:
+            self.activation_fn = None
+
+        self.num_selected_channels = self._num_selected_channels()
+        self.channel_projectors = nn.ModuleList([
+            nn.Linear(in_feats, self.sign_project_dim)
+            for _ in range(self.num_selected_channels)
+        ])
+        self.channel_norms = nn.ModuleList([
+            nn.LayerNorm(self.sign_project_dim, elementwise_affine=norm_affine)
+            for _ in range(self.num_selected_channels)
+        ])
+
+        self.fuse = nn.Linear(self.num_selected_channels * self.sign_project_dim, h_feats)
+        if self.norm:
+            self.out_norm = nn.LayerNorm(h_feats, elementwise_affine=norm_affine)
+
+    def _num_selected_channels(self):
+        low_hops = self.prop_step if self.sign_low_layers == 0 else self.sign_low_layers
+        high_hops = self.prop_step if self.sign_high_layers == 0 else self.sign_high_layers
+        return (low_hops + 1) + high_hops
+
+    @staticmethod
+    def _to_edge_index(adj_t):
+        if isinstance(adj_t, SparseTensor):
+            row, col, _ = adj_t.coo()
+            return torch.stack([row, col], dim=0)
+        if isinstance(adj_t, torch.Tensor):
+            if adj_t.dim() == 2 and adj_t.size(0) == 2:
+                return adj_t
+            raise TypeError(
+                f"SIGN expected edge_index tensor of shape [2, E], got {tuple(adj_t.shape)}."
+            )
+        raise TypeError(f"Unsupported adjacency type for SIGN: {type(adj_t)}")
+
+    @staticmethod
+    def _build_norm_adj(edge_index, num_nodes, dtype, device):
+        norm_edge_index, norm_edge_weight = gcn_norm(
+            edge_index,
+            edge_weight=None,
+            num_nodes=num_nodes,
+            improved=False,
+            add_self_loops=True,
+            flow='source_to_target',
+            dtype=dtype,
+        )
+        return torch.sparse_coo_tensor(
+            indices=norm_edge_index,
+            values=norm_edge_weight,
+            size=(num_nodes, num_nodes),
+            device=device,
+            dtype=dtype,
+        ).coalesce()
+
+    def _select_channels(self, low_channels, high_channels):
+        low_hops = self.prop_step if self.sign_low_layers == 0 else self.sign_low_layers
+        high_hops = self.prop_step if self.sign_high_layers == 0 else self.sign_high_layers
+        selected_low = low_channels[: low_hops + 1]  # include L0
+        selected_high = high_channels[:high_hops]    # H1..H_high_hops
+        return selected_low + selected_high
+
+    def forward(self, in_feat, adj_t, batch=None):
+        edge_index = self._to_edge_index(adj_t)
+        num_nodes = in_feat.size(0)
+        norm_adj = self._build_norm_adj(
+            edge_index=edge_index,
+            num_nodes=num_nodes,
+            dtype=in_feat.dtype,
+            device=in_feat.device,
+        )
+
+        low_channels = [in_feat]
+        for _ in range(self.prop_step):
+            low_channels.append(torch.sparse.mm(norm_adj, low_channels[-1]))
+        high_channels = [low_channels[i] - low_channels[i + 1] for i in range(self.prop_step)]
+        channels = self._select_channels(low_channels, high_channels)
+
+        if len(channels) != self.num_selected_channels:
+            raise RuntimeError(
+                f"SIGN channel selection mismatch: expected {self.num_selected_channels}, "
+                f"got {len(channels)}."
+            )
+
+        projected = []
+        for idx, (x_channel, projector) in enumerate(zip(channels, self.channel_projectors)):
+            h = F.dropout(x_channel, p=self.dropout, training=self.training)
+            h = projector(h)
+            h = self.channel_norms[idx](h)
+            if self.activation_fn is not None:
+                h = self.activation_fn(h)
+            projected.append(h)
+
+        h = torch.cat(projected, dim=-1)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        h = self.fuse(h)
+        if self.norm:
+            h = self.out_norm(h)
+        return h
+
+
 class GraphGPS(nn.Module):
     """
     GraphGPS backbone built from stacked PyG GPSConv layers.
@@ -1012,26 +1169,30 @@ class RidgeRegressionPredictor(nn.Module):
 class PFNTransformerLayer(nn.Module):
     def __init__(self, hidden_dim, n_head=1, mlp_layers=2, dropout=0.2, norm=False,
                  separate_att=False, unsqueeze=False, norm_affine=True, norm_type='post',
-                 ffn_expansion_ratio=4):
+                 ffn_expansion_ratio=4, ffn_only=False):
         super(PFNTransformerLayer, self).__init__()
         self.hidden_dim = hidden_dim
-        if separate_att:
-            self.self_att = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=n_head,
-                dropout=dropout,
-            )
-            self.cross_att = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=n_head,
-                dropout=dropout,
-            )
-        else:
-            self.self_att = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=n_head,
-                dropout=dropout,
-            )
+        self.ffn_only = ffn_only
+        self.self_att = None
+        self.cross_att = None
+        if not self.ffn_only:
+            if separate_att:
+                self.self_att = nn.MultiheadAttention(
+                    embed_dim=hidden_dim,
+                    num_heads=n_head,
+                    dropout=dropout,
+                )
+                self.cross_att = nn.MultiheadAttention(
+                    embed_dim=hidden_dim,
+                    num_heads=n_head,
+                    dropout=dropout,
+                )
+            else:
+                self.self_att = nn.MultiheadAttention(
+                    embed_dim=hidden_dim,
+                    num_heads=n_head,
+                    dropout=dropout,
+                )
         # FFN layer
         self.ffn = MLP(
             in_channels=hidden_dim,
@@ -1077,9 +1238,10 @@ class PFNTransformerLayer(nn.Module):
 
             # Pre-norm: LayerNorm before sublayers
             # Context self-attention
-            x_context_norm = self.context_norm1(x_context)
-            x_context_att, _ = self.self_att(x_context_norm, x_context_norm, x_context_norm)
-            x_context = x_context_att + x_context
+            if not self.ffn_only:
+                x_context_norm = self.context_norm1(x_context)
+                x_context_att, _ = self.self_att(x_context_norm, x_context_norm, x_context_norm)
+                x_context = x_context_att + x_context
 
             # Context FFN
             x_context_norm = self.context_norm2(x_context)
@@ -1100,26 +1262,27 @@ class PFNTransformerLayer(nn.Module):
             if debug_collapse:
                 after_norm_dom = compute_mean_dominance(x_target_norm, "After LayerNorm")
 
-            context_for_att = self.context_norm3(x_context)  # Normalize context for use as key/value
+            if not self.ffn_only:
+                context_for_att = self.context_norm3(x_context)  # Normalize context for use as key/value
 
-            if self.separate_att:
-                x_target_att, attn_weights = self.cross_att(x_target_norm, context_for_att, context_for_att)
-            else:
-                x_target_att, attn_weights = self.self_att(x_target_norm, context_for_att, context_for_att)
+                if self.separate_att:
+                    x_target_att, attn_weights = self.cross_att(x_target_norm, context_for_att, context_for_att)
+                else:
+                    x_target_att, attn_weights = self.self_att(x_target_norm, context_for_att, context_for_att)
 
-            if debug_collapse:
-                att_out_dom = compute_mean_dominance(x_target_att, "After Cross-Att")
-                # Check attention weight uniformity
-                if attn_weights is not None:
-                    attn_entropy = -(attn_weights * torch.log(attn_weights + 1e-10)).sum(dim=-1).mean().item()
-                    max_entropy = torch.log(torch.tensor(attn_weights.size(-1), dtype=torch.float))
-                    normalized_entropy = attn_entropy / max_entropy
-                    print(f"    Attention entropy: {normalized_entropy:.4f} (1.0=uniform, 0.0=peaked)")
+                if debug_collapse:
+                    att_out_dom = compute_mean_dominance(x_target_att, "After Cross-Att")
+                    # Check attention weight uniformity
+                    if attn_weights is not None:
+                        attn_entropy = -(attn_weights * torch.log(attn_weights + 1e-10)).sum(dim=-1).mean().item()
+                        max_entropy = torch.log(torch.tensor(attn_weights.size(-1), dtype=torch.float))
+                        normalized_entropy = attn_entropy / max_entropy
+                        print(f"    Attention entropy: {normalized_entropy:.4f} (1.0=uniform, 0.0=peaked)")
 
-            x_target = x_target_att + x_target
+                x_target = x_target_att + x_target
 
-            if debug_collapse:
-                after_residual_dom = compute_mean_dominance(x_target, "After residual (att+input)")
+                if debug_collapse:
+                    after_residual_dom = compute_mean_dominance(x_target, "After residual (att+input)")
 
             # Target FFN
             x_target_norm = self.tar_norm2(x_target)
@@ -1143,9 +1306,10 @@ class PFNTransformerLayer(nn.Module):
         else:  # post-norm (original behavior)
             # Post-norm: LayerNorm after sublayers
             # Context self-attention
-            x_context_att, _ = self.self_att(x_context, x_context, x_context)
-            x_context = x_context_att + x_context
-            x_context = self.context_norm1(x_context)
+            if not self.ffn_only:
+                x_context_att, _ = self.self_att(x_context, x_context, x_context)
+                x_context = x_context_att + x_context
+                x_context = self.context_norm1(x_context)
 
             # Context FFN
             # Store original shape to preserve it
@@ -1162,12 +1326,13 @@ class PFNTransformerLayer(nn.Module):
             # Target cross/self-attention (context should now be 3D)
             context_for_att = x_context
 
-            if self.separate_att:
-                x_target_att, _ = self.cross_att(x_target, context_for_att, context_for_att)
-            else:
-                x_target_att, _ = self.self_att(x_target, context_for_att, context_for_att)
-            x_target = x_target_att + x_target
-            x_target = self.tar_norm1(x_target)
+            if not self.ffn_only:
+                if self.separate_att:
+                    x_target_att, _ = self.cross_att(x_target, context_for_att, context_for_att)
+                else:
+                    x_target_att, _ = self.self_att(x_target, context_for_att, context_for_att)
+                x_target = x_target_att + x_target
+                x_target = self.tar_norm1(x_target)
 
             # Target FFN
             # Store original shape to preserve it
@@ -2023,15 +2188,15 @@ class MPLPLinkPredictionHead(nn.Module):
             degree = adj_t.sum(dim=1).view(-1, 1)
             node_weight_feat = torch.cat([node_emb, degree], dim=1)
             node_weight = self.node_weight_mlp(node_weight_feat).squeeze(-1) + 1.0
-        
+
         # 2. Get Structural Features
         # Ensure edges are [2, E]
         if edges.size(0) != 2:
             edges = edges.t()
-            
+
         struct_feats = self.node_labeling(edges, adj_t, node_weight)
         struct_emb = self.struct_encode(struct_feats)
-        
+
         # 3. Process Edge Features (from PFN)
         feat_emb = self.feat_encode(edge_emb)
 
@@ -2254,7 +2419,8 @@ class PFNPredictorNodeCls(nn.Module):
                  norm=False, separate_att=False, degree=False, att=None, mlp=None, sim='dot',
                  padding='zero', norm_affine=True, normalize=False,
                  use_first_half_embedding=False, use_full_embedding=False, norm_type='post',
-                 ffn_expansion_ratio=4, use_matching_network=False, matching_network_projection='linear',
+                 ffn_expansion_ratio=4, transformer_ffn_only=False,
+                 use_matching_network=False, matching_network_projection='linear',
                  matching_network_temperature=1.0, matching_network_learnable_temp=True,
                  # Node classification ridge regression
                  nc_sim='dot', nc_ridge_alpha=1.0,
@@ -2282,7 +2448,7 @@ class PFNPredictorNodeCls(nn.Module):
                  mplp_calib_w_max=10.0,
                  ncn_beta=1.0,
                  ncn_cndeg=-1,
-                 nc_head_num_layers=None, lp_head_num_layers=None,
+                 nc_head_num_layers=None, lp_head_num_layers=None, gc_head_num_layers=None,
                  lp_concat_common_neighbors=False):
         super(PFNPredictorNodeCls, self).__init__()
         self.lp_head_type = lp_head_type
@@ -2321,6 +2487,7 @@ class PFNPredictorNodeCls(nn.Module):
         self.head_num_layers = head_num_layers
         self.nc_head_num_layers = head_num_layers if nc_head_num_layers is None else nc_head_num_layers
         self.lp_head_num_layers = head_num_layers if lp_head_num_layers is None else lp_head_num_layers
+        self.gc_head_num_layers = head_num_layers if gc_head_num_layers is None else gc_head_num_layers
 
         if self.padding == 'mlp':
             self.pad_mlp = MLP(
@@ -2356,7 +2523,8 @@ class PFNPredictorNodeCls(nn.Module):
                 separate_att=separate_att,
                 unsqueeze=False,
                 norm_type=norm_type,
-                ffn_expansion_ratio=ffn_expansion_ratio
+                ffn_expansion_ratio=ffn_expansion_ratio,
+                ffn_only=transformer_ffn_only
             ) for _ in range(num_layers)
         ])
         self.degree = degree
@@ -2474,7 +2642,7 @@ class PFNPredictorNodeCls(nn.Module):
             norm_affine=norm_affine,
             sim=self.gc_sim,
             ridge_alpha=self.gc_ridge_alpha,
-            head_num_layers=self.head_num_layers
+            head_num_layers=self.gc_head_num_layers
         )
     
     def forward(self, data, context_x, target_x, context_y, class_x, task_type='node_classification', adj_t=None, lp_edges=None, node_emb=None, lp_cn_context=None, lp_cn_target=None, lp_context_edges=None):

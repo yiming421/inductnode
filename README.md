@@ -57,27 +57,9 @@ python train.py \
 
 GILT requires no tuning for new tasks. Simply provide a few labeled examples at inference time.
 
-#### Download Pre-trained Checkpoint
+#### Evaluation with a Pre-trained Model
 
-```bash
-# Install huggingface-hub if not already installed
-pip install huggingface-hub
-
-# Download the pre-trained checkpoint
-from huggingface_hub import hf_hub_download
-checkpoint_path = hf_hub_download(
-    repo_id="fdsajkshf/gilt-checkpoint",
-    filename="gilt_model.pt",
-    cache_dir="./checkpoints"
-)
-```
-
-Or download directly:
-```bash
-wget https://huggingface.co/fdsajkshf/gilt-checkpoint/resolve/main/gilt_model.pt -O checkpoints/gilt_model.pt
-```
-
-#### Evaluation with Pre-trained Model
+If a checkpoint is available, pass its path with `--load_checkpoint`.
 
 ```bash
 # Multi-task evaluation (all tasks)
@@ -101,33 +83,24 @@ The model performs in-context learning without any parameter updates, directly i
 ├── README.md                     # This file
 │
 ├── src/                          # Source code
-│   ├── model.py                  # GILT architecture (GNN, Predictor, Transformer)
-│   ├── config.py                 # Configuration and command-line arguments
+│   ├── config.py                 # Command-line configuration
+│   ├── model.py                  # Main GNN/PFN model components
 │   ├── checkpoint_utils.py       # Checkpoint loading/saving utilities
-│   │
-│   ├── data_nc.py                # Node classification data loading
-│   ├── data_lp.py                # Link prediction data loading
-│   ├── data_gc.py                # Graph classification data loading
-│   ├── data_utils.py             # Common data utilities
-│   ├── data_minibatch.py         # Mini-batch data loader
-│   ├── dataset_*.py              # Dataset-specific loaders
-│   │
-│   ├── engine_nc.py              # Node classification training/evaluation
-│   ├── engine_lp.py              # Link prediction training/evaluation
-│   ├── engine_gc.py              # Graph classification training/evaluation
-│   │
-│   ├── gpu_utils.py              # GPU management utilities
-│   ├── logger.py                 # Training logger
-│   └── utils.py                  # General utility functions
+│   ├── data_*.py                 # Data loading and preprocessing modules
+│   ├── engine_*.py               # Task training/evaluation engines
+│   ├── graphpfn/                 # GraphPFN components
+│   └── taglas_lite/              # Lightweight TAGLAS integration
 │
-├── legacy/                       # Legacy code and experiments
+├── tests/                        # Regression and correctness tests
+├── legacy/                       # Deprecated single-task/experimental code
+└── scripts/                      # Auxiliary debugging and data-preparation scripts
 ```
 
 ## Key Arguments
 
 ```bash
---model              # GNN backbone: PureGCN_v1, GCN, UnifiedGNN (default: PureGCN_v1)
---hidden             # Hidden dimension (default: 256)
+--model              # GNN backbone: PureGCN_v1, GCN, UnifiedGNN, GraphGPS, FAGCN, SIGN (default: PureGCN_v1)
+--hidden             # Hidden dimension (default: 128)
 --num_layers         # GNN layers (default: 4)
 --transformer_layers # Transformer layers in ICL module (default: 3)
 --epochs             # Training epochs (default: 50)

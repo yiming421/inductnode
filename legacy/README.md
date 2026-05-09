@@ -1,6 +1,6 @@
 # Legacy Code Archive
 
-This directory contains deprecated code that has been superseded by the joint training pipeline (`scripts/joint_training.py`).
+This directory contains deprecated code that has been superseded by the main training pipeline (`train.py`).
 
 ## Status: DEPRECATED - DO NOT USE
 
@@ -13,23 +13,23 @@ These files are kept for historical reference only. They are **not maintained** 
 ### Single-Task Scripts (Replaced by Joint Training)
 
 - **pfn.py** - Original node classification training script
-  - Superseded by: `scripts/joint_training.py` with node classification task enabled
+  - Superseded by: `train.py` with node classification task enabled
   - Last used: Pre-joint training implementation
 
 - **link_prediction.py** - Original link prediction training script
-  - Superseded by: `scripts/joint_training.py` with link prediction task enabled
+  - Superseded by: `train.py` with link prediction task enabled
   - Last used: Pre-joint training implementation
 
 - **graph_classification.py** - Original graph classification training script
-  - Superseded by: `scripts/joint_training.py` with graph classification task enabled
+  - Superseded by: `train.py` with graph classification task enabled
   - Last used: Pre-joint training implementation
 
 - **pfn_parallel_ddp.py** - Early DDP implementation for node classification
-  - Superseded by: Integrated DDP in `joint_training.py`
+  - Superseded by: the current main pipeline
   - Last used: Early distributed training experiments
 
 - **multipfn.py** - Multi-task experiment script
-  - Superseded by: `scripts/joint_training.py` with multi-task support
+  - Superseded by: `train.py` with multi-task support
   - Last used: Multi-task prototype phase
 
 ---
@@ -55,7 +55,7 @@ These files are kept for historical reference only. They are **not maintained** 
 - **ddp_utils.py** - DDP setup and cleanup utilities
 - **ddp_monitor.py** - DDP process monitoring
 - **ddp_gpu_monitor.py** - GPU memory monitoring for DDP
-  - Status: Not used in joint_training.py (single-GPU only)
+  - Status: Not used in the current main pipeline
   - Only used by: legacy/link_prediction.py
   - Reason for deprecation: DDP implementation had issues and was never successfully used
 
@@ -72,9 +72,9 @@ These files are kept for historical reference only. They are **not maintained** 
 
 ---
 
-## Migration to Joint Training
+## Migration to the Main Pipeline
 
-The joint training pipeline (`scripts/joint_training.py`) provides:
+The main training pipeline (`train.py`) provides:
 
 - **Unified multi-task training** - Node classification, link prediction, and graph classification in one script
 - **Better resource management** - Integrated DDP, GPU monitoring, and memory optimization
@@ -86,13 +86,13 @@ The joint training pipeline (`scripts/joint_training.py`) provides:
 
 ```bash
 # Node classification + Link prediction
-python scripts/joint_training.py \
+python train.py \
   --enable_nc --enable_lp \
   --nc_train_dataset ogbn-arxiv,CS \
   --lp_train_dataset ogbl-collab
 
 # All three tasks
-python scripts/joint_training.py \
+python train.py \
   --enable_nc --enable_lp --enable_gc \
   --nc_train_dataset ogbn-arxiv \
   --lp_train_dataset ogbl-collab \
@@ -105,11 +105,10 @@ python scripts/joint_training.py \
 
 If you have a specific reason to reference or use these legacy scripts:
 
-1. **Check if functionality exists in joint_training.py** - Most features have been ported
+1. **Check if functionality exists in `train.py`** - Most features have been ported
 2. **Consult git history** - Use `git log --follow <filename>` to see evolution
 3. **Ask maintainers** - There may be a modern equivalent you're not aware of
 
 ---
 
-**Last Updated**: 2025-10-11
-**Deprecated Since**: Joint training pipeline implementation
+**Deprecated Since**: Main training pipeline implementation

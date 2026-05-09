@@ -8,12 +8,13 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch_geometric.nn import global_mean_pool, global_max_pool, global_add_pool
+from torch_geometric.data import Data
 from torch_sparse import SparseTensor
 import gc
 from sklearn.metrics import roc_auc_score, average_precision_score
 from .data_gc import create_graph_batch, create_task_filtered_datasets
 from .utils import process_node_features
-from .data_utils import batch_edge_dropout, feature_dropout
+from .data_utils import batch_edge_dropout, feature_dropout, apply_random_projection_augmentation
 import numpy as np
 from torch.profiler import profile, record_function, ProfilerActivity
 from .training_monitor import TrainingMonitor
@@ -322,6 +323,12 @@ def _get_node_embedding_table(dataset, task_idx, device, dataset_info=None):
     Returns:
         torch.Tensor: Node embedding table [N_nodes, emb_dim]
     """
+    if dataset_info and dataset_info.get('_gc_tta_node_embs_override', None) is not None:
+        override = dataset_info['_gc_tta_node_embs_override']
+        if 'fug_mapping' in dataset_info:
+            return override
+        return override.to(device)
+
     # Check for FUG external mapping first
     if dataset_info and 'fug_mapping' in dataset_info:
         fug_mapping = dataset_info['fug_mapping']
@@ -1839,7 +1846,7 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
             # Exact full-batch objective with task-wise chunked autograd:
             # one optimizer step per graph batch, but lower peak memory in PFN task loop.
             predictor_params = [p for p in predictor.parameters() if p.requires_grad]
-            grad_target = torch.zeros_like(target_embeddings)
+            grad_target = torch.zeros_like(target_embeddings) if target_embeddings.requires_grad else None
             grad_pos = {}
             grad_neg = {}
             chunk_loss_values = []
@@ -1864,8 +1871,12 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
                 if not chunk_loss.requires_grad:
                     continue
 
-                grad_inputs = [target_embeddings]
-                grad_meta = [('target', None)]
+                grad_inputs = []
+                grad_meta = []
+
+                if target_embeddings.requires_grad:
+                    grad_inputs.append(target_embeddings)
+                    grad_meta.append(('target', None))
 
                 for idx, p in enumerate(predictor_params):
                     grad_inputs.append(p)
@@ -1874,12 +1885,15 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
                 for task_idx in chunk_task_indices:
                     pos_e = pos_embeds_by_task[task_idx]
                     neg_e = neg_embeds_by_task[task_idx]
-                    if pos_e is not None and pos_e.numel() > 0:
+                    if pos_e is not None and pos_e.numel() > 0 and pos_e.requires_grad:
                         grad_inputs.append(pos_e)
                         grad_meta.append(('pos', task_idx))
-                    if neg_e is not None and neg_e.numel() > 0:
+                    if neg_e is not None and neg_e.numel() > 0 and neg_e.requires_grad:
                         grad_inputs.append(neg_e)
                         grad_meta.append(('neg', task_idx))
+
+                if not grad_inputs:
+                    continue
 
                 chunk_grads = torch.autograd.grad(
                     chunk_loss,
@@ -1919,21 +1933,26 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
                 loss = torch.stack(chunk_loss_values).sum()
 
             if did_backward:
-                back_tensors = [target_embeddings]
-                back_grads = [grad_target]
+                back_tensors = []
+                back_grads = []
+
+                if grad_target is not None:
+                    back_tensors.append(target_embeddings)
+                    back_grads.append(grad_target)
 
                 for task_idx, grad in grad_pos.items():
                     pos_e = pos_embeds_by_task[task_idx]
-                    if pos_e is not None:
+                    if pos_e is not None and pos_e.requires_grad:
                         back_tensors.append(pos_e)
                         back_grads.append(grad)
                 for task_idx, grad in grad_neg.items():
                     neg_e = neg_embeds_by_task[task_idx]
-                    if neg_e is not None:
+                    if neg_e is not None and neg_e.requires_grad:
                         back_tensors.append(neg_e)
                         back_grads.append(grad)
 
-                torch.autograd.backward(back_tensors, back_grads)
+                if back_tensors:
+                    torch.autograd.backward(back_tensors, back_grads)
         else:
             logits, _ = _vectorized_multitask_pfn_logits(
                 predictor, target_embeddings, pos_embeds_by_task, neg_embeds_by_task,
@@ -1985,7 +2004,8 @@ def train_graph_classification_multitask_vectorized(model, predictor, dataset_in
 def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset_info, data_loaders,
                                                        pooling_method='mean', device='cuda',
                                                        normalize_class_h=True, dataset_name=None,
-                                                       identity_projection=None, args=None):
+                                                       identity_projection=None, args=None,
+                                                       return_logits=False):
     """
     Vectorized multi-task evaluation: compute logits [B, T] and AUC/AP with task_mask.
     """
@@ -2140,6 +2160,10 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
                 task_metrics.append(metric_t)
 
         split_results[split_name] = aggregate_task_metrics(task_metrics) if task_metrics else 0.0
+        if return_logits:
+            split_results[f'{split_name}_logits'] = all_logits
+            split_results[f'{split_name}_labels'] = all_labels
+            split_results[f'{split_name}_masks'] = all_masks
         split_time = time.perf_counter() - split_start
         avg_batch_time = split_batch_time / max(len(data_loaders[split_name]), 1)
         if use_supervised:
@@ -2151,6 +2175,144 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
     total_time = time.perf_counter() - eval_start
     print(f"[GC-VEC] eval total: {total_time:.2f}s")
     return split_results
+
+
+@torch.no_grad()
+def evaluate_graph_classification_multitask_vectorized_with_tta(
+    model, predictor, dataset_info, data_loaders,
+    pooling_method='mean', device='cuda', normalize_class_h=True,
+    dataset_name=None, identity_projection=None, args=None,
+    num_augmentations=5, normalize_views=False, use_batchnorm=False,
+    linear_projection=False,
+):
+    """
+    Minimal vectorized GC TTA for multitask datasets such as PCBA.
+    Uses the same node-embedding-table override as regular GC TTA and averages
+    per-graph, per-task logits before metric computation.
+    """
+    dataset = dataset_info['dataset']
+    original_override_present = '_gc_tta_node_embs_override' in dataset_info
+    original_override = dataset_info.get('_gc_tta_node_embs_override', None)
+    dataset_name = dataset_name or getattr(dataset, 'name', 'unknown')
+    num_augmentations = 5 if num_augmentations is None else int(num_augmentations)
+
+    def _select_source_table():
+        if 'fug_mapping' in dataset_info and dataset_info['fug_mapping'] and 'node_embs' in dataset_info['fug_mapping']:
+            return dataset_info['fug_mapping']['node_embs']
+        if hasattr(dataset, 'node_embs') and dataset.node_embs is not None:
+            return dataset.node_embs
+        return None
+
+    source_table = _select_source_table()
+    if source_table is None:
+        print(f"[GC_TTA_VEC] {dataset_name}: no node embedding table found, falling back to vectorized eval")
+        return evaluate_graph_classification_multitask_vectorized(
+            model, predictor, dataset_info, data_loaders,
+            pooling_method=pooling_method, device=device,
+            normalize_class_h=normalize_class_h, dataset_name=dataset_name,
+            identity_projection=identity_projection, args=args,
+        )
+
+    source_table = source_table.detach().cpu()
+    target_dim = source_table.size(1)
+    view_tables = [None]
+    for aug_idx in range(num_augmentations):
+        seed = 999000 + aug_idx
+        aug_data = apply_random_projection_augmentation(
+            Data(x=source_table),
+            activation_pool=['identity'] if linear_projection else None,
+            seed=seed,
+            verbose=False,
+            rank=0,
+            max_hidden_dim=target_dim,
+        )
+        q = min(target_dim, aug_data.x.size(0), aug_data.x.size(1))
+        U, S, _ = torch.pca_lowrank(aug_data.x, q=q)
+        x_aug = torch.mm(U, torch.diag(S))
+        if x_aug.size(1) < target_dim:
+            pad = torch.zeros(x_aug.size(0), target_dim - x_aug.size(1), dtype=x_aug.dtype)
+            x_aug = torch.cat([x_aug, pad], dim=1)
+        if normalize_views:
+            if use_batchnorm:
+                x_aug = (x_aug - x_aug.mean(dim=0, keepdim=True)) / (x_aug.std(dim=0, keepdim=True, unbiased=False) + 1e-5)
+            else:
+                x_aug = F.normalize(x_aug, p=2, dim=1)
+        view_tables.append(x_aug.detach().cpu())
+
+    sample_graph = dataset[0]
+    num_tasks = sample_graph.y.numel()
+    metric_type = get_dataset_metric(
+        dataset_name,
+        num_classes=dataset_info.get('num_classes', None),
+        is_multitask=True,
+        metric_override=getattr(args, 'gc_metric', 'auto') if args is not None else None,
+    )
+
+    try:
+        view_results = []
+        for table in view_tables:
+            if table is None:
+                dataset_info.pop('_gc_tta_node_embs_override', None)
+            else:
+                dataset_info['_gc_tta_node_embs_override'] = table
+            view_results.append(evaluate_graph_classification_multitask_vectorized(
+                model, predictor, dataset_info, data_loaders,
+                pooling_method=pooling_method, device=device,
+                normalize_class_h=normalize_class_h, dataset_name=dataset_name,
+                identity_projection=identity_projection, args=args,
+                return_logits=True,
+            ))
+
+        results = {}
+        for split_name in ['train', 'val', 'test']:
+            logits_key = f'{split_name}_logits'
+            labels_key = f'{split_name}_labels'
+            masks_key = f'{split_name}_masks'
+            if logits_key not in view_results[0]:
+                if split_name in view_results[0]:
+                    results[split_name] = view_results[0][split_name]
+                continue
+
+            avg_logits = torch.stack([r[logits_key] for r in view_results], dim=0).mean(dim=0)
+            labels = view_results[0][labels_key]
+            masks = view_results[0][masks_key]
+            task_metrics = []
+            for t in range(num_tasks):
+                mask_t = masks[:, t].bool()
+                if mask_t.sum() == 0:
+                    continue
+                labels_t = labels[mask_t, t]
+                probs_t = torch.sigmoid(avg_logits[mask_t, t]).view(-1)
+                preds_t = (probs_t >= 0.5).long()
+                if isinstance(metric_type, list):
+                    task_metrics.append(calculate_multiple_metrics(preds_t, labels_t.long(), probs_t, metric_type))
+                else:
+                    task_metrics.append(calculate_metric(preds_t, labels_t.long(), probs_t, metric_type))
+            results[split_name] = aggregate_task_metrics(task_metrics) if task_metrics else 0.0
+
+        shown_split = 'test' if 'test' in results else next(iter(results.keys()), None)
+        if shown_split is not None:
+            view_metrics = [r.get(shown_split, 0.0) for r in view_results]
+            display_metrics = [
+                (m.get('auc', m.get('ap', next(iter(m.values())))) if isinstance(m, dict) else m)
+                for m in view_metrics
+            ]
+            agg_metric = results[shown_split]
+            agg_display = agg_metric.get('auc', agg_metric.get('ap', next(iter(agg_metric.values())))) if isinstance(agg_metric, dict) else agg_metric
+            print(
+                f"[GC_TTA_VEC] {dataset_name} split={shown_split}: "
+                f"original={display_metrics[0]:.4f} "
+                f"mean_view={sum(display_metrics) / len(display_metrics):.4f} "
+                f"agg={agg_display:.4f} views={len(view_results)} "
+                f"norm_views={normalize_views} linear_proj={linear_projection}"
+            )
+        return results
+    finally:
+        if original_override_present:
+            dataset_info['_gc_tta_node_embs_override'] = original_override
+        else:
+            dataset_info.pop('_gc_tta_node_embs_override', None)
+
 
 def prepare_pfn_data_structure(context_embeddings, context_labels, num_classes, device='cuda'):
     """
@@ -2811,7 +2973,8 @@ def train_graph_classification_single_task(model, predictor, dataset_info, data_
 @torch.no_grad()
 def evaluate_graph_classification_single_task(model, predictor, dataset_info, data_loaders, task_idx,
                                              pooling_method='mean', device='cuda',
-                                             normalize_class_h=True, dataset_name=None, identity_projection=None, context_k=None, args=None):
+                                             normalize_class_h=True, dataset_name=None, identity_projection=None, context_k=None, args=None,
+                                             return_logits=False):
     """
     Evaluate graph classification performance for a single task with prefiltered data.
     All samples in each batch are guaranteed to have valid labels for the specified task.
@@ -2896,6 +3059,7 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         all_predictions = []
         all_labels = []
         all_probabilities = []
+        all_raw_logits = []
         split_embeddings = []
         split_logits = []
 
@@ -2973,6 +3137,8 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             all_predictions.append(predictions.cpu())
             all_labels.append(batch_labels.cpu())
             all_probabilities.append(probabilities.cpu())
+            if return_logits:
+                all_raw_logits.append(scores.detach().cpu())
 
             # Store embeddings and logits for C&S if enabled
             if use_graph_cs:
@@ -3006,6 +3172,9 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
                 # Single metric
                 metric_value = calculate_metric(all_predictions, all_labels, all_probabilities, metric_type)
                 results[split_name] = metric_value
+            if return_logits:
+                results[f'{split_name}_logits'] = torch.cat(all_raw_logits, dim=0)
+                results[f'{split_name}_labels'] = all_labels
         else:
             if isinstance(metric_type, list):
                 results[split_name] = {metric_name: 0.0 for metric_name in metric_type}
@@ -3102,6 +3271,131 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
         print(f"  Split breakdown: {split_breakdown}")
     
     return results
+
+
+@torch.no_grad()
+def evaluate_graph_classification_single_task_with_tta(
+    model, predictor, dataset_info, data_loaders, task_idx,
+    pooling_method='mean', device='cuda', normalize_class_h=True,
+    dataset_name=None, identity_projection=None, context_k=None, args=None,
+    num_augmentations=5, normalize_views=False, use_batchnorm=False,
+    linear_projection=False,
+):
+    """
+    Minimal regular-path GC TTA for a single task.
+    It overrides the dataset node-embedding table per view so context and target
+    graphs are evaluated in the same augmented feature space, then averages logits.
+    """
+    dataset = dataset_info['dataset']
+    original_override_present = '_gc_tta_node_embs_override' in dataset_info
+    original_override = dataset_info.get('_gc_tta_node_embs_override', None)
+    dataset_name = dataset_name or getattr(dataset, 'name', 'unknown')
+    num_augmentations = 5 if num_augmentations is None else int(num_augmentations)
+
+    def _select_source_table():
+        if 'fug_mapping' in dataset_info and dataset_info['fug_mapping'] and 'node_embs' in dataset_info['fug_mapping']:
+            return dataset_info['fug_mapping']['node_embs']
+        if hasattr(dataset, 'node_embs') and dataset.node_embs is not None:
+            return dataset.node_embs
+        return None
+
+    source_table = _select_source_table()
+    if source_table is None:
+        print(f"[GC_TTA] {dataset_name}: no node embedding table found, falling back to regular eval")
+        return evaluate_graph_classification_single_task(
+            model, predictor, dataset_info, data_loaders, task_idx,
+            pooling_method=pooling_method, device=device,
+            normalize_class_h=normalize_class_h, dataset_name=dataset_name,
+            identity_projection=identity_projection, context_k=context_k, args=args
+        )
+
+    source_table = source_table.detach().cpu()
+    target_dim = source_table.size(1)
+    view_tables = [None]
+    for aug_idx in range(num_augmentations):
+        seed = 999000 + task_idx * 1000 + aug_idx
+        aug_data = apply_random_projection_augmentation(
+            Data(x=source_table),
+            activation_pool=['identity'] if linear_projection else None,
+            seed=seed,
+            verbose=False,
+            rank=0,
+            max_hidden_dim=target_dim,
+        )
+        q = min(target_dim, aug_data.x.size(0), aug_data.x.size(1))
+        U, S, _ = torch.pca_lowrank(aug_data.x, q=q)
+        x_aug = torch.mm(U, torch.diag(S))
+        if x_aug.size(1) < target_dim:
+            pad = torch.zeros(x_aug.size(0), target_dim - x_aug.size(1), dtype=x_aug.dtype)
+            x_aug = torch.cat([x_aug, pad], dim=1)
+        if normalize_views:
+            if use_batchnorm:
+                x_aug = (x_aug - x_aug.mean(dim=0, keepdim=True)) / (x_aug.std(dim=0, keepdim=True, unbiased=False) + 1e-5)
+            else:
+                x_aug = F.normalize(x_aug, p=2, dim=1)
+        view_tables.append(x_aug.detach().cpu())
+
+    sample_graph = dataset[0]
+    metric_type = get_dataset_metric(
+        dataset_name,
+        num_classes=dataset_info.get('num_classes', None),
+        is_multitask=sample_graph.y.numel() > 1,
+        metric_override=getattr(args, 'gc_metric', 'auto') if args is not None else None,
+    )
+
+    try:
+        view_results = []
+        for table in view_tables:
+            if table is None:
+                dataset_info.pop('_gc_tta_node_embs_override', None)
+            else:
+                dataset_info['_gc_tta_node_embs_override'] = table
+            view_results.append(evaluate_graph_classification_single_task(
+                model, predictor, dataset_info, data_loaders, task_idx,
+                pooling_method=pooling_method, device=device,
+                normalize_class_h=normalize_class_h, dataset_name=dataset_name,
+                identity_projection=identity_projection, context_k=context_k,
+                args=args, return_logits=True
+            ))
+
+        results = {}
+        for split_name in data_loaders.keys():
+            logits_key = f'{split_name}_logits'
+            labels_key = f'{split_name}_labels'
+            if logits_key not in view_results[0] or labels_key not in view_results[0]:
+                results[split_name] = view_results[0].get(split_name, 0.0)
+                continue
+            avg_logits = torch.stack([r[logits_key] for r in view_results], dim=0).mean(dim=0)
+            labels = view_results[0][labels_key]
+            probabilities = F.softmax(avg_logits, dim=1)
+            predictions = avg_logits.argmax(dim=1)
+            if isinstance(metric_type, list):
+                results[split_name] = calculate_multiple_metrics(predictions, labels, probabilities, metric_type)
+            else:
+                results[split_name] = calculate_metric(predictions, labels, probabilities, metric_type)
+
+        shown_split = 'test' if 'test' in results else next(iter(results.keys()), None)
+        if shown_split is not None:
+            view_metrics = [r.get(shown_split, 0.0) for r in view_results]
+            display_metrics = [
+                (m.get('auc', m.get('ap', next(iter(m.values())))) if isinstance(m, dict) else m)
+                for m in view_metrics
+            ]
+            agg_metric = results[shown_split]
+            agg_display = agg_metric.get('auc', agg_metric.get('ap', next(iter(agg_metric.values())))) if isinstance(agg_metric, dict) else agg_metric
+            print(
+                f"[GC_TTA] {dataset_name} task={task_idx} split={shown_split}: "
+                f"original={display_metrics[0]:.4f} "
+                f"mean_view={sum(display_metrics) / len(display_metrics):.4f} "
+                f"agg={agg_display:.4f} views={len(view_results)} "
+                f"norm_views={normalize_views} linear_proj={linear_projection}"
+            )
+        return results
+    finally:
+        if original_override_present:
+            dataset_info['_gc_tta_node_embs_override'] = original_override
+        else:
+            dataset_info.pop('_gc_tta_node_embs_override', None)
 
 
 def train_and_evaluate_graph_classification(model, predictor, train_datasets, train_processed_data_list, args, 

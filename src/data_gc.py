@@ -46,7 +46,7 @@ except ImportError:
             load_modelnet_original_features = lambda *a, **k: None
 
 
-def load_gpse_embeddings(dataset_name, gpse_base_path="/home/maweishuo/GPSE/datasets"):
+def load_gpse_embeddings(dataset_name, gpse_base_path=os.environ.get("GPSE_DATASETS_DIR", "../GPSE/datasets")):
     """
     Load pre-computed GPSE embeddings for a dataset.
     
@@ -849,7 +849,7 @@ def create_random_splits(dataset, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2
 def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, seed=42, pretraining_mode=False):
     """
     Create dataset splits with priority order:
-    0. OGB official splits (when using OGB FUG datasets)
+    0. OGB official splits (whenever the dataset exposes them)
     1. Pre-computed splits (TSGFM)
     2. Scaffold splits (TODO)  
     3. Random splits (fallback)
@@ -875,9 +875,11 @@ def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0
         test_ratio = 0.0
         print(f"Pretraining mode: using {train_ratio:.1%} train / {val_ratio:.1%} val split (no test)")
     
-    # 0. Check if this is an OGB dataset and use official OGB splits
-    use_ogb_fug = os.environ.get('USE_FUG_EMB', '0') == '1'
-    if use_ogb_fug and hasattr(dataset, 'get_idx_split'):
+    # 0. Check if this dataset exposes official OGB splits.
+    # Both FUG and original-feature OGB loaders return the same underlying
+    # PygGraphPropPredDataset object, so split selection should not depend on
+    # which feature path was chosen.
+    if hasattr(dataset, 'get_idx_split'):
         try:
             ogb_splits = dataset.get_idx_split()
             split_idx = {
@@ -926,7 +928,18 @@ def create_dataset_splits(dataset, dataset_name, root='./dataset', train_ratio=0
         return split_idx
     
     # 2. Fall back to scaffold splits for molecular datasets
-    molecular_datasets = ['bace', 'bbbp', 'chemhiv', 'chempcba', 'muv', 'tox21', 'toxcast', 'chemblpre']
+    molecular_datasets = {
+        'bace', 'bbbp',
+        'hiv', 'chemhiv', 'ogbg-molhiv',
+        'pcba', 'chempcba', 'molpcba', 'ogbg-molpcba',
+        'muv', 'ogbg-molmuv',
+        'tox21', 'ogbg-moltox21',
+        'toxcast', 'ogbg-moltoxcast',
+        'clintox', 'ogbg-molclintox',
+        'sider', 'ogbg-molsider',
+        'chemblpre',
+        'ogbg-molbace', 'ogbg-molbbbp',
+    }
     if dataset_name.lower() in molecular_datasets:
         return create_scaffold_splits(dataset, train_ratio, val_ratio, test_ratio, seed, pretraining_mode)
     
@@ -1752,7 +1765,7 @@ def process_graph_features(dataset, hidden_dim, device='cuda',
                          use_identity_projection=False, projection_small_dim=128, projection_large_dim=256,
                          use_full_pca=False, sign_normalize=False, normalize_data=False,
                          padding_strategy='zero', use_batchnorm=False,
-                         use_gpse=False, gpse_path='/home/maweishuo/GPSE/datasets', dataset_name=None,
+                         use_gpse=False, gpse_path=os.environ.get("GPSE_DATASETS_DIR", "../GPSE/datasets"), dataset_name=None,
                          pca_device='gpu', incremental_pca_batch_size=10000, pca_sample_threshold=500000,
                          processed_data=None, pcba_context_only_pca=False,
                          use_pca_cache=False, pca_cache_dir="./pca_cache", use_random_orthogonal=False,

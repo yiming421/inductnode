@@ -98,7 +98,7 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def load_graph_pe_embeddings(dataset_name, pe_type='gpse', gpse_base_path="/home/maweishuo/GPSE/datasets"):
+def load_graph_pe_embeddings(dataset_name, pe_type='gpse', gpse_base_path=os.environ.get("GPSE_DATASETS_DIR", "../GPSE/datasets")):
     """
     Load pre-computed positional encodings for graph classification datasets.
 
@@ -172,7 +172,7 @@ def load_graph_pe_embeddings(dataset_name, pe_type='gpse', gpse_base_path="/home
 
 
 def load_all_pes(dataset_name, use_gpse=True, use_lappe=True, use_rwse=True,
-                 gpse_base_path="/home/maweishuo/GPSE/datasets"):
+                 gpse_base_path=os.environ.get("GPSE_DATASETS_DIR", "../GPSE/datasets")):
     """
     Load all available PE embeddings for a graph dataset.
 
@@ -219,7 +219,7 @@ def load_all_pes(dataset_name, use_gpse=True, use_lappe=True, use_rwse=True,
     return pe_data
 
 
-def load_fingerprint_pe(dataset_name, pas_ogb_path="/home/maweishuo/PAS-OGB", 
+def load_fingerprint_pe(dataset_name, pas_ogb_path=os.environ.get("PAS_OGB_DIR", "../PAS-OGB"),
                        fp_type='morgan', use_pca=False, pe_dim=64):
     """
     Load molecular fingerprints from PAS-OGB as PE for graph datasets
@@ -290,8 +290,8 @@ def load_fingerprint_pe(dataset_name, pas_ogb_path="/home/maweishuo/PAS-OGB",
 
 def load_all_pes_with_fingerprints(dataset_name, use_gpse=True, use_lappe=True, use_rwse=True,
                                   use_fingerprint_pe=False, fp_type='morgan', fp_use_pca=False, 
-                                  fp_pca_dim=64, pas_ogb_path="/home/maweishuo/PAS-OGB",
-                                  gpse_base_path="/home/maweishuo/GPSE/datasets"):
+                                  fp_pca_dim=64, pas_ogb_path=os.environ.get("PAS_OGB_DIR", "../PAS-OGB"),
+                                  gpse_base_path=os.environ.get("GPSE_DATASETS_DIR", "../GPSE/datasets")):
     """
     Load all PE embeddings including fingerprints for a graph dataset
     """
@@ -953,7 +953,7 @@ def correct_and_smooth(adj, base_logits, train_idx, train_labels, num_classes,
 
     1. Start with base predictions from features (not zeros!)
     2. Propagate predictions through graph
-    3. Clamp support set to ground truth at each step
+    3. Clamp support set to observed support labels at each step
 
     This combines feature information with graph structure.
     """
@@ -980,7 +980,7 @@ def correct_and_smooth(adj, base_logits, train_idx, train_labels, num_classes,
         # Blend with previous
         Y = (1 - alpha) * Y_new + alpha * Y
 
-        # Clamp support set to ground truth (force truth to flow outward)
+        # Clamp support set to observed support labels.
         Y[train_idx] = Y_support
 
     return Y
@@ -1993,7 +1993,7 @@ def main():
                         help='Power to raise edge weights to (>1: emphasize strong connections, <1: smooth differences)')
     parser.add_argument('--use_pe', type=str2bool, default=False,
                         help='Use positional encodings (GPSE/LapPE/RWSE) if available in the dataset')
-    parser.add_argument('--gpse_path', type=str, default='/home/maweishuo/GPSE/datasets',
+    parser.add_argument('--gpse_path', type=str, default=os.environ.get("GPSE_DATASETS_DIR", "../GPSE/datasets"),
                         help='Path to GPSE/LapPE/RWSE datasets directory')
     parser.add_argument('--use_gpse', type=str2bool, default=True,
                         help='Load GPSE embeddings (if use_pe is True)')
@@ -2009,7 +2009,7 @@ def main():
                         help='Apply PCA to fingerprints to reduce dimensionality')
     parser.add_argument('--fp_pca_dim', type=int, default=64,
                         help='Target dimension for fingerprint PCA')
-    parser.add_argument('--pas_ogb_path', type=str, default='/home/maweishuo/PAS-OGB',
+    parser.add_argument('--pas_ogb_path', type=str, default=os.environ.get("PAS_OGB_DIR", "../PAS-OGB"),
                         help='Path to PAS-OGB project for loading fingerprints')
 
     # === Random Projection Augmentation (for testing information preservation) ===

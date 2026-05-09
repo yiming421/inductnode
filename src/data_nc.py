@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit, Reddit2, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
 from src.dataset_twitch import TwitchFixed
 from src.dataset_heterophilous import HeterophilousGraphDataset
@@ -182,8 +184,11 @@ def _is_graphpfn_xy_name(name: str) -> bool:
     return name.lower() in {"graphpfn-xy", "graphpfn_xy", "graphpfnxy"}
 
 
-def _get_graphpfn_xy_root() -> str:
+def _get_graphpfn_xy_root(graphpfn_xy_dir: str = "") -> str:
     """Resolve default path for GraphPFN XY exports."""
+    if graphpfn_xy_dir:
+        return os.path.abspath(os.path.expanduser(graphpfn_xy_dir))
+
     env = os.getenv("GRAPHPFN_XY_DIR")
     if env:
         return env
@@ -195,13 +200,20 @@ def _get_graphpfn_xy_root() -> str:
     return os.path.join(get_project_root(), "dataset", "graphpfn-xy")
 
 
-def _select_graphpfn_xy_files(root: Path, split: str) -> list[Path]:
+def _select_graphpfn_xy_files(
+    root: Path,
+    split: str,
+    num_graphs: int | None = None,
+) -> list[Path]:
     """
     Deterministic graph-level split:
       - train split: first 90%
       - eval split: last 10%
     """
     files = sorted(root.glob("graph_*.npz"))
+    if num_graphs is not None and num_graphs > 0:
+        files = files[:num_graphs]
+
     total = len(files)
     if total < 2:
         raise FileNotFoundError(
@@ -224,7 +236,12 @@ def _select_graphpfn_xy_files(root: Path, split: str) -> list[Path]:
     return selected
 
 
-def _load_graphpfn_xy_files(files: list[Path], root: Path, make_undirected: bool = True):
+def _load_graphpfn_xy_files(
+    files: list[Path],
+    root: Path,
+    make_undirected: bool = True,
+    train_all_nodes: bool = False,
+):
     """
     Load GraphPFN synthetic graphs exported by graphpfn/bin/prior/export_xy.py.
 
@@ -246,9 +263,16 @@ def _load_graphpfn_xy_files(files: list[Path], root: Path, make_undirected: bool
         if train_size <= 0 or train_size >= num_nodes:
             raise ValueError(f"Invalid train_size {train_size} for {f} (num_nodes={num_nodes})")
 
-        train_idx = torch.arange(0, train_size, dtype=torch.long)
-        test_idx = torch.arange(train_size, num_nodes, dtype=torch.long)
-        split_idx = {"train": train_idx, "valid": test_idx, "test": test_idx}
+        if train_all_nodes:
+            # For GraphPFN-XY training graphs, use all nodes for training.
+            # Seen valid/test on these graphs is intentionally skipped in evaluate_node_classification.
+            train_idx = torch.arange(0, num_nodes, dtype=torch.long)
+            empty_idx = torch.empty(0, dtype=torch.long)
+            split_idx = {"train": train_idx, "valid": empty_idx, "test": empty_idx}
+        else:
+            train_idx = torch.arange(0, train_size, dtype=torch.long)
+            test_idx = torch.arange(train_size, num_nodes, dtype=torch.long)
+            split_idx = {"train": train_idx, "valid": test_idx, "test": test_idx}
 
         data = Data(x=x, edge_index=edge_index, y=y)
         data.adj_t = build_adj_t(edge_index, num_nodes, make_undirected=make_undirected)
@@ -261,20 +285,39 @@ def _load_graphpfn_xy_files(files: list[Path], root: Path, make_undirected: bool
     return data_list, split_idx_list
 
 
-def load_graphpfn_xy_dataset_train(root_dir: str, make_undirected: bool = True):
+def load_graphpfn_xy_dataset_train(
+    root_dir: str,
+    make_undirected: bool = True,
+    num_graphs: int | None = None,
+):
     root = Path(root_dir)
     if not root.exists():
         raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
-    files = _select_graphpfn_xy_files(root, split="train")
-    return _load_graphpfn_xy_files(files, root, make_undirected=make_undirected)
+    files = _select_graphpfn_xy_files(root, split="train", num_graphs=num_graphs)
+    print("[graphpfn_xy] Train mode: using all nodes as train; seen valid/test nodes are disabled for training graphs")
+    return _load_graphpfn_xy_files(
+        files,
+        root,
+        make_undirected=make_undirected,
+        train_all_nodes=True,
+    )
 
 
-def load_graphpfn_xy_dataset_eval(root_dir: str, make_undirected: bool = True):
+def load_graphpfn_xy_dataset_eval(
+    root_dir: str,
+    make_undirected: bool = True,
+    num_graphs: int | None = None,
+):
     root = Path(root_dir)
     if not root.exists():
         raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
-    files = _select_graphpfn_xy_files(root, split="eval")
-    return _load_graphpfn_xy_files(files, root, make_undirected=make_undirected)
+    files = _select_graphpfn_xy_files(root, split="eval", num_graphs=num_graphs)
+    return _load_graphpfn_xy_files(
+        files,
+        root,
+        make_undirected=make_undirected,
+        train_all_nodes=False,
+    )
 
 def rebalance_splits_for_pretraining(split_idx, strategy='smallest_for_valid'):
     """
@@ -719,7 +762,13 @@ def load_data(dataset, make_undirected: bool = True, split_id: int | None = None
     data.name = name
     return data, split_idx
 
-def load_all_data(train_datasets, make_undirected: bool = True, expand_webkb_splits: bool = False):
+def load_all_data(
+    train_datasets,
+    make_undirected: bool = True,
+    expand_webkb_splits: bool = False,
+    graphpfn_xy_num_graphs: int = 0,
+    graphpfn_xy_dir: str = "",
+):
     data_list = []
     split_idx_list = []
     webkb_datasets = {'Cornell', 'Texas', 'Wisconsin'}
@@ -727,9 +776,13 @@ def load_all_data(train_datasets, make_undirected: bool = True, expand_webkb_spl
     for dataset in train_datasets:
         print(dataset, flush=True)
         if _is_graphpfn_xy_name(dataset):
-            root = _get_graphpfn_xy_root()
+            root = _get_graphpfn_xy_root(graphpfn_xy_dir)
+            if graphpfn_xy_num_graphs > 0:
+                print(f"[graphpfn_xy] Limiting to first {graphpfn_xy_num_graphs} files before 90/10 split (eval branch)")
             data_ext, split_ext = load_graphpfn_xy_dataset_eval(
-                root, make_undirected=make_undirected
+                root,
+                make_undirected=make_undirected,
+                num_graphs=graphpfn_xy_num_graphs if graphpfn_xy_num_graphs > 0 else None,
             )
             data_list.extend(data_ext)
             split_idx_list.extend(split_ext)
@@ -793,7 +846,9 @@ def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
                         augmentation_verbose=False, augmentation_use_random_noise=False,
                         augmentation_dropout_rate=0.0, augmentation_use_feature_mixing=False,
                         augmentation_mix_ratio=0.3, augmentation_mix_alpha=0.5,
-                        make_undirected: bool = True):
+                        make_undirected: bool = True,
+                        graphpfn_xy_num_graphs: int = 0,
+                        graphpfn_xy_dir: str = ""):
     """
     Load training datasets with optional split rebalancing and data augmentation.
 
@@ -815,9 +870,13 @@ def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
     for dataset in expanded_datasets:
         print(dataset, flush=True)
         if _is_graphpfn_xy_name(dataset):
-            root = _get_graphpfn_xy_root()
+            root = _get_graphpfn_xy_root(graphpfn_xy_dir)
+            if graphpfn_xy_num_graphs > 0:
+                print(f"[graphpfn_xy] Limiting to first {graphpfn_xy_num_graphs} files before 90/10 split (train branch)")
             data_ext, split_ext = load_graphpfn_xy_dataset_train(
-                root, make_undirected=make_undirected
+                root,
+                make_undirected=make_undirected,
+                num_graphs=graphpfn_xy_num_graphs if graphpfn_xy_num_graphs > 0 else None,
             )
             data_list.extend(data_ext)
             split_idx_list.extend(split_ext)

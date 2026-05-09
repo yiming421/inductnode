@@ -35,7 +35,6 @@ from transformers import get_cosine_schedule_with_warmup
 
 # Import logging system and waste analyzer
 from src.logger import TrainingLogger, LogLevel
-sys.path.append('/home/maweishuo/inductnode')
 from waste_analyzer import DistributedWasteAnalyzer
 
 

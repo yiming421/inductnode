@@ -10,7 +10,7 @@ from src.model import PFNPredictorNodeCls
 
 def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch,
                    att=None, mlp=None, projector=None, identity_projection=None,
-                   scheduler=None, rank=0):
+                   scheduler=None, gc_model=None, rank=0):
     """Save checkpoint with all training state"""
     if rank != 0:
         return  # Only rank 0 saves checkpoints
@@ -52,6 +52,8 @@ def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch,
             'num_layers': args.num_layers,
             'transformer_layers': args.transformer_layers,
             'nhead': args.nhead,
+            'gc_use_separate_gnn': getattr(args, 'gc_use_separate_gnn', False),
+            'gc_model_type': getattr(args, 'gc_model', None),
         }
     }
     
@@ -68,6 +70,8 @@ def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch,
         checkpoint['projector_state_dict'] = projector.module.state_dict() if hasattr(projector, 'module') else projector.state_dict()
     if identity_projection is not None:
         checkpoint['identity_projection_state_dict'] = identity_projection.module.state_dict() if hasattr(identity_projection, 'module') else identity_projection.state_dict()
+    if gc_model is not None:
+        checkpoint['gc_model_state_dict'] = gc_model.module.state_dict() if hasattr(gc_model, 'module') else gc_model.state_dict()
     
     # Save checkpoint
     torch.save(checkpoint, checkpoint_path)
@@ -90,7 +94,7 @@ def save_checkpoint(model, predictor, optimizer, args, best_metrics, epoch,
 
 def load_checkpoint(checkpoint_path, model, predictor, optimizer=None, 
                    att=None, mlp=None, projector=None, identity_projection=None, 
-                   scheduler=None, device='cpu'):
+                   scheduler=None, gc_model=None, device='cpu'):
     """Load checkpoint and restore training state"""
     
     print(f"🔄 Loading checkpoint from: {checkpoint_path}")
@@ -140,6 +144,20 @@ def load_checkpoint(checkpoint_path, model, predictor, optimizer=None,
             identity_projection.module.load_state_dict(checkpoint['identity_projection_state_dict'])
         else:
             identity_projection.load_state_dict(checkpoint['identity_projection_state_dict'])
+    if gc_model is not None and 'gc_model_state_dict' in checkpoint:
+        if hasattr(gc_model, 'module'):
+            gc_model.module.load_state_dict(checkpoint['gc_model_state_dict'])
+        else:
+            gc_model.load_state_dict(checkpoint['gc_model_state_dict'])
+    elif gc_model is not None:
+        try:
+            if hasattr(gc_model, 'module'):
+                gc_model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            else:
+                gc_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print("⚠️ gc_model_state_dict missing; initialized graph-task backbone from shared model weights.")
+        except RuntimeError as e:
+            print(f"⚠️ Failed to warm-start separate graph-task backbone from shared model weights: {e}")
     
     # Return checkpoint info
     info = {
@@ -220,6 +238,8 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0, predictor_state
         print(f"  Original predictor: {args.predictor} -> Checkpoint predictor: {checkpoint_args['predictor']}")
         if 'head_num_layers' in checkpoint_args:
             print(f"  Original head_num_layers: {getattr(args, 'head_num_layers', 2)} -> Checkpoint head_num_layers: {checkpoint_args['head_num_layers']}")
+        if 'gc_head_num_layers' in checkpoint_args:
+            print(f"  Original gc_head_num_layers: {getattr(args, 'gc_head_num_layers', None)} -> Checkpoint gc_head_num_layers: {checkpoint_args['gc_head_num_layers']}")
 
     # Override key model architecture parameters (with fallback for missing keys)
     args.hidden = checkpoint_args['hidden']
@@ -253,17 +273,26 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0, predictor_state
     args.graphgps_attn_type = checkpoint_args.get(
         'graphgps_attn_type', getattr(args, 'graphgps_attn_type', 'multihead')
     )
+    # Minimal UnifiedGNN compatibility overrides:
+    # needed for checkpoints like gc_top1 (SAGE + linear=False), otherwise
+    # model keys mismatch (lin_l/lin_r vs lin + mlps).
+    if 'conv_type' in checkpoint_args:
+        args.conv_type = checkpoint_args['conv_type']
+    if 'linear' in checkpoint_args:
+        args.linear = checkpoint_args['linear']
 
     # Predictor architecture/behavior options that must match checkpoint
     optional_override_keys = [
         'head_num_layers',
         'nc_head_num_layers',
         'lp_head_num_layers',
+        'gc_head_num_layers',
         'use_first_half_embedding',
         'use_full_embedding',
         'skip_token_formulation',
         'transformer_norm_type',
         'ffn_expansion_ratio',
+        'transformer_ffn_only',
         'use_matching_network',
         'matching_network_projection',
         'matching_network_temperature',
@@ -292,6 +321,18 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0, predictor_state
         'ncn_beta',
         'ncn_cndeg',
         'lp_concat_common_neighbors',
+        'gc_use_separate_gnn',
+        'gc_model',
+        'gc_num_layers',
+        'gc_unified_model_type',
+        'gc_conv_type',
+        'gc_multilayer',
+        'gc_linear',
+        'gc_use_gin',
+        'gc_gin_aggr',
+        'gc_graphgps_heads',
+        'gc_graphgps_local_conv',
+        'gc_graphgps_attn_type',
     ]
     for key in optional_override_keys:
         if key in checkpoint_args:
@@ -313,7 +354,7 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0, predictor_state
 
 def create_gnn_from_config(model_config, args_dict, input_dim):
     """Creates a GNN model from a configuration dictionary."""
-    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, FAGCN
+    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, FAGCN, SIGN
     model_type = model_config.get('model_type') or args_dict.get('model')
     
     if model_type == 'PureGCN':
@@ -354,6 +395,20 @@ def create_gnn_from_config(model_config, args_dict, input_dim):
             activation=args_dict.get('activation', 'relu'),
             eps=args_dict.get('fagcn_eps', 0.1),
             attn_dropout=args_dict.get('fagcn_attn_dropout', 0.0),
+        )
+    elif model_type == 'SIGN':
+        model = SIGN(
+            in_feats=input_dim,
+            h_feats=args_dict['hidden'],
+            prop_step=args_dict.get('sign_k', 3),
+            dropout=args_dict['dp'],
+            norm=args_dict['norm'],
+            relu=True,
+            norm_affine=args_dict.get('gnn_norm_affine', True),
+            activation=args_dict.get('activation', 'relu'),
+            sign_low_layers=args_dict.get('sign_low_layers', 0),
+            sign_high_layers=args_dict.get('sign_high_layers', 0),
+            sign_project_dim=args_dict.get('sign_project_dim', 64),
         )
     else:
         raise ValueError(f"Unknown GNN model type: {model_type}")
@@ -406,7 +461,7 @@ def create_pfn_components_from_config(args_dict, device='cpu'):
 
 def create_model_from_args(args, input_dim, device):
     """Creates a GNN model and all PFN components from command-line arguments."""
-    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, FAGCN, AttentionPool, MLP, IdentityProjection
+    from .model import PureGCN, PureGCN_v1, GCN, GraphGPS, FAGCN, SIGN, AttentionPool, MLP, IdentityProjection
     
     # GNN Model
     if args.model == 'PureGCN':
@@ -443,6 +498,20 @@ def create_model_from_args(args, input_dim, device):
             eps=getattr(args, 'fagcn_eps', 0.1),
             attn_dropout=getattr(args, 'fagcn_attn_dropout', 0.0),
         )
+    elif args.model == 'SIGN':
+        model = SIGN(
+            in_feats=input_dim,
+            h_feats=args.hidden,
+            prop_step=getattr(args, 'sign_k', 3),
+            dropout=args.dp,
+            norm=args.norm,
+            relu=True,
+            norm_affine=args.gnn_norm_affine,
+            activation=getattr(args, 'activation', 'relu'),
+            sign_low_layers=getattr(args, 'sign_low_layers', 0),
+            sign_high_layers=getattr(args, 'sign_high_layers', 0),
+            sign_project_dim=getattr(args, 'sign_project_dim', 64),
+        )
     else:
         raise ValueError(f"Unknown model type: {args.model}")
     model = model.to(device)
@@ -458,6 +527,7 @@ def create_model_from_args(args, input_dim, device):
             padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
             use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
             use_full_embedding=getattr(args, 'use_full_embedding', False),
+            transformer_ffn_only=getattr(args, 'transformer_ffn_only', False),
             use_matching_network=getattr(args, 'use_matching_network', False),
             matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
             matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
@@ -533,6 +603,7 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
         padding=args.padding, norm_affine=args.mlp_norm_affine, normalize=args.normalize_class_h,
         use_first_half_embedding=getattr(args, 'use_first_half_embedding', False),
         use_full_embedding=getattr(args, 'use_full_embedding', False),
+        transformer_ffn_only=getattr(args, 'transformer_ffn_only', False),
         use_matching_network=getattr(args, 'use_matching_network', False),
         matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
         matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
@@ -569,7 +640,7 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
 
 def load_checkpoint_states(checkpoint, model, predictor=None, optimizer=None, 
                           att=None, mlp=None, projector=None, identity_projection=None, 
-                          scheduler=None, rank=0):
+                          scheduler=None, gc_model=None, rank=0):
     """Load model states from an already-loaded checkpoint"""
     
     if rank == 0:
@@ -645,6 +716,23 @@ def load_checkpoint_states(checkpoint, model, predictor=None, optimizer=None,
             identity_projection.module.load_state_dict(checkpoint['identity_projection_state_dict'])
         else:
             identity_projection.load_state_dict(checkpoint['identity_projection_state_dict'])
+
+    if gc_model is not None:
+        gc_target = gc_model.module if hasattr(gc_model, 'module') else gc_model
+        if 'gc_model_state_dict' in checkpoint:
+            gc_target.load_state_dict(checkpoint['gc_model_state_dict'])
+        elif 'model_state_dict' in checkpoint:
+            try:
+                missing_keys, unexpected_keys = gc_target.load_state_dict(
+                    checkpoint['model_state_dict'], strict=False
+                )
+                if rank == 0:
+                    print("⚠️ gc_model_state_dict missing; initialized graph-task backbone from shared model weights.")
+                    print(f"   Missing keys: {len(missing_keys)} | Unexpected keys: {len(unexpected_keys)}")
+            except RuntimeError as e:
+                if rank == 0:
+                    print("⚠️ Failed to warm-start separate graph-task backbone from shared model weights.")
+                    print(f"   Reason: {e}")
     
     # Extract info from checkpoint
     best_epoch = checkpoint['epoch']

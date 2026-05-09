@@ -98,7 +98,7 @@ def _graphcl_forward_model(model, x, adj_t, batch):
     Forward through encoder with call signature compatible across backbones.
 
     Backbones in this repo use mixed signatures, e.g.:
-      - PureGCN_v1/GraphGPS/FAGCN: forward(x, adj_t, batch=None)
+      - PureGCN_v1/GraphGPS/FAGCN/SIGN: forward(x, adj_t, batch=None)
       - UnifiedGNN:               forward(x, adj_t, e_feat=None)
       - GCN and others:           forward(x, adj_t)
     """

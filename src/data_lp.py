@@ -5,6 +5,7 @@ from torch_geometric import transforms
 from torch_sparse import SparseTensor
 from ogb.linkproppred import PygLinkPropPredDataset
 from ogb.nodeproppred import PygNodePropPredDataset
+from src.projection_methods import generate_orthogonal_noise_features
 import torch
 import numpy as np
 import os
@@ -27,6 +28,24 @@ except (ImportError, AttributeError):
 # This file is in inductnode/src/, so we go up two levels to get to the inductnode root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATASET_ROOT = os.path.join(PROJECT_ROOT, 'dataset')
+ORTHOGONAL_NOISE_DEFAULT_DIM = 128
+ORTHOGONAL_NOISE_OGBL_DATASETS = {'ogbl-ddi', 'ogbl-ppa'}
+
+
+def _init_orthogonal_noise_features(data, dataset_name, device='cpu', feature_dim=ORTHOGONAL_NOISE_DEFAULT_DIM):
+    """Initialize node features with orthogonal noise for featureless/ablation LP datasets."""
+    target_device = torch.device(device)
+    data.x = generate_orthogonal_noise_features(
+        num_nodes=int(data.num_nodes),
+        target_dim=int(feature_dim),
+        seed=42,
+        device=target_device,
+        dtype=torch.float32,
+        rank=0,
+    )
+    data.uses_orthogonal_noise_init = True
+    data.orthogonal_noise_dataset = dataset_name
+    data.orthogonal_noise_dim = int(feature_dim)
 
 def safe_load_dataset(dataset_class, **kwargs):
     """Safely load PyTorch Geometric datasets with proper error handling."""
@@ -211,8 +230,13 @@ def load_ogbl_data(dataset_name, device='cpu'):
             u=split_edge[name]["source_node"].repeat(1, 1000).view(-1)
             v=split_edge[name]["target_node_neg"].view(-1)
             split_edge[name]['edge_neg']=torch.stack((u,v),dim=0).t()   
-    if dataset_name == 'ogbl-ppa':
-        data.x = None
+    if dataset_name in ORTHOGONAL_NOISE_OGBL_DATASETS:
+        _init_orthogonal_noise_features(
+            data,
+            dataset_name,
+            device=device,
+            feature_dim=ORTHOGONAL_NOISE_DEFAULT_DIM,
+        )
 
     # Set default metric based on dataset
     if dataset_name == 'ogbl-ddi':
@@ -241,6 +265,13 @@ def load_all_data_link(train_datasets, device='cpu', is_pretraining=False):
             data, split_edge = load_data(dataset, device=device, is_pretraining=is_pretraining)
         
         # Move data to the specified device (additional safety check)
+        if not hasattr(data, 'x') or data.x is None:
+            _init_orthogonal_noise_features(
+                data,
+                getattr(data, 'name', dataset),
+                device=device,
+                feature_dim=ORTHOGONAL_NOISE_DEFAULT_DIM,
+            )
         data.x = data.x.to(device)
         data.adj_t = data.adj_t.to(device)
         if hasattr(data, 'edge_index'):

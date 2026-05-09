@@ -11,7 +11,7 @@ import copy
 import time
 import psutil
 import os
-from .data_utils import edge_dropout_sparse_tensor, feature_dropout
+from .data_utils import edge_dropout_sparse_tensor, feature_dropout, apply_random_projection_augmentation
 
 
 def refresh_lp_context_if_needed(data, batch_idx, epoch, args, context_edges, train_mask, train_edges):
@@ -708,10 +708,14 @@ def train_link_prediction(model, predictor, data, train_edges, context_edges, tr
 
 def get_dataset_default_metric(dataset_name):
     """Get the default metric for each dataset."""
-    if dataset_name == 'ogbl-collab':
+    if dataset_name == 'ogbl-ddi':
+        return 'hits@20'
+    elif dataset_name == 'ogbl-collab':
         return 'hits@50'
     elif dataset_name == 'ogbl-citation2':
         return 'mrr'
+    elif dataset_name == 'ogbl-ppa':
+        return 'hits@100'
     else:
         return 'hits@100'  # Default metric
 
@@ -807,12 +811,203 @@ def compute_mrr_citation2(pos_scores, neg_scores):
         print(f"Error computing citation2 MRR: {e}")
         return 0.0
 
+
+def _select_debug_indices(num_items, max_samples, device):
+    if num_items <= max_samples:
+        return torch.arange(num_items, device=device)
+    return torch.linspace(0, num_items - 1, steps=max_samples, device=device).long()
+
+
+def _print_lp_edge_probe_debug(node_embeddings, context_edge_pairs, context_labels,
+                               pos_edges, neg_edges,
+                               pos_scores, neg_scores, rank=0, max_samples=512,
+                               dataset_name='unknown', debug_label='eval',
+                               ridge_alpha=1e-2, k_values=(20, 50, 100)):
+    """
+    Fit same-view ridge probes on several edge feature maps:
+    had=h_u*h_v, inv=[dot,cos,dist,norms], sym=[h_u+h_v, |h_u-h_v|], dot=scalar dot.
+    This separates node-embedding geometry loss from Hadamard-specific loss.
+    """
+    if rank != 0 or max_samples <= 0:
+        return
+    if pos_edges.numel() == 0 or neg_edges.numel() == 0:
+        return
+
+    try:
+        pos_idx = _select_debug_indices(pos_edges.size(0), max_samples, pos_edges.device)
+        neg_idx = _select_debug_indices(neg_edges.size(0), max_samples, neg_edges.device)
+        sample_pos = pos_edges[pos_idx]
+        sample_neg = neg_edges[neg_idx]
+        if sample_pos.size(0) < 4 or sample_neg.size(0) < 4:
+            return
+
+        split_pos = sample_pos.size(0) // 2
+        split_neg = sample_neg.size(0) // 2
+        train_pos = sample_pos[:split_pos]
+        train_neg = sample_neg[:split_neg]
+        test_pos = sample_pos[split_pos:]
+        test_neg = sample_neg[split_neg:]
+
+        def _edge_features(edges, mode):
+            hu = node_embeddings[edges[:, 0]].float()
+            hv = node_embeddings[edges[:, 1]].float()
+            if mode == 'had':
+                return hu * hv
+            if mode == 'sym':
+                return torch.cat([hu + hv, (hu - hv).abs()], dim=1)
+            dot = (hu * hv).sum(dim=1, keepdim=True)
+            if mode == 'dot':
+                return dot
+            if mode == 'inv':
+                nu = hu.norm(dim=1, keepdim=True)
+                nv = hv.norm(dim=1, keepdim=True)
+                cos = dot / (nu * nv + 1e-8)
+                dist = (hu - hv).norm(dim=1, keepdim=True)
+                return torch.cat([dot, cos, dist, nu, nv], dim=1)
+            raise ValueError(f"unknown edge feature mode: {mode}")
+
+        X_train_by_mode = {
+            mode: torch.cat([_edge_features(train_pos, mode), _edge_features(train_neg, mode)], dim=0)
+            for mode in ('had', 'inv', 'sym', 'dot')
+        }
+        y_train = torch.cat([
+            torch.ones(train_pos.size(0), device=node_embeddings.device),
+            torch.zeros(train_neg.size(0), device=node_embeddings.device),
+        ]).float()
+        X_test_by_mode = {
+            mode: torch.cat([_edge_features(test_pos, mode), _edge_features(test_neg, mode)], dim=0)
+            for mode in ('had', 'inv', 'sym', 'dot')
+        }
+        y_test = torch.cat([
+            torch.ones(test_pos.size(0), device=node_embeddings.device),
+            torch.zeros(test_neg.size(0), device=node_embeddings.device),
+        ]).float()
+
+        pos_scores_sample = pos_scores[pos_idx.detach().cpu()]
+        neg_scores_sample = neg_scores[neg_idx.detach().cpu()]
+        fixed_scores = torch.cat([pos_scores_sample[split_pos:], neg_scores_sample[split_neg:]], dim=0).float()
+
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        labels_np = y_test.detach().cpu().numpy()
+        fixed_np = fixed_scores.detach().cpu().numpy()
+        fixed_auc = roc_auc_score(labels_np, fixed_np)
+        fixed_ap = average_precision_score(labels_np, fixed_np)
+        fixed_sep = (fixed_scores[:test_pos.size(0)].mean() - fixed_scores[test_pos.size(0):].mean()).item()
+
+        probe_auc = {}
+        probe_ap = {}
+        probe_sep = {}
+        y_centered = y_train * 2.0 - 1.0
+        for mode, X_train in X_train_by_mode.items():
+            X_test = X_test_by_mode[mode]
+            mean = X_train.mean(dim=0, keepdim=True)
+            std = X_train.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+            X_train_n = (X_train - mean) / std
+            X_test_n = (X_test - mean) / std
+            X_train_n = torch.cat([X_train_n, torch.ones(X_train_n.size(0), 1, device=X_train_n.device)], dim=1)
+            X_test_n = torch.cat([X_test_n, torch.ones(X_test_n.size(0), 1, device=X_test_n.device)], dim=1)
+            eye = torch.eye(X_train_n.size(1), device=X_train_n.device, dtype=X_train_n.dtype)
+            eye[-1, -1] = 0.0
+            w = torch.linalg.solve(X_train_n.t() @ X_train_n + ridge_alpha * eye, X_train_n.t() @ y_centered)
+            scores = X_test_n @ w
+            scores_np = scores.detach().cpu().numpy()
+            probe_auc[mode] = roc_auc_score(labels_np, scores_np)
+            probe_ap[mode] = average_precision_score(labels_np, scores_np)
+            probe_sep[mode] = (scores[:test_pos.size(0)].mean() - scores[test_pos.size(0):].mean()).item()
+
+        print(
+            f"[LP_EDGE_PROBE] {dataset_name}/{debug_label}: "
+            f"fixed_auc={fixed_auc:.4f} fixed_ap={fixed_ap:.4f} fixed_sep={fixed_sep:.4f} "
+            f"had_auc={probe_auc['had']:.4f} inv_auc={probe_auc['inv']:.4f} "
+            f"sym_auc={probe_auc['sym']:.4f} dot_auc={probe_auc['dot']:.4f} "
+            f"had_ap={probe_ap['had']:.4f} inv_ap={probe_ap['inv']:.4f} "
+            f"sym_ap={probe_ap['sym']:.4f} dot_ap={probe_ap['dot']:.4f} "
+            f"train={y_train.numel()} test={y_test.numel()}"
+        )
+
+        if context_edge_pairs is not None and context_labels is not None and len(k_values) > 0:
+            context_labels = context_labels.float().to(node_embeddings.device)
+            pos_context = int((context_labels == 1).sum().item())
+            neg_context = int((context_labels == 0).sum().item())
+            if context_edge_pairs.size(0) >= 4 and pos_context > 0 and neg_context > 0:
+                X_context = _edge_features(context_edge_pairs.to(node_embeddings.device), 'inv').float()
+                y_context = context_labels * 2.0 - 1.0
+                inv_mean = X_context.mean(dim=0, keepdim=True)
+                inv_std = X_context.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+                X_context = (X_context - inv_mean) / inv_std
+                X_context = torch.cat([
+                    X_context,
+                    torch.ones(X_context.size(0), 1, device=X_context.device)
+                ], dim=1)
+                eye = torch.eye(X_context.size(1), device=X_context.device, dtype=X_context.dtype)
+                eye[-1, -1] = 0.0
+                inv_w = torch.linalg.solve(
+                    X_context.t() @ X_context + ridge_alpha * eye,
+                    X_context.t() @ y_context
+                )
+
+                def _score_full_edges(edges, mode, batch_size=65536):
+                    scores = []
+                    for start in range(0, edges.size(0), batch_size):
+                        batch_edges = edges[start:start + batch_size]
+                        feats = _edge_features(batch_edges, mode).float()
+                        if mode == 'dot':
+                            batch_scores = feats.squeeze(1)
+                        elif mode == 'inv':
+                            feats = (feats - inv_mean) / inv_std
+                            feats = torch.cat([
+                                feats,
+                                torch.ones(feats.size(0), 1, device=feats.device)
+                            ], dim=1)
+                            batch_scores = feats @ inv_w
+                        else:
+                            raise ValueError(f"unsupported official probe mode: {mode}")
+                        scores.append(batch_scores.detach().cpu())
+                    return torch.cat(scores, dim=0)
+
+                dot_pos = _score_full_edges(pos_edges, 'dot')
+                dot_neg = _score_full_edges(neg_edges, 'dot')
+                inv_pos = _score_full_edges(pos_edges, 'inv')
+                inv_neg = _score_full_edges(neg_edges, 'inv')
+
+                evaluator_name = dataset_name if isinstance(dataset_name, str) and dataset_name.startswith('ogbl-') else 'ogbl-ppa'
+                official_evaluator = Evaluator(name=evaluator_name)
+                official_parts = []
+                for k in k_values:
+                    official_evaluator.K = int(k)
+                    fixed_hits = official_evaluator.eval({
+                        'y_pred_pos': pos_scores.cpu(),
+                        'y_pred_neg': neg_scores.cpu(),
+                    })[f'hits@{int(k)}']
+                    dot_hits = official_evaluator.eval({
+                        'y_pred_pos': dot_pos,
+                        'y_pred_neg': dot_neg,
+                    })[f'hits@{int(k)}']
+                    inv_hits = official_evaluator.eval({
+                        'y_pred_pos': inv_pos,
+                        'y_pred_neg': inv_neg,
+                    })[f'hits@{int(k)}']
+                    official_parts.append(
+                        f"hits@{int(k)} fixed={fixed_hits:.4f} dot={dot_hits:.4f} inv_ctx={inv_hits:.4f}"
+                    )
+                print(
+                    f"[LP_EDGE_OFFICIAL] {dataset_name}/{debug_label}: "
+                    + " | ".join(official_parts)
+                    + f" context_pos={pos_context} context_neg={neg_context}"
+                )
+    except Exception as e:
+        print(f"[LP_EDGE_PROBE] {dataset_name}/{debug_label}: skipped ({type(e).__name__}: {e})")
+
+
 @torch.no_grad()
 def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, batch_size,
                              att, mlp, projector=None, identity_projection=None, rank=0,
                              normalize_class_h=False, degree=False, evaluator=None,
                              neg_edges=None, k_values=[20, 50, 100], use_full_adj_for_test=True,
-                             lp_metric='auto', lp_concat_common_neighbors=False):
+                             lp_metric='auto', lp_concat_common_neighbors=False,
+                             return_scores=False, lp_edge_probe_debug=False,
+                             lp_edge_probe_samples=512, lp_edge_probe_label='eval',
+                             return_context_dot_scores=False):
     """
     Evaluate link prediction using the PFN methodology with Hits@K metric.
     
@@ -1150,6 +1345,16 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
                 neg_scores.append(batch_scores.squeeze(-1).cpu())
 
             neg_scores = torch.cat(neg_scores, dim=0)
+            if lp_edge_probe_debug:
+                _print_lp_edge_probe_debug(
+                    node_embeddings, context_edge_pairs, context_labels,
+                    pos_edges, neg_edges_to_use, pos_scores, neg_scores,
+                    rank=rank,
+                    max_samples=int(lp_edge_probe_samples),
+                    dataset_name=getattr(data, 'name', 'unknown'),
+                    debug_label=lp_edge_probe_label,
+                    k_values=k_values
+                )
         finally:
             pass
 
@@ -1161,10 +1366,8 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         
         if evaluator is None:
             # Choose evaluator based on dataset
-            if dataset_name == 'ogbl-citation2':
-                evaluator = Evaluator(name='ogbl-citation2')
-            elif dataset_name == 'ogbl-collab':
-                evaluator = Evaluator(name='ogbl-collab')
+            if isinstance(dataset_name, str) and dataset_name.startswith('ogbl-'):
+                evaluator = Evaluator(name=dataset_name)
             else:
                 evaluator = Evaluator(name='ogbl-ppa')  # Use as default
 
@@ -1452,6 +1655,40 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
         results['hybrid3_ncn_only_metric_name'] = hybrid_ncn_metric_name
         results['hybrid3_ncn_neg_nonzero_overlap_count'] = ncn_neg_overlap_nonzero
         results['hybrid3_ncn_neg_overlap_total_count'] = ncn_neg_overlap_total
+        if return_scores:
+            results['pos_scores'] = pos_scores.detach().cpu()
+            results['neg_scores'] = neg_scores.detach().cpu()
+            if lp_edge_probe_debug or return_context_dot_scores:
+                def _dot_scores_for_edges(edges, batch_size=65536):
+                    scores = []
+                    for start in range(0, edges.size(0), batch_size):
+                        batch_edges = edges[start:start + batch_size]
+                        hu = node_embeddings[batch_edges[:, 0]].float()
+                        hv = node_embeddings[batch_edges[:, 1]].float()
+                        scores.append((hu * hv).sum(dim=1).detach().cpu())
+                    return torch.cat(scores, dim=0)
+
+            if lp_edge_probe_debug:
+                results['dot_pos_scores'] = _dot_scores_for_edges(pos_edges)
+                results['dot_neg_scores'] = _dot_scores_for_edges(neg_edges_to_use)
+            if return_context_dot_scores:
+                context_dot_scores = _dot_scores_for_edges(context_edge_pairs)
+                context_labels_cpu = context_labels.detach().cpu().float()
+                results['lp_tta_context_dot_sep'] = (
+                    context_dot_scores[context_labels_cpu == 1].mean()
+                    - context_dot_scores[context_labels_cpu == 0].mean()
+                ).item() if (context_labels_cpu == 1).any() and (context_labels_cpu == 0).any() else None
+                try:
+                    from sklearn.metrics import roc_auc_score
+                    if (context_labels_cpu == 1).any() and (context_labels_cpu == 0).any():
+                        results['lp_tta_context_dot_auc'] = roc_auc_score(
+                            context_labels_cpu.numpy(),
+                            context_dot_scores.numpy()
+                        )
+                    else:
+                        results['lp_tta_context_dot_auc'] = None
+                except Exception:
+                    results['lp_tta_context_dot_auc'] = None
 
         # Move persistent tensors back to CPU to free GPU memory
         test_edges['edge_pairs'] = test_edges['edge_pairs'].cpu()
@@ -1469,3 +1706,342 @@ def evaluate_link_prediction(model, predictor, data, test_edges, context_edges, 
             import traceback
             print(f"Full traceback: {traceback.format_exc()}")
         raise
+
+
+def _compute_lp_metrics_from_scores(pos_scores, neg_scores, dataset_name, k_values, lp_metric, rank=0):
+    """Compute the same core LP metrics from already-computed edge scores."""
+    evaluation_metric = get_evaluation_metric(dataset_name, lp_metric)
+    default_metric = get_dataset_default_metric(dataset_name)
+    evaluator_name = dataset_name if isinstance(dataset_name, str) and dataset_name.startswith('ogbl-') else 'ogbl-ppa'
+    evaluator = Evaluator(name=evaluator_name)
+
+    results = {}
+    for k in k_values:
+        evaluator.K = k
+        results[f'hits@{k}'] = evaluator.eval({
+            'y_pred_pos': pos_scores.cpu(),
+            'y_pred_neg': neg_scores.cpu(),
+        })[f'hits@{k}']
+
+    try:
+        from sklearn.metrics import roc_auc_score, accuracy_score
+        pos_labels = torch.ones(pos_scores.size(0))
+        neg_labels = torch.zeros(neg_scores.size(0))
+        all_labels = torch.cat([pos_labels, neg_labels]).cpu().numpy()
+        all_probs = torch.sigmoid(torch.cat([pos_scores, neg_scores])).cpu().numpy()
+        results['auc'] = roc_auc_score(all_labels, all_probs)
+        results['acc'] = accuracy_score(all_labels, (all_probs > 0.5).astype(int))
+    except Exception as e:
+        if rank == 0:
+            print(f"Warning: could not compute LP AUC/ACC from TTA scores: {e}")
+
+    if dataset_name == 'ogbl-citation2':
+        results['mrr'] = compute_mrr_citation2(pos_scores, neg_scores)
+
+    if evaluation_metric in results:
+        metric_name = evaluation_metric
+    elif default_metric in results:
+        metric_name = default_metric
+    elif 'hits@100' in results:
+        metric_name = 'hits@100'
+    else:
+        metric_name = None
+
+    results['default_metric'] = results[metric_name] if metric_name is not None else 0.0
+    results['default_metric_name'] = metric_name or 'unavailable'
+    return results
+
+
+def _mask_edges_from_sparse_adj(adj_t, edge_pairs, num_nodes):
+    """Return adj_t with both directions of edge_pairs removed."""
+    if adj_t is None or edge_pairs is None or edge_pairs.numel() == 0:
+        return adj_t, 0
+
+    row, col, edge_attr = adj_t.coo()
+    edge_pairs = edge_pairs.to(row.device)
+    remove_src = edge_pairs[:, 0].long()
+    remove_dst = edge_pairs[:, 1].long()
+    remove_keys = torch.cat([
+        remove_src * num_nodes + remove_dst,
+        remove_dst * num_nodes + remove_src,
+    ], dim=0)
+    remove_keys = torch.unique(remove_keys)
+
+    edge_keys = row.long() * num_nodes + col.long()
+    keep_mask = ~torch.isin(edge_keys, remove_keys)
+    removed = int((~keep_mask).sum().item())
+    if removed == 0:
+        return adj_t, 0
+
+    masked_attr = edge_attr[keep_mask] if edge_attr is not None else None
+    masked_adj = SparseTensor(
+        row=row[keep_mask],
+        col=col[keep_mask],
+        value=masked_attr,
+        sparse_sizes=adj_t.sparse_sizes()
+    ).coalesce()
+    return masked_adj, removed
+
+
+@torch.no_grad()
+def evaluate_link_prediction_with_tta(model, predictor, data, test_edges, context_edges, batch_size,
+                                      att, mlp, projector=None, identity_projection=None, rank=0,
+                                      normalize_class_h=False, degree=False, evaluator=None,
+                                      neg_edges=None, k_values=[20, 50, 100], use_full_adj_for_test=True,
+                                      lp_metric='auto', lp_concat_common_neighbors=False,
+                                      num_augmentations=5, normalize_views=False,
+                                      use_batchnorm=False, linear_projection=False,
+                                      lp_edge_probe_debug=False,
+                                      lp_edge_probe_samples=512,
+                                      context_gate=False,
+                                      context_gate_tolerance=0.0,
+                                      train_gate=False,
+                                      train_gate_edges=None,
+                                      train_gate_pos_samples=256,
+                                      train_gate_neg_ratio=1.0,
+                                      train_gate_hits_k=20,
+                                      train_gate_tolerance=0.0):
+    """
+    Minimal LP TTA: evaluate the original view plus K random-projection feature
+    views, average positive/negative edge logits, then compute LP metrics once.
+    """
+    dataset_name = getattr(data, 'name', 'unknown')
+    device = data.x.device
+    target_dim = data.x.size(1)
+    num_augmentations = 5 if num_augmentations is None else int(num_augmentations)
+    train_gate_data = None
+    train_gate_key = f'hits@{int(train_gate_hits_k)}'
+
+    if train_gate and train_gate_edges is not None and train_gate_edges.get('edge_pairs', None) is not None:
+        gate_edge_pairs = train_gate_edges['edge_pairs'].detach().cpu()
+        gate_labels = train_gate_edges['labels'].detach().cpu()
+        pos_idx = torch.nonzero(gate_labels == 1, as_tuple=False).view(-1)
+        neg_idx = torch.nonzero(gate_labels == 0, as_tuple=False).view(-1)
+        if pos_idx.numel() > 0 and neg_idx.numel() > 0:
+            generator = torch.Generator(device='cpu')
+            generator.manual_seed(20260502)
+            pos_count = min(int(train_gate_pos_samples), pos_idx.numel())
+            neg_count = min(max(int(round(pos_count * float(train_gate_neg_ratio))), int(train_gate_hits_k)), neg_idx.numel())
+            pos_perm = torch.randperm(pos_idx.numel(), generator=generator)[:pos_count]
+            neg_perm = torch.randperm(neg_idx.numel(), generator=generator)[:neg_count]
+            sampled_idx = torch.cat([pos_idx[pos_perm], neg_idx[neg_perm]], dim=0)
+            train_gate_data = {
+                'edge_pairs': gate_edge_pairs[sampled_idx].detach().cpu(),
+                'labels': gate_labels[sampled_idx].detach().cpu(),
+            }
+            train_gate_pos_edges_to_mask = gate_edge_pairs[pos_idx[pos_perm]].detach().cpu()
+        else:
+            train_gate_pos_edges_to_mask = None
+    else:
+        train_gate_pos_edges_to_mask = None
+
+    def _eval_view(view_data, view_label):
+        view_result = evaluate_link_prediction(
+            model, predictor, view_data, test_edges, context_edges, batch_size,
+            att, mlp, projector, identity_projection, rank, normalize_class_h,
+            degree, evaluator, neg_edges, k_values, use_full_adj_for_test,
+            lp_metric, lp_concat_common_neighbors, return_scores=True,
+            lp_edge_probe_debug=lp_edge_probe_debug,
+            lp_edge_probe_samples=lp_edge_probe_samples,
+            lp_edge_probe_label=view_label,
+            return_context_dot_scores=context_gate
+        )
+        if train_gate_data is not None:
+            gate_view_data = view_data.clone()
+            masked_adj, removed_edges = _mask_edges_from_sparse_adj(
+                view_data.adj_t, train_gate_pos_edges_to_mask, view_data.num_nodes
+            )
+            gate_view_data.adj_t = masked_adj
+            if hasattr(gate_view_data, 'full_adj_t'):
+                gate_view_data.full_adj_t = None
+            gate_result = evaluate_link_prediction(
+                model, predictor, gate_view_data, train_gate_data, context_edges, batch_size,
+                att, mlp, projector, identity_projection, rank, normalize_class_h,
+                degree, evaluator=None, neg_edges=None, k_values=[int(train_gate_hits_k)],
+                use_full_adj_for_test=False, lp_metric=f'hits@{int(train_gate_hits_k)}',
+                lp_concat_common_neighbors=lp_concat_common_neighbors, return_scores=True,
+                lp_edge_probe_debug=False
+            )
+            view_result['lp_tta_train_gate_metric'] = gate_result.get(train_gate_key, None)
+            view_result['lp_tta_train_gate_pos_scores'] = gate_result.get('pos_scores', None)
+            view_result['lp_tta_train_gate_neg_scores'] = gate_result.get('neg_scores', None)
+            view_result['lp_tta_train_gate_removed_adj_edges'] = removed_edges
+        return view_result
+
+    view_results = []
+    original_results = _eval_view(data, "original")
+    view_results.append(original_results)
+
+    for aug_idx in range(num_augmentations):
+        seed = 999000 + aug_idx
+        data_for_aug = data.clone()
+        if hasattr(data, 'x_original') and data.x_original is not None:
+            data_for_aug.x = data.x_original.to(device).clone()
+        else:
+            data_for_aug.x = data.x.detach().clone()
+
+        data_aug = apply_random_projection_augmentation(
+            data_for_aug,
+            activation_pool=['identity'] if linear_projection else None,
+            seed=seed,
+            verbose=False,
+            rank=rank,
+        )
+
+        q = min(target_dim, data_aug.x.size(0), data_aug.x.size(1))
+        U, S, _ = torch.pca_lowrank(data_aug.x.to(device), q=q)
+        x_aug = torch.mm(U, torch.diag(S))
+        if x_aug.size(1) < target_dim:
+            pad = torch.zeros(x_aug.size(0), target_dim - x_aug.size(1), device=device, dtype=x_aug.dtype)
+            x_aug = torch.cat([x_aug, pad], dim=1)
+        if normalize_views:
+            if use_batchnorm:
+                x_aug = (x_aug - x_aug.mean(dim=0, keepdim=True)) / (x_aug.std(dim=0, keepdim=True, unbiased=False) + 1e-5)
+            else:
+                x_aug = F.normalize(x_aug, p=2, dim=1)
+        data_aug.x = x_aug
+
+        view_results.append(_eval_view(data_aug, f"aug{aug_idx + 1}"))
+
+    keep_mask = [True] * len(view_results)
+    train_gate_tta_metric = None
+    train_gate_candidate_indices = list(range(len(view_results)))
+    if context_gate:
+        original_gate = view_results[0].get('lp_tta_context_dot_auc', None)
+        if original_gate is not None:
+            for idx, view_result in enumerate(view_results[1:], start=1):
+                gate_value = view_result.get('lp_tta_context_dot_auc', None)
+                if gate_value is None or gate_value + float(context_gate_tolerance) < original_gate:
+                    keep_mask[idx] = False
+
+    if train_gate_data is not None:
+        original_train_gate = view_results[0].get('lp_tta_train_gate_metric', None)
+        train_gate_candidate_indices = [idx for idx, keep in enumerate(keep_mask) if keep or idx == 0]
+        candidate_view_results = [view_results[idx] for idx in train_gate_candidate_indices]
+        if (
+            original_train_gate is not None and
+            all(
+                r.get('lp_tta_train_gate_pos_scores', None) is not None
+                and r.get('lp_tta_train_gate_neg_scores', None) is not None
+                for r in candidate_view_results
+            )
+        ):
+            candidate_gate_pos_scores = torch.stack(
+                [r['lp_tta_train_gate_pos_scores'] for r in candidate_view_results], dim=0
+            ).mean(dim=0)
+            candidate_gate_neg_scores = torch.stack(
+                [r['lp_tta_train_gate_neg_scores'] for r in candidate_view_results], dim=0
+            ).mean(dim=0)
+            train_gate_tta_metric = _compute_lp_metrics_from_scores(
+                candidate_gate_pos_scores, candidate_gate_neg_scores, dataset_name,
+                [int(train_gate_hits_k)], f'hits@{int(train_gate_hits_k)}', rank
+            ).get(train_gate_key, None)
+            if train_gate_tta_metric is None or train_gate_tta_metric + float(train_gate_tolerance) < original_train_gate:
+                keep_mask = [idx == 0 for idx in range(len(view_results))]
+            else:
+                keep_mask = [idx in train_gate_candidate_indices for idx in range(len(view_results))]
+        else:
+            keep_mask = [idx == 0 for idx in range(len(view_results))]
+
+    kept_indices = [idx for idx, keep in enumerate(keep_mask) if keep or idx == 0]
+    selected_view_results = [view_results[idx] for idx in kept_indices]
+
+    pos_scores = torch.stack([r['pos_scores'] for r in selected_view_results], dim=0).mean(dim=0)
+    neg_scores = torch.stack([r['neg_scores'] for r in selected_view_results], dim=0).mean(dim=0)
+    results = _compute_lp_metrics_from_scores(pos_scores, neg_scores, dataset_name, k_values, lp_metric, rank)
+    results['lp_tta_original_metric'] = original_results.get('default_metric', 0.0)
+    results['lp_tta_num_views'] = len(view_results)
+    results['lp_tta_num_kept_views'] = len(selected_view_results)
+
+    if rank == 0:
+        view_metrics = [r.get('default_metric', 0.0) for r in view_results]
+        print(
+            f"[LP_TTA] {dataset_name}: original={view_metrics[0]:.4f} "
+            f"mean_view={sum(view_metrics) / len(view_metrics):.4f} "
+            f"agg={results['default_metric']:.4f} views={len(view_results)} kept={len(selected_view_results)} "
+            f"norm_views={normalize_views} linear_proj={linear_projection}"
+        )
+        if context_gate:
+            gate_values = [r.get('lp_tta_context_dot_auc', None) for r in view_results]
+            gate_text = ",".join("nan" if v is None else f"{v:.3f}" for v in gate_values)
+            print(
+                f"[LP_TTA_GATE] {dataset_name}: metric=context_dot_auc "
+                f"original={gate_values[0] if gate_values[0] is not None else float('nan'):.4f} "
+                f"kept={kept_indices}/{len(view_results)} tol={float(context_gate_tolerance):.4f} "
+                f"values=[{gate_text}]"
+        )
+        if train_gate_data is not None:
+            train_gate_values = [r.get('lp_tta_train_gate_metric', None) for r in view_results]
+            train_gate_text = ",".join("nan" if v is None else f"{v:.3f}" for v in train_gate_values)
+            removed_text = ",".join(str(r.get('lp_tta_train_gate_removed_adj_edges', 0)) for r in view_results)
+            candidate_gate_pos_scores = None
+            candidate_gate_neg_scores = None
+            candidate_view_results = [view_results[idx] for idx in train_gate_candidate_indices]
+            if all(
+                r.get('lp_tta_train_gate_pos_scores', None) is not None
+                and r.get('lp_tta_train_gate_neg_scores', None) is not None
+                for r in candidate_view_results
+            ):
+                candidate_gate_pos_scores = torch.stack(
+                    [r['lp_tta_train_gate_pos_scores'] for r in candidate_view_results], dim=0
+                ).mean(dim=0)
+                candidate_gate_neg_scores = torch.stack(
+                    [r['lp_tta_train_gate_neg_scores'] for r in candidate_view_results], dim=0
+                ).mean(dim=0)
+            train_gate_decision = "accept" if set(kept_indices) == set(train_gate_candidate_indices) else "reject"
+            print(
+                f"[LP_TTA_TRAIN_GATE] {dataset_name}: metric={train_gate_key} "
+                f"original={train_gate_values[0] if train_gate_values[0] is not None else float('nan'):.4f} "
+                f"tta={train_gate_tta_metric if train_gate_tta_metric is not None else float('nan'):.4f} "
+                f"decision={train_gate_decision} candidates={train_gate_candidate_indices}/{len(view_results)} "
+                f"kept={kept_indices}/{len(view_results)} tol={float(train_gate_tolerance):.4f} "
+                f"gate_edges={train_gate_data['edge_pairs'].size(0)} values=[{train_gate_text}] "
+                f"masked_adj_edges=[{removed_text}]"
+            )
+            original_gate_pos = view_results[0].get('lp_tta_train_gate_pos_scores', None)
+            original_gate_neg = view_results[0].get('lp_tta_train_gate_neg_scores', None)
+            if original_gate_pos is not None and original_gate_neg is not None:
+                def _gate_quantile_text(label, pos_scores_q, neg_scores_q):
+                    pos_scores_q = pos_scores_q.float()
+                    neg_scores_q = neg_scores_q.float()
+                    pos_q = torch.quantile(pos_scores_q, torch.tensor([0.10, 0.50, 0.90], device=pos_scores_q.device))
+                    neg_q = torch.quantile(neg_scores_q, torch.tensor([0.90, 0.95, 0.99], device=neg_scores_q.device))
+                    k_eff = min(int(train_gate_hits_k), neg_scores_q.numel())
+                    topk_thr = torch.topk(neg_scores_q, k_eff).values[-1].item() if k_eff > 0 else float('nan')
+                    pos_above = (pos_scores_q > topk_thr).float().mean().item() if k_eff > 0 else float('nan')
+                    return (
+                        f"{label}: pos_p10/50/90={pos_q[0].item():.3f}/{pos_q[1].item():.3f}/{pos_q[2].item():.3f} "
+                        f"neg_p90/95/99={neg_q[0].item():.3f}/{neg_q[1].item():.3f}/{neg_q[2].item():.3f} "
+                        f"neg_top{int(train_gate_hits_k)}_thr={topk_thr:.3f} pos_above_thr={pos_above:.3f}"
+                    )
+
+                diag_parts = [_gate_quantile_text("orig", original_gate_pos, original_gate_neg)]
+                if candidate_gate_pos_scores is not None and candidate_gate_neg_scores is not None:
+                    diag_parts.append(_gate_quantile_text("tta", candidate_gate_pos_scores, candidate_gate_neg_scores))
+                print(f"[LP_TTA_TRAIN_GATE_DIST] {dataset_name}: " + " | ".join(diag_parts))
+        if lp_edge_probe_debug and all('dot_pos_scores' in r and 'dot_neg_scores' in r for r in view_results):
+            dot_pos_scores = torch.stack([r['dot_pos_scores'] for r in selected_view_results], dim=0).mean(dim=0)
+            dot_neg_scores = torch.stack([r['dot_neg_scores'] for r in selected_view_results], dim=0).mean(dim=0)
+            dot_tta_results = _compute_lp_metrics_from_scores(
+                dot_pos_scores, dot_neg_scores, dataset_name, k_values, lp_metric, rank
+            )
+            dot_original_results = _compute_lp_metrics_from_scores(
+                view_results[0]['dot_pos_scores'], view_results[0]['dot_neg_scores'],
+                dataset_name, k_values, lp_metric, rank
+            )
+            dot_parts = []
+            for k in k_values:
+                key = f'hits@{int(k)}'
+                if key in dot_tta_results:
+                    dot_parts.append(
+                        f"{key} orig={dot_original_results.get(key, 0.0):.4f} "
+                        f"tta={dot_tta_results[key]:.4f}"
+                    )
+            print(
+                f"[LP_DOT_TTA] {dataset_name}: "
+                + " | ".join(dot_parts)
+                + f" views={len(view_results)} kept={len(selected_view_results)} "
+                + f"norm_views={normalize_views} linear_proj={linear_projection}"
+            )
+
+    return results

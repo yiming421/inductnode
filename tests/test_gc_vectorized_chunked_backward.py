@@ -46,6 +46,15 @@ class _TinyModel(nn.Module):
         return self.linear(x)
 
 
+class _IdentityModel(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+    def forward(self, x, adj_t, batch):
+        return x[:, : self.hidden_dim]
+
+
 class _TinyPredictor(nn.Module):
     def __init__(self):
         super().__init__()
@@ -86,6 +95,40 @@ def _fake_context_embeddings(
         delta = (task_idx + 1) * 0.03
         pos.append((base + delta) * direction)
         neg.append((base - delta) * direction)
+
+    if return_timing:
+        return pos, neg, {
+            "encode_time": 0.0,
+            "overhead_time": 0.0,
+            "concat_time": 0.0,
+            "total_time": 0.0,
+            "num_context_batches": 1,
+        }
+    return pos, neg
+
+
+def _fake_context_embeddings_static(
+    model,
+    context_structure,
+    dataset,
+    pooling_method,
+    device,
+    identity_projection,
+    dataset_info,
+    return_timing=False,
+    sync_cuda=False,
+    batch_size=None,
+):
+    num_tasks = max(context_structure.keys()) + 1 if context_structure else dataset_info["num_tasks"]
+    hidden_dim = model.hidden_dim
+    direction = torch.linspace(0.2, 0.5, steps=hidden_dim, device=device).view(1, hidden_dim)
+
+    pos = []
+    neg = []
+    for task_idx in range(num_tasks):
+        delta = (task_idx + 1) * 0.04
+        pos.append((direction + delta).clone())
+        neg.append((direction - delta).clone())
 
     if return_timing:
         return pos, neg, {
@@ -241,6 +284,69 @@ def _run_one_step(monkeypatch, chunk_size, seed=7):
     }
 
 
+def _run_one_step_no_encoder_grad(monkeypatch, chunk_size, seed=11):
+    torch.manual_seed(seed)
+
+    monkeypatch.setattr(engine_gc, "SparseTensor", _DummySparseTensor)
+    monkeypatch.setattr(engine_gc, "pool_graph_embeddings", _fake_pool_graph_embeddings)
+    monkeypatch.setattr(engine_gc, "_create_all_task_context_embeddings", _fake_context_embeddings_static)
+    monkeypatch.setattr(engine_gc, "_vectorized_multitask_pfn_logits", _fake_multitask_pfn_logits)
+    monkeypatch.setattr(engine_gc, "_get_node_embedding_table", lambda *args, **kwargs: torch.empty(1))
+    monkeypatch.setattr(
+        engine_gc,
+        "_safe_lookup_node_embeddings",
+        lambda node_emb_table, x, context="", batch_data=None, dataset_info=None: x.float(),
+    )
+    monkeypatch.setattr(engine_gc, "batch_edge_dropout", lambda batch_data, rate, training=True: batch_data)
+
+    hidden_dim = 3
+    num_tasks = 4
+
+    model = _IdentityModel(hidden_dim=hidden_dim)
+    predictor = _TinyPredictor()
+    optimizer = torch.optim.SGD(list(model.parameters()) + list(predictor.parameters()), lr=0.1)
+
+    dataset = [SimpleNamespace(y=torch.zeros(num_tasks, dtype=torch.float32))]
+    dataset_info = {
+        "dataset": dataset,
+        "context_graphs": {t: {} for t in range(num_tasks)},
+        "needs_identity_projection": False,
+        "num_tasks": num_tasks,
+    }
+    data_loaders = {"train": [_make_batch(num_tasks=num_tasks)]}
+
+    args = SimpleNamespace(
+        gc_supervised_mlp=False,
+        gc_profile_context=False,
+        gc_sim="dot",
+        gc_ridge_alpha=1.0,
+        gc_batch_size=16,
+        gc_vec_task_chunk_size=chunk_size,
+        edge_dropout_enabled=False,
+    )
+
+    loss = engine_gc.train_graph_classification_multitask_vectorized(
+        model=model,
+        predictor=predictor,
+        dataset_info=dataset_info,
+        data_loaders=data_loaders,
+        optimizer=optimizer,
+        pooling_method="mean",
+        device="cpu",
+        clip_grad=0.0,
+        orthogonal_push=0.0,
+        normalize_class_h=True,
+        identity_projection=None,
+        args=args,
+        lambda_=1.0,
+    )
+
+    return {
+        "loss": loss,
+        "predictor_state": {k: v.detach().clone() for k, v in predictor.state_dict().items()},
+    }
+
+
 def _assert_states_close(state_a, state_b, rtol=1e-6, atol=1e-8):
     assert set(state_a.keys()) == set(state_b.keys())
     for key in state_a:
@@ -271,3 +377,11 @@ def test_gc_vectorized_chunked_backward_matches_full_batch(monkeypatch):
     _assert_states_close(chunk_1["predictor_state"], baseline["predictor_state"])
     _assert_states_close(chunk_2["predictor_state"], baseline["predictor_state"])
     _assert_states_close(chunk_big["predictor_state"], baseline["predictor_state"])
+
+
+def test_gc_vectorized_chunked_backward_handles_parameter_free_encoder(monkeypatch):
+    baseline = _run_one_step_no_encoder_grad(monkeypatch, chunk_size=0, seed=321)
+    chunked = _run_one_step_no_encoder_grad(monkeypatch, chunk_size=2, seed=321)
+
+    assert math.isclose(chunked["loss"], baseline["loss"], rel_tol=1e-6, abs_tol=1e-8)
+    _assert_states_close(chunked["predictor_state"], baseline["predictor_state"])

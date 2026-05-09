@@ -320,7 +320,7 @@ def correct_and_smooth(adj, base_logits, context_idx, context_labels, num_classe
         # Blend with previous
         Y = (1 - alpha) * Y_new + alpha * Y
 
-        # Clamp context set to ground truth (force truth to flow outward from few-shot samples)
+        # Clamp context set to observed support labels.
         Y[context_idx] = Y_support
 
     return Y

@@ -11,6 +11,152 @@ from .utils import process_node_features, acc, apply_final_pca
 from .data_utils import select_k_shot_context, edge_dropout_sparse_tensor, feature_dropout
 
 
+def _sync_cuda_if_needed(device):
+    if isinstance(device, torch.device) and device.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _synced_perf_counter(device):
+    _sync_cuda_if_needed(device)
+    return time.perf_counter()
+
+
+def _apply_tta_view_input_normalization(features, args):
+    """
+    Optionally mirror the main NC path's final input-normalization step for
+    augmented TTA views after PCA/padding.
+
+    This intentionally mirrors only the final `normalize_data/use_batchnorm`
+    branch from `process_data()`. It does not replay the full preprocessing
+    stack such as quantile normalization or whitening.
+    """
+    if args is None or not getattr(args, 'tta_apply_input_normalization_to_views', False):
+        return features
+    if not getattr(args, 'normalize_data', False):
+        return features
+
+    if getattr(args, 'use_batchnorm', False):
+        batch_mean = features.mean(dim=0, keepdim=True)
+        batch_std = features.std(dim=0, keepdim=True, unbiased=False)
+        return (features - batch_mean) / (batch_std + 1e-5)
+    return F.normalize(features, p=2, dim=1)
+
+
+def _tta_true_class_probabilities(probs, y_true):
+    idx = torch.arange(y_true.size(0), device=probs.device)
+    return probs[idx, y_true]
+
+
+def _tta_true_class_margins(probs, y_true):
+    idx = torch.arange(y_true.size(0), device=probs.device)
+    true_probs = probs[idx, y_true]
+    masked = probs.clone()
+    masked[idx, y_true] = float('-inf')
+    max_other = masked.max(dim=-1).values
+    return true_probs - max_other
+
+
+def _tta_true_class_ranks(probs, y_true):
+    true_probs = _tta_true_class_probabilities(probs, y_true)
+    return (probs > true_probs.unsqueeze(-1)).sum(dim=-1) + 1
+
+
+def _tta_subset_mean(values, mask):
+    if mask.numel() == 0 or mask.sum().item() == 0:
+        return None
+    return values[mask].mean().item()
+
+
+def _tta_subset_int_mean(values, mask):
+    if mask.numel() == 0 or mask.sum().item() == 0:
+        return None
+    return values[mask].float().mean().item()
+
+
+def _print_tta_distribution_debug(dataset_name, split_name, base_logits, all_view_logits,
+                                  agg_logits, y_true):
+    """
+    Print a compact summary explaining how TTA aggregation changes raw class
+    probability behavior for a given split.
+    """
+    if y_true.numel() == 0:
+        return
+
+    base_probs = F.softmax(base_logits, dim=-1)
+    view_probs = torch.stack([F.softmax(logits, dim=-1) for logits in all_view_logits], dim=0)
+    agg_probs = F.softmax(agg_logits, dim=-1)
+
+    base_pred = base_probs.argmax(dim=-1)
+    agg_pred = agg_probs.argmax(dim=-1)
+    view_pred = view_probs.argmax(dim=-1)
+    majority_pred = torch.mode(view_pred, dim=0).values
+
+    corrected = (base_pred != y_true) & (agg_pred == y_true)
+    broken = (base_pred == y_true) & (agg_pred != y_true)
+    soft_only_corrected = corrected & (majority_pred != y_true)
+
+    base_true_prob = _tta_true_class_probabilities(base_probs, y_true)
+    mean_view_true_prob = view_probs.gather(
+        2, y_true.view(1, -1, 1).expand(view_probs.size(0), -1, 1)
+    ).squeeze(-1).mean(dim=0)
+    agg_true_prob = _tta_true_class_probabilities(agg_probs, y_true)
+
+    base_margin = _tta_true_class_margins(base_probs, y_true)
+    mean_view_margin = torch.stack(
+        [_tta_true_class_margins(view_probs[i], y_true) for i in range(view_probs.size(0))],
+        dim=0
+    ).mean(dim=0)
+    agg_margin = _tta_true_class_margins(agg_probs, y_true)
+
+    base_rank = _tta_true_class_ranks(base_probs, y_true)
+    agg_rank = _tta_true_class_ranks(agg_probs, y_true)
+    vote_true_frac = (view_pred == y_true.unsqueeze(0)).float().mean(dim=0)
+    unique_top1 = torch.tensor(
+        [view_pred[:, i].unique().numel() for i in range(view_pred.size(1))],
+        device=view_pred.device,
+        dtype=torch.float32
+    )
+
+    base_acc = (base_pred == y_true).float().mean().item()
+    majority_acc = (majority_pred == y_true).float().mean().item()
+    agg_acc = (agg_pred == y_true).float().mean().item()
+
+    def _fmt(v):
+        return "n/a" if v is None else f"{v:.3f}"
+
+    print(
+        f"      [TTA_DIST:{split_name}] base={base_acc:.4f} vote={majority_acc:.4f} "
+        f"agg={agg_acc:.4f} corrected={int(corrected.sum().item())} "
+        f"broken={int(broken.sum().item())} soft_only={int(soft_only_corrected.sum().item())}"
+    )
+    print(
+        f"        p_true mean base/view/agg = "
+        f"{base_true_prob.mean().item():.3f}/{mean_view_true_prob.mean().item():.3f}/{agg_true_prob.mean().item():.3f}"
+    )
+    print(
+        f"        margin mean base/view/agg = "
+        f"{base_margin.mean().item():.3f}/{mean_view_margin.mean().item():.3f}/{agg_margin.mean().item():.3f}"
+    )
+    print(
+        f"        corrected: p_true base/view/agg={_fmt(_tta_subset_mean(base_true_prob, corrected))}/"
+        f"{_fmt(_tta_subset_mean(mean_view_true_prob, corrected))}/"
+        f"{_fmt(_tta_subset_mean(agg_true_prob, corrected))} "
+        f"rank base->agg={_fmt(_tta_subset_int_mean(base_rank, corrected))}->"
+        f"{_fmt(_tta_subset_int_mean(agg_rank, corrected))} "
+        f"vote_true_frac={_fmt(_tta_subset_mean(vote_true_frac, corrected))} "
+        f"unique_top1={_fmt(_tta_subset_mean(unique_top1, corrected))}"
+    )
+    print(
+        f"        broken:    p_true base/view/agg={_fmt(_tta_subset_mean(base_true_prob, broken))}/"
+        f"{_fmt(_tta_subset_mean(mean_view_true_prob, broken))}/"
+        f"{_fmt(_tta_subset_mean(agg_true_prob, broken))} "
+        f"rank base->agg={_fmt(_tta_subset_int_mean(base_rank, broken))}->"
+        f"{_fmt(_tta_subset_int_mean(agg_rank, broken))} "
+        f"vote_true_frac={_fmt(_tta_subset_mean(vote_true_frac, broken))} "
+        f"unique_top1={_fmt(_tta_subset_mean(unique_top1, broken))}"
+    )
+
+
 def correct_and_smooth(adj, base_logits, context_idx, context_labels, num_classes,
                        num_iters=50, alpha=0.5):
     """
@@ -18,12 +164,12 @@ def correct_and_smooth(adj, base_logits, context_idx, context_labels, num_classe
 
     1. Start with base predictions from features (not zeros!)
     2. Propagate predictions through graph
-    3. Clamp context/support set to ground truth at each step
+    3. Clamp context/support set to observed support labels at each step
 
     This combines feature information with graph structure.
 
     IMPORTANT: context_idx should be the FEW-SHOT context samples (e.g., data.context_sample),
-    NOT the full training split, to avoid label leakage in few-shot evaluation!
+    NOT the full training split, so few-shot evaluation uses only the support labels.
 
     Args:
         adj: SparseTensor adjacency matrix
@@ -61,7 +207,7 @@ def correct_and_smooth(adj, base_logits, context_idx, context_labels, num_classe
         # Blend with previous
         Y = (1 - alpha) * Y_new + alpha * Y
 
-        # Clamp context set to ground truth (force truth to flow outward from few-shot samples)
+        # Clamp context set to observed support labels.
         Y[context_idx] = Y_support
 
     return Y
@@ -290,6 +436,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                 )
 
                 data_aug.x_pca = _pca_or_pad(data_aug.x, pca_target_dim)
+                data_aug.x_pca = _apply_tta_view_input_normalization(data_aug.x_pca, args)
                 tta_base_features_list.append(data_aug.x_pca)
 
             if rank == 0:
@@ -471,6 +618,7 @@ def train(model, data, train_idx, optimizer, pred, batch_size, degree=False, att
                     max_hidden_dim=getattr(args, 'augmentation_max_dim', None),
                 )
                 cached_step_features = _pca_or_pad(data_aug.x, pca_target_dim)
+                cached_step_features = _apply_tta_view_input_normalization(cached_step_features, args)
 
             base_features = cached_step_features
 
@@ -1223,6 +1371,24 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
             device = next(predictor.parameters()).device
         except StopIteration:
             device = data.x.device
+
+    profile_active_compute = bool(args is not None and getattr(args, 'nc_eval_profile', False) and rank == 0)
+    projection_sec = 0.0
+    gnn_sec = 0.0
+    context_sec = 0.0
+    predictor_sec = 0.0
+    cs_sec = 0.0
+
+    def _stage_start():
+        if not profile_active_compute:
+            return None
+        return _synced_perf_counter(device)
+
+    def _stage_stop(stage_start):
+        if stage_start is None:
+            return 0.0
+        return _synced_perf_counter(device) - stage_start
+
     moved_to_device = False
     if data.x.device != device:
         data = data.to(device)
@@ -1233,6 +1399,8 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
             data.context_sample = data.context_sample.to(device)
         moved_to_device = True
 
+    active_compute_start = _stage_start()
+
     base_features = data.x
 
     # Note: GPSE embeddings are already concatenated in process_data (data_utils.py)
@@ -1240,6 +1408,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
 
     # Apply different projection strategies
     # Priority: FUG embeddings > identity projection > standard projection > raw features
+    projection_start = _stage_start()
     if hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
         # FUG embeddings are uniform 1024-dim, just use simple MLP projection to hidden
         # No need for PCA or identity projection since FUG already provides consistent embeddings
@@ -1256,15 +1425,20 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
             x_input = projected_features
     else:
         x_input = base_features
+    projection_sec = _stage_stop(projection_start)
 
     # GNN forward pass
+    gnn_start = _stage_start()
     h = model(x_input, data.adj_t)
+    gnn_sec = _stage_stop(gnn_start)
 
     context_h = h[data.context_sample]
     context_y = data.y[data.context_sample]
 
+    context_start = _stage_start()
     class_h = process_node_features(context_h, data, degree_normalize=degree, attention_pool_module=att, 
                                     mlp_module=mlp, normalize=normalize_class_h)
+    context_sec = _stage_stop(context_start)
 
     # predict
     # break into mini-batches for large edge sets
@@ -1273,6 +1447,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     test_loader = DataLoader(range(test_idx.size(0)), batch_size, shuffle=False)
 
     # Get base predictions for all splits
+    predictor_start = _stage_start()
     valid_logits = []
     for idx in valid_loader:
         target_h = h[valid_idx[idx]]
@@ -1308,10 +1483,12 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
         test_logits.append(out)
     test_logits = torch.cat(test_logits, dim=0)
     test_score_base = test_logits.argmax(dim=1)
+    predictor_sec = _stage_stop(predictor_start)
 
     # Apply C&S if enabled with validation-based selection
     # Decision: Only use C&S if it improves VALIDATION performance (no test leakage)
     if use_cs:
+        cs_start = _stage_start()
         # Build full logits tensor for all nodes
         all_logits = torch.zeros(data.num_nodes, train_logits.size(1), device=h.device)
         all_logits[train_idx] = train_logits
@@ -1319,7 +1496,7 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
         all_logits[test_idx] = test_logits
 
         # Apply Correct & Smooth
-        # IMPORTANT: Use only context samples, not full training split, to avoid label leakage!
+        # IMPORTANT: Use only context samples, not the full training split.
         num_classes = context_y.max().item() + 1
         cs_predictions = correct_and_smooth(
             data.adj_t, all_logits, data.context_sample, data.y[data.context_sample],
@@ -1347,11 +1524,14 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
             if rank == 0:
                 dataset_name = getattr(data, 'name', 'unknown')
                 print(f"[C&S] Skipping C&S for {dataset_name} (valid: {valid_acc_base:.4f} ≥ {valid_acc_cs:.4f})")
+        cs_sec = _stage_stop(cs_start)
     else:
         # Use base predictions
         train_score = train_score_base
         valid_score = valid_score_base
         test_score = test_score_base
+
+    active_compute_sec = _stage_stop(active_compute_start)
 
     # calculate valid metric
     valid_y = data.y[valid_idx]
@@ -1360,6 +1540,18 @@ def test(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, deg
     train_results = acc(train_y, train_score)
     test_y = data.y[test_idx]
     test_results = acc(test_y, test_score)
+
+    if profile_active_compute:
+        total_elapsed_sec = time.time() - st
+        excluded_sec = max(0.0, total_elapsed_sec - active_compute_sec)
+        dataset_name = getattr(data, 'name', 'unknown')
+        print(
+            f"[NC_ACTIVE_COMPUTE] dataset={dataset_name} "
+            f"active_compute={active_compute_sec:.4f}s "
+            f"(projection={projection_sec:.4f}s gnn={gnn_sec:.4f}s context={context_sec:.4f}s "
+            f"predictor={predictor_sec:.4f}s cs={cs_sec:.4f}s) "
+            f"excluded={excluded_sec:.4f}s"
+        )
 
     if moved_to_device:
         data = data.cpu()
@@ -1496,6 +1688,8 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
     tta_include_original = getattr(args, 'tta_include_original', True)
     tta_aggregation = getattr(args, 'tta_aggregation', 'logits')
     tta_gate_by_valid = getattr(args, 'tta_gate_by_valid', True)
+    tta_apply_input_normalization_to_views = getattr(args, 'tta_apply_input_normalization_to_views', False)
+    tta_linear_projection = getattr(args, 'tta_linear_projection', False)
 
     if rank == 0:
         print(f"\n{'='*80}")
@@ -1504,6 +1698,8 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         print(f"  Include original: {tta_include_original}")
         print(f"  Aggregation strategy: {tta_aggregation}")
         print(f"  Gate by valid: {tta_gate_by_valid}")
+        print(f"  Normalize augmented views like main path: {tta_apply_input_normalization_to_views}")
+        print(f"  Linear projection only: {tta_linear_projection}")
         print(f"  Total versions per graph: {tta_num_augmentations + (1 if tta_include_original else 0)}")
         print(f"{'='*80}\n")
 
@@ -1585,8 +1781,27 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
         aug_cpu = 0.0
         pca_wall = 0.0
         pca_cpu = 0.0
+        pca_lowrank_wall = 0.0
+        pca_project_wall = 0.0
+        pca_pad_wall = 0.0
+        pca_unattributed_wall = 0.0
         infer_wall = 0.0
         infer_cpu = 0.0
+        infer_inner_total_wall = 0.0
+        infer_device_transfer_wall = 0.0
+        infer_proj_wall = 0.0
+        infer_gnn_wall = 0.0
+        infer_context_gather_wall = 0.0
+        infer_context_wall = 0.0
+        infer_loader_setup_wall = 0.0
+        infer_predictor_wall = 0.0
+        infer_predictor_train_wall = 0.0
+        infer_predictor_valid_wall = 0.0
+        infer_predictor_test_wall = 0.0
+        infer_restore_wall = 0.0
+        infer_unattributed_wall = 0.0
+        active_compute_wall = 0.0
+        active_compute_cpu = 0.0
 
         if rank == 0:
             print(f"  [TTA] Processing unseen dataset {dataset_idx} ({data.name})...")
@@ -1619,6 +1834,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 data_to_device_start,
                 extra=f"dataset={dataset_idx} name={data.name}",
             )
+        active_compute_start = _tta_profile_snapshot()
 
         # Determine PCA target dimension based on args (same as in process_data)
         if hasattr(data, 'needs_identity_projection') and data.needs_identity_projection:
@@ -1636,6 +1852,10 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
         def _run_one_tta_view(data_version, view_type, view_idx):
             nonlocal infer_wall, infer_cpu
+            nonlocal infer_inner_total_wall, infer_device_transfer_wall, infer_proj_wall, infer_gnn_wall
+            nonlocal infer_context_gather_wall, infer_context_wall, infer_loader_setup_wall
+            nonlocal infer_predictor_wall, infer_predictor_train_wall, infer_predictor_valid_wall
+            nonlocal infer_predictor_test_wall, infer_restore_wall, infer_unattributed_wall
             if hasattr(data_version, 'x') and data_version.x is not None:
                 data_version.x = data_version.x.to(inference_device)
             if hasattr(data_version, 'y') and data_version.y is not None:
@@ -1645,11 +1865,54 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             if hasattr(data_version, 'adj_t') and data_version.adj_t is not None:
                 data_version.adj_t = data_version.adj_t.to(inference_device)
             infer_start = _tta_profile_snapshot()
-            train_logits, valid_logits, test_logits = test_single_with_logits(
-                model, predictor, data_version, train_idx, valid_idx, test_idx,
-                batch_size, degree, att, mlp, normalize_class_h, projector, rank,
-                identity_projection, external_embeddings, args, use_cs, cs_num_iters, cs_alpha
-            )
+            if tta_profile_enabled:
+                train_logits, valid_logits, test_logits, infer_breakdown = test_single_with_logits(
+                    model, predictor, data_version, train_idx, valid_idx, test_idx,
+                    batch_size, degree, att, mlp, normalize_class_h, projector, rank,
+                    identity_projection, external_embeddings, args, use_cs, cs_num_iters, cs_alpha,
+                    return_timing=True, assume_on_device=True
+                )
+            else:
+                train_logits, valid_logits, test_logits = test_single_with_logits(
+                    model, predictor, data_version, train_idx, valid_idx, test_idx,
+                    batch_size, degree, att, mlp, normalize_class_h, projector, rank,
+                    identity_projection, external_embeddings, args, use_cs, cs_num_iters, cs_alpha,
+                    assume_on_device=True
+                )
+                infer_breakdown = None
+            if infer_breakdown is not None:
+                infer_inner_total_wall += infer_breakdown.get('total', 0.0)
+                infer_device_transfer_wall += infer_breakdown.get('device_transfer', 0.0)
+                infer_proj_wall += infer_breakdown.get('projection', 0.0)
+                infer_gnn_wall += infer_breakdown.get('gnn', 0.0)
+                infer_context_gather_wall += infer_breakdown.get('context_gather', 0.0)
+                infer_context_wall += infer_breakdown.get('context', 0.0)
+                infer_loader_setup_wall += infer_breakdown.get('loader_setup', 0.0)
+                infer_predictor_wall += infer_breakdown.get('predictor_total', 0.0)
+                infer_predictor_train_wall += infer_breakdown.get('predictor_train', 0.0)
+                infer_predictor_valid_wall += infer_breakdown.get('predictor_valid', 0.0)
+                infer_predictor_test_wall += infer_breakdown.get('predictor_test', 0.0)
+                infer_restore_wall += infer_breakdown.get('restore', 0.0)
+                infer_unattributed_wall += infer_breakdown.get('unattributed', 0.0)
+                if tta_profile_view_interval > 0:
+                    is_last = (view_idx == total_versions - 1)
+                    if view_idx == 0 or is_last or (view_idx % tta_profile_view_interval == 0):
+                        print(
+                            f"[NC_INFER_BREAKDOWN] dataset={dataset_idx} view={view_type} idx={view_idx} "
+                            f"total={infer_breakdown.get('total', 0.0):.4f}s "
+                            f"device_transfer={infer_breakdown.get('device_transfer', 0.0):.4f}s "
+                            f"proj={infer_breakdown.get('projection', 0.0):.4f}s "
+                            f"gnn={infer_breakdown.get('gnn', 0.0):.4f}s "
+                            f"context_gather={infer_breakdown.get('context_gather', 0.0):.4f}s "
+                            f"context={infer_breakdown.get('context', 0.0):.4f}s "
+                            f"loader_setup={infer_breakdown.get('loader_setup', 0.0):.4f}s "
+                            f"predictor={infer_breakdown.get('predictor_total', 0.0):.4f}s "
+                            f"predictor_train={infer_breakdown.get('predictor_train', 0.0):.4f}s "
+                            f"predictor_valid={infer_breakdown.get('predictor_valid', 0.0):.4f}s "
+                            f"predictor_test={infer_breakdown.get('predictor_test', 0.0):.4f}s "
+                            f"restore={infer_breakdown.get('restore', 0.0):.4f}s "
+                            f"unattributed={infer_breakdown.get('unattributed', 0.0):.4f}s"
+                        )
             infer_view_wall, infer_view_cpu = _tta_profile_elapsed(infer_start)
             infer_wall += infer_view_wall
             infer_cpu += infer_view_cpu
@@ -1700,7 +1963,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             data_aug = apply_random_projection_augmentation(
                 data_for_aug,
                 hidden_dim_range=None,  # Use default (0.5x to 2.0x)
-                activation_pool=None,   # Use default diverse pool
+                activation_pool=['identity'] if tta_linear_projection else None,
                 seed=seed,
                 verbose=False,
                 rank=rank,
@@ -1721,16 +1984,36 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             # Step 3: Apply PCA to augmented features on inference device
             pca_start = _tta_profile_snapshot()
             q = min(pca_target_dim, data_aug.x.shape[0], data_aug.x.shape[1])
+            pca_lowrank_start = _tta_profile_snapshot()
             U, S, _ = torch.pca_lowrank(data_aug.x, q=q)
+            pca_lowrank_view_wall, _ = _tta_profile_elapsed(pca_lowrank_start)
+            pca_lowrank_wall += pca_lowrank_view_wall
+
+            pca_project_start = _tta_profile_snapshot()
             data_aug.x_pca = torch.mm(U, torch.diag(S))
+            pca_project_view_wall, _ = _tta_profile_elapsed(pca_project_start)
+            pca_project_wall += pca_project_view_wall
+
+            pca_pad_start = _tta_profile_snapshot()
             if data_aug.x_pca.shape[1] < pca_target_dim:
                 pad_size = pca_target_dim - data_aug.x_pca.shape[1]
                 padding = torch.zeros(data_aug.x_pca.shape[0], pad_size, device=data_aug.x.device)
                 data_aug.x_pca = torch.cat([data_aug.x_pca, padding], dim=1)
+            pca_pad_view_wall, _ = _tta_profile_elapsed(pca_pad_start)
+            pca_pad_wall += pca_pad_view_wall
+
             pca_view_wall, pca_view_cpu = _tta_profile_elapsed(pca_start)
             pca_wall += pca_view_wall
             pca_cpu += pca_view_cpu
+            pca_unattributed_wall += max(0.0, pca_view_wall - pca_lowrank_view_wall - pca_project_view_wall - pca_pad_view_wall)
             if tta_profile_enabled and tta_profile_view_interval > 0 and ((aug_idx + 1) % tta_profile_view_interval == 0):
+                pca_unattributed_view_wall = max(0.0, pca_view_wall - pca_lowrank_view_wall - pca_project_view_wall - pca_pad_view_wall)
+                print(
+                    f"[NC_PCA_BREAKDOWN] dataset={dataset_idx} aug_idx={aug_idx + 1} "
+                    f"total={pca_view_wall:.4f}s lowrank={pca_lowrank_view_wall:.4f}s "
+                    f"project={pca_project_view_wall:.4f}s pad={pca_pad_view_wall:.4f}s "
+                    f"unattributed={pca_unattributed_view_wall:.4f}s"
+                )
                 _tta_profile_log(
                     "tta_view_pca",
                     pca_start,
@@ -1738,6 +2021,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 )
 
             data_aug.x = data_aug.x_pca
+            data_aug.x = _apply_tta_view_input_normalization(data_aug.x, args)
 
             if hasattr(data_device, 'needs_identity_projection'):
                 data_aug.needs_identity_projection = data_device.needs_identity_projection
@@ -1802,13 +2086,20 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             valid_logits_agg = F.one_hot(valid_pred_mode, num_classes=num_classes).float() * 10.0
             test_logits_agg = F.one_hot(test_pred_mode, num_classes=num_classes).float() * 10.0
 
-
         metric_device = train_logits_agg.device
         y_device = data_device.y.to(metric_device)
         train_idx_dev = train_idx.to(metric_device)
         valid_idx_dev = valid_idx.to(metric_device)
         test_idx_dev = test_idx.to(metric_device)
         context_sample_dev = data_device.context_sample.to(metric_device)
+
+        if rank == 0 and bool(args is not None and getattr(args, 'tta_distribution_debug', False)):
+            _print_tta_distribution_debug(
+                data.name, "valid", all_valid_logits[0], all_valid_logits, valid_logits_agg, y_device[valid_idx_dev]
+            )
+            _print_tta_distribution_debug(
+                data.name, "test", all_test_logits[0], all_test_logits, test_logits_agg, y_device[test_idx_dev]
+            )
 
         # Optionally gate TTA by validation performance (per dataset)
         train_logits_sel = train_logits_agg
@@ -1888,6 +2179,7 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
             train_pred = train_score_base
             valid_pred = valid_score_base
             test_pred = test_score_base
+        active_compute_wall, active_compute_cpu = _tta_profile_elapsed(active_compute_start)
 
         # Compute final metrics
         train_metric = (train_pred == y_device[train_idx_dev]).float().mean().item()
@@ -1903,15 +2195,53 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
                 infer_cpu_ratio = (100.0 * infer_cpu / infer_wall) if infer_wall > 1e-9 else 0.0
                 aug_cpu_ratio = (100.0 * aug_cpu / aug_wall) if aug_wall > 1e-9 else 0.0
                 pca_cpu_ratio = (100.0 * pca_cpu / pca_wall) if pca_wall > 1e-9 else 0.0
+                pca_lowrank_ratio = (100.0 * pca_lowrank_wall / pca_wall) if pca_wall > 1e-9 else 0.0
+                pca_project_ratio = (100.0 * pca_project_wall / pca_wall) if pca_wall > 1e-9 else 0.0
+                pca_pad_ratio = (100.0 * pca_pad_wall / pca_wall) if pca_wall > 1e-9 else 0.0
+                pca_unattributed_ratio = (100.0 * pca_unattributed_wall / pca_wall) if pca_wall > 1e-9 else 0.0
+                active_compute_cpu_ratio = (100.0 * active_compute_cpu / active_compute_wall) if active_compute_wall > 1e-9 else 0.0
+                excluded_wall = max(0.0, dataset_time - data_to_device_wall - active_compute_wall)
+                infer_inner_total_ratio = (100.0 * infer_inner_total_wall / infer_wall) if infer_wall > 1e-9 else 0.0
+                infer_device_transfer_ratio = (100.0 * infer_device_transfer_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_predictor_ratio = (100.0 * infer_predictor_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_predictor_train_ratio = (100.0 * infer_predictor_train_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_predictor_valid_ratio = (100.0 * infer_predictor_valid_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_predictor_test_ratio = (100.0 * infer_predictor_test_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_gnn_ratio = (100.0 * infer_gnn_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_proj_ratio = (100.0 * infer_proj_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_context_gather_ratio = (100.0 * infer_context_gather_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_context_ratio = (100.0 * infer_context_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_loader_ratio = (100.0 * infer_loader_setup_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_restore_ratio = (100.0 * infer_restore_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
+                infer_unattributed_ratio = (100.0 * infer_unattributed_wall / infer_inner_total_wall) if infer_inner_total_wall > 1e-9 else 0.0
                 _tta_profile_log(
                     "dataset_summary",
                     dataset_profile_start,
                     extra=(
                         f"dataset={dataset_idx} name={data.name} versions={total_versions} "
                         f"data_to_device_wall={data_to_device_wall:.3f}s data_to_device_cpu={data_to_device_cpu:.3f}s "
+                        f"active_compute_wall={active_compute_wall:.3f}s active_compute_cpu={active_compute_cpu:.3f}s "
+                        f"active_compute_cpu_over_wall={active_compute_cpu_ratio:.1f}% excluded_wall={excluded_wall:.3f}s "
                         f"aug_wall={aug_wall:.3f}s aug_cpu={aug_cpu:.3f}s aug_cpu_over_wall={aug_cpu_ratio:.1f}% "
                         f"pca_wall={pca_wall:.3f}s pca_cpu={pca_cpu:.3f}s pca_cpu_over_wall={pca_cpu_ratio:.1f}% "
-                        f"infer_wall={infer_wall:.3f}s infer_cpu={infer_cpu:.3f}s infer_cpu_over_wall={infer_cpu_ratio:.1f}%"
+                        f"pca_lowrank_wall={pca_lowrank_wall:.3f}s pca_lowrank_share={pca_lowrank_ratio:.1f}% "
+                        f"pca_project_wall={pca_project_wall:.3f}s pca_project_share={pca_project_ratio:.1f}% "
+                        f"pca_pad_wall={pca_pad_wall:.3f}s pca_pad_share={pca_pad_ratio:.1f}% "
+                        f"pca_unattributed_wall={pca_unattributed_wall:.3f}s pca_unattributed_share={pca_unattributed_ratio:.1f}% "
+                        f"infer_wall={infer_wall:.3f}s infer_cpu={infer_cpu:.3f}s infer_cpu_over_wall={infer_cpu_ratio:.1f}% "
+                        f"infer_inner_total_wall={infer_inner_total_wall:.3f}s infer_inner_total_over_infer={infer_inner_total_ratio:.1f}% "
+                        f"infer_device_transfer_wall={infer_device_transfer_wall:.3f}s infer_device_transfer_share={infer_device_transfer_ratio:.1f}% "
+                        f"infer_predictor_wall={infer_predictor_wall:.3f}s infer_predictor_share={infer_predictor_ratio:.1f}% "
+                        f"infer_predictor_train_wall={infer_predictor_train_wall:.3f}s infer_predictor_train_share={infer_predictor_train_ratio:.1f}% "
+                        f"infer_predictor_valid_wall={infer_predictor_valid_wall:.3f}s infer_predictor_valid_share={infer_predictor_valid_ratio:.1f}% "
+                        f"infer_predictor_test_wall={infer_predictor_test_wall:.3f}s infer_predictor_test_share={infer_predictor_test_ratio:.1f}% "
+                        f"infer_gnn_wall={infer_gnn_wall:.3f}s infer_gnn_share={infer_gnn_ratio:.1f}% "
+                        f"infer_proj_wall={infer_proj_wall:.3f}s infer_proj_share={infer_proj_ratio:.1f}% "
+                        f"infer_context_gather_wall={infer_context_gather_wall:.3f}s infer_context_gather_share={infer_context_gather_ratio:.1f}% "
+                        f"infer_context_wall={infer_context_wall:.3f}s infer_context_share={infer_context_ratio:.1f}% "
+                        f"infer_loader_setup_wall={infer_loader_setup_wall:.3f}s infer_loader_setup_share={infer_loader_ratio:.1f}% "
+                        f"infer_restore_wall={infer_restore_wall:.3f}s infer_restore_share={infer_restore_ratio:.1f}% "
+                        f"infer_unattributed_wall={infer_unattributed_wall:.3f}s infer_unattributed_share={infer_unattributed_ratio:.1f}%"
                     ),
                 )
 
@@ -1924,7 +2254,8 @@ def test_all_induct_with_tta(model, predictor, data_list, split_idx_list, batch_
 
 def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_idx, batch_size, degree=False,
                              att=None, mlp=None, normalize_class_h=False, projector=None, rank=0, identity_projection=None,
-                             external_embeddings=None, args=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5):
+                             external_embeddings=None, args=None, use_cs=False, cs_num_iters=50, cs_alpha=0.5,
+                             return_timing=False, assume_on_device=False):
     """
     Helper function for TTA: Run inference on a single graph and return logits (not predictions).
 
@@ -1947,8 +2278,34 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
             device = next(predictor.parameters()).device
         except StopIteration:
             device = data.x.device
+
+    profile_infer_breakdown = bool(args is not None and getattr(args, 'nc_eval_profile', False) and rank == 0)
+
+    def _stage_start():
+        if not profile_infer_breakdown:
+            return None
+        return _synced_perf_counter(device)
+
+    def _stage_stop(stage_start):
+        if stage_start is None:
+            return 0.0
+        return _synced_perf_counter(device) - stage_start
+
+    infer_total_start = _stage_start()
+    device_transfer_sec = 0.0
+    projection_sec = 0.0
+    gnn_sec = 0.0
+    context_gather_sec = 0.0
+    context_sec = 0.0
+    loader_setup_sec = 0.0
+    predictor_train_sec = 0.0
+    predictor_valid_sec = 0.0
+    predictor_test_sec = 0.0
+    restore_sec = 0.0
+
     moved_to_device = False
-    if data.x.device != device or (hasattr(data, 'adj_t') and data.adj_t.device != device):
+    device_transfer_start = _stage_start()
+    if not assume_on_device and (data.x.device != device or (hasattr(data, 'adj_t') and data.adj_t.device != device)):
         data = data.to(device)
         train_idx = train_idx.to(device)
         valid_idx = valid_idx.to(device)
@@ -1958,10 +2315,12 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
         if hasattr(data, 'adj_t'):
             data.adj_t = data.adj_t.to(device)
         moved_to_device = True
+    device_transfer_sec = _stage_stop(device_transfer_start)
 
     base_features = data.x
 
     # Apply projection strategies (same as test())
+    projection_start = _stage_start()
     if hasattr(data, 'uses_fug_embeddings') and data.uses_fug_embeddings and projector is not None:
         x_input = projector(base_features)
     elif hasattr(data, 'needs_identity_projection') and data.needs_identity_projection and identity_projection is not None:
@@ -1975,23 +2334,33 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
             x_input = projected_features
     else:
         x_input = base_features
+    projection_sec = _stage_stop(projection_start)
 
     # GNN forward pass
+    gnn_start = _stage_start()
     with torch.no_grad():
         h = model(x_input, data.adj_t)
+    gnn_sec = _stage_stop(gnn_start)
 
+    context_gather_start = _stage_start()
     context_h = h[data.context_sample]
     context_y = data.y[data.context_sample]
+    context_gather_sec = _stage_stop(context_gather_start)
 
+    context_start = _stage_start()
     class_h = process_node_features(context_h, data, degree_normalize=degree, attention_pool_module=att,
                                     mlp_module=mlp, normalize=normalize_class_h)
+    context_sec = _stage_stop(context_start)
 
     # Get logits for all splits
+    loader_setup_start = _stage_start()
     train_loader = DataLoader(range(train_idx.size(0)), batch_size, shuffle=False)
     valid_loader = DataLoader(range(valid_idx.size(0)), batch_size, shuffle=False)
     test_loader = DataLoader(range(test_idx.size(0)), batch_size, shuffle=False)
+    loader_setup_sec = _stage_stop(loader_setup_start)
 
     train_logits = []
+    predictor_train_start = _stage_start()
     with torch.no_grad():
         for idx in train_loader:
             target_h = h[train_idx[idx]]
@@ -2002,8 +2371,10 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
                 out, _ = pred_output
             train_logits.append(out)
     train_logits = torch.cat(train_logits, dim=0)
+    predictor_train_sec = _stage_stop(predictor_train_start)
 
     valid_logits = []
+    predictor_valid_start = _stage_start()
     with torch.no_grad():
         for idx in valid_loader:
             target_h = h[valid_idx[idx]]
@@ -2014,8 +2385,10 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
                 out, _ = pred_output
             valid_logits.append(out)
     valid_logits = torch.cat(valid_logits, dim=0)
+    predictor_valid_sec = _stage_stop(predictor_valid_start)
 
     test_logits = []
+    predictor_test_start = _stage_start()
     with torch.no_grad():
         for idx in test_loader:
             target_h = h[test_idx[idx]]
@@ -2026,8 +2399,10 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
                 out, _ = pred_output
             test_logits.append(out)
     test_logits = torch.cat(test_logits, dim=0)
+    predictor_test_sec = _stage_stop(predictor_test_start)
 
-    if moved_to_device:
+    restore_start = _stage_start()
+    if moved_to_device and not assume_on_device:
         data = data.cpu()
         if hasattr(data, 'context_sample') and data.context_sample is not None:
             data.context_sample = data.context_sample.cpu()
@@ -2036,8 +2411,33 @@ def test_single_with_logits(model, predictor, data, train_idx, valid_idx, test_i
         test_idx = test_idx.cpu()
         if hasattr(data, 'adj_t'):
             data.adj_t = data.adj_t.cpu()
+    restore_sec = _stage_stop(restore_start)
 
     # Note: For TTA, we don't apply C&S because we want to aggregate raw model predictions
     # C&S can be applied after aggregation if needed
+
+    if return_timing:
+        infer_total_sec = _stage_stop(infer_total_start)
+        predictor_total_sec = predictor_train_sec + predictor_valid_sec + predictor_test_sec
+        known_sec = (
+            device_transfer_sec + projection_sec + gnn_sec + context_gather_sec +
+            context_sec + loader_setup_sec + predictor_total_sec + restore_sec
+        )
+        infer_timing = {
+            'total': infer_total_sec,
+            'device_transfer': device_transfer_sec,
+            'projection': projection_sec,
+            'gnn': gnn_sec,
+            'context_gather': context_gather_sec,
+            'context': context_sec,
+            'loader_setup': loader_setup_sec,
+            'predictor_train': predictor_train_sec,
+            'predictor_valid': predictor_valid_sec,
+            'predictor_test': predictor_test_sec,
+            'predictor_total': predictor_total_sec,
+            'restore': restore_sec,
+            'unattributed': max(0.0, infer_total_sec - known_sec),
+        }
+        return train_logits, valid_logits, test_logits, infer_timing
 
     return train_logits, valid_logits, test_logits 

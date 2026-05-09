@@ -249,7 +249,7 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
     split_idx['test'] = split_idx['test'].to(device)
 
     # Context sampling ALWAYS uses train split (or test if train is empty, for datasets with no train split)
-    # NEVER use process_test_only flag to change context source - that would be data leakage!
+    # NEVER use process_test_only to change context source; split roles must stay fixed.
     if len(split_idx['train']) > 0:
         context_source_split = split_idx['train']
     else:
@@ -272,7 +272,7 @@ def process_data(data, split_idx, hidden, context_num, sign_normalize=False, use
 
     # Determine which nodes to process based on process_test_only flag
     if process_test_only:
-        # Only process context + test nodes (zero-shot evaluation, avoid data leakage)
+        # Only process context + test nodes for zero-shot evaluation.
         context_indices = data.context_sample
         test_indices = split_idx['test']
         # Combine and remove duplicates
@@ -957,6 +957,106 @@ def process_link_data(data, args, rank=0):
     use_random_orthogonal = getattr(args, 'use_random_orthogonal', False)
     use_quantile_normalization = getattr(args, 'use_quantile_normalization', False)
     quantile_norm_before_padding = getattr(args, 'quantile_norm_before_padding', True)
+    lp_orthogonal_noise_dim = max(1, int(getattr(args, 'lp_orthogonal_noise_dim', 128)))
+    force_lp_orthogonal_noise = bool(getattr(data, 'lp_force_orthogonal_noise', False))
+    force_noise_dim = getattr(data, 'lp_force_orthogonal_noise_dim', None)
+    lp_use_lappe_as_feature = bool(getattr(args, 'lp_use_lappe_as_feature', False))
+    lp_lappe_direct_up_project = bool(getattr(args, 'lp_lappe_direct_up_project', False))
+    if force_noise_dim is not None:
+        lp_orthogonal_noise_dim = max(1, int(force_noise_dim))
+
+    if force_lp_orthogonal_noise:
+        if use_identity_projection:
+            noise_dim = max(lp_orthogonal_noise_dim, int(projection_small_dim))
+        else:
+            noise_dim = lp_orthogonal_noise_dim
+
+        if rank == 0:
+            base_name = getattr(data, 'lp_base_dataset_name', data.name)
+            print(
+                f"Dataset {data.name}: LP dual-view no-feature mode enabled "
+                f"(base={base_name}, {data.num_nodes} x {noise_dim})"
+            )
+
+        data.x = generate_orthogonal_noise_features(
+            num_nodes=int(data.num_nodes),
+            target_dim=int(noise_dim),
+            seed=42,
+            device=device,
+            dtype=torch.float32,
+            rank=rank
+        )
+        data.lp_uses_orthogonal_noise = True
+        data.lp_orthogonal_noise_dim = int(noise_dim)
+
+    # Optional LP mode: replace node features with precomputed LapPE.
+    # Keep orthogonal-noise no-feature view higher priority when dual-view is enabled.
+    if lp_use_lappe_as_feature and not force_lp_orthogonal_noise:
+        lappe_embeddings = getattr(data, 'lappe_embeddings', None)
+        if lappe_embeddings is None:
+            raise ValueError(
+                f"Dataset {data.name}: --lp_use_lappe_as_feature=True but LapPE embeddings are missing. "
+                f"Ensure LP LapPE loading is enabled and files exist in gpse_dir."
+            )
+        if int(lappe_embeddings.size(0)) != int(data.num_nodes):
+            raise ValueError(
+                f"Dataset {data.name}: LapPE node count mismatch "
+                f"({lappe_embeddings.size(0)} vs {data.num_nodes})"
+            )
+        data.x = lappe_embeddings.to(device=device, dtype=torch.float32)
+        data.lp_uses_lappe_feature = True
+        if rank == 0:
+            print(
+                f"Dataset {data.name}: LP using LapPE as initial feature "
+                f"({data.x.size(0)} x {data.x.size(1)})"
+            )
+
+    # LP-specific path: skip PCA and directly up-project LapPE using identity_projection.
+    if lp_use_lappe_as_feature and lp_lappe_direct_up_project and not force_lp_orthogonal_noise:
+        if use_identity_projection:
+            expected_in_dim = int(projection_small_dim)
+            target_dim = int(projection_large_dim)
+        else:
+            expected_in_dim = max(1, int(getattr(args, 'lp_lappe_dim', data.x.size(1))))
+            target_dim = int(hidden_dim)
+
+        current_dim = int(data.x.size(1))
+        if current_dim < expected_in_dim:
+            pad_cols = expected_in_dim - current_dim
+            padding = torch.zeros(data.x.size(0), pad_cols, device=device, dtype=data.x.dtype)
+            data.x = torch.cat([data.x, padding], dim=1)
+            if rank == 0:
+                print(f"Dataset {data.name}: LP direct LapPE path padded {current_dim} -> {expected_in_dim} (no PCA)")
+        elif current_dim > expected_in_dim:
+            data.x = data.x[:, :expected_in_dim]
+            if rank == 0:
+                print(f"Dataset {data.name}: LP direct LapPE path truncated {current_dim} -> {expected_in_dim} (no PCA)")
+
+        # Optional quantile normalization on raw LapPE before up-projection.
+        if use_quantile_normalization:
+            data.x = apply_quantile_normalization(data.x, rank=rank)
+
+        # Optional standard normalization (same style as other LP branches).
+        if normalize_data and not use_quantile_normalization:
+            if use_batchnorm:
+                batch_mean = data.x.mean(dim=0, keepdim=True)
+                batch_std = data.x.std(dim=0, keepdim=True, unbiased=False)
+                data.x = (data.x - batch_mean) / (batch_std + 1e-5)
+            else:
+                data.x = F.normalize(data.x, p=2, dim=1)
+
+        data.needs_identity_projection = True
+        data.projection_target_dim = target_dim
+        data.needs_projection = False
+        data.needs_final_pca = False
+
+        if rank == 0:
+            print(
+                f"Dataset {data.name}: LP direct LapPE up-projection enabled "
+                f"({data.x.size(1)} -> {target_dim}, no PCA)"
+            )
+            print(f"Feature processing time: {time.time()-st:.2f}s", flush=True)
+        return
 
     # Auto-fix: Override zero padding to random when using quantile norm AFTER padding
     # Zero padding creates constant columns which cannot be normalized to N(0,1)
@@ -1474,7 +1574,8 @@ def apply_random_projection_augmentation(data, hidden_dim_range=None, activation
         activation_pool (list, optional): List of activation functions to randomly select from.
                                          Default includes monotonic (ReLU, GELU, etc.),
                                          non-monotonic (sin, cos), polynomial (squared, abs),
-                                         and soft variants (softplus, sigmoid, etc.)
+                                         and soft variants (softplus, sigmoid, etc.).
+                                         Use ['identity'] for a linear-only projection.
         seed (int, optional): Random seed for reproducibility
         verbose (bool): Print augmentation details
         rank (int): Process rank for logging
@@ -1641,6 +1742,8 @@ def apply_random_projection_augmentation(data, hidden_dim_range=None, activation
                 x_current = x_projected ** 2
             elif activation_name == 'abs':
                 x_current = torch.abs(x_projected)
+            elif activation_name == 'identity':
+                x_current = x_projected
             else:
                 raise ValueError(f"Unsupported activation function: {activation_name}")
 

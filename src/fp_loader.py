@@ -6,9 +6,10 @@ Just loads the .npy files from PAS-OGB and formats for inductnode
 import numpy as np
 import torch
 from pathlib import Path
+import os
 
 
-def load_pas_fingerprint_pe(dataset_name, pas_path="/home/maweishuo/PAS-OGB", 
+def load_pas_fingerprint_pe(dataset_name, pas_path=os.environ.get("PAS_OGB_DIR", "../PAS-OGB"),
                            fp_type='morgan', use_pca=False, pe_dim=64):
     """
     Load fingerprints from PAS-OGB as PE for inductnode
