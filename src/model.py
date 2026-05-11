@@ -7,7 +7,7 @@ from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.utils import degree
 from torch_sparse.matmul import spmm_add
 from torch_sparse import SparseTensor
-from torch_scatter import scatter_softmax
+from torch_scatter import scatter_add, scatter_softmax
 from .utils import process_node_features
 
 def get_activation_fn(activation_name):
@@ -1356,13 +1356,103 @@ class PFNTransformerLayer(nn.Module):
 
         return x_context, x_target
 
+class NCPrototypePooler(nn.Module):
+    """NC-only class prototype pooler used after PFN target/context refinement."""
+    def __init__(self, hidden_dim, mode='mean', num_heads=4, dropout=0.0,
+                 norm=True, norm_affine=True, residual=True):
+        super(NCPrototypePooler, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.mode = mode
+        self.num_heads = max(1, int(num_heads))
+        self.dropout = dropout
+        self.residual = residual
+
+        valid_modes = {'mean', 'attention', 'gated_attention'}
+        if self.mode not in valid_modes:
+            raise ValueError(f"Unknown NC prototype pooling mode: {self.mode}. Use one of {sorted(valid_modes)}")
+
+        if self.mode == 'mean':
+            return
+
+        self.input_norm = nn.LayerNorm(hidden_dim, elementwise_affine=norm_affine) if norm else nn.Identity()
+        self.value_proj = nn.Linear(hidden_dim, self.num_heads * hidden_dim)
+        self.score_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, self.num_heads),
+        )
+        self.out_proj = nn.Linear(self.num_heads * hidden_dim, hidden_dim)
+
+        if self.mode == 'gated_attention':
+            self.gate = nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.Sigmoid(),
+            )
+
+        self._init_stable()
+
+    def _init_stable(self):
+        if self.mode == 'mean':
+            return
+        # With residual=True, attention modes start as mean pooling and learn deviations.
+        if self.residual:
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
+
+    @staticmethod
+    def _mean_pool(context_h, context_y, num_classes):
+        pooled = torch.zeros(
+            num_classes, context_h.size(-1),
+            device=context_h.device, dtype=context_h.dtype
+        )
+        if context_h.numel() == 0 or context_y.numel() == 0:
+            return pooled
+        return torch.scatter_reduce(
+            pooled, 0, context_y.long().view(-1, 1).expand(-1, context_h.size(-1)),
+            context_h, reduce='mean', include_self=False
+        )
+
+    def forward(self, context_h, context_y, num_classes):
+        context_y = context_y.long()
+        mean_proto = self._mean_pool(context_h, context_y, num_classes)
+        if self.mode == 'mean' or context_h.numel() == 0 or context_y.numel() == 0:
+            return mean_proto
+
+        context_h_drop = F.dropout(context_h, p=self.dropout, training=self.training)
+        norm_h = self.input_norm(context_h_drop)
+        values = self.value_proj(norm_h).view(-1, self.num_heads, self.hidden_dim)
+        scores = F.leaky_relu(self.score_mlp(norm_h), negative_slope=0.2)
+        weights = scatter_softmax(scores, context_y, dim=0)
+        weighted_values = values * weights.unsqueeze(-1)
+        pooled_heads = torch.zeros(
+            num_classes, self.num_heads, self.hidden_dim,
+            device=context_h.device, dtype=context_h.dtype
+        )
+        pooled_heads = scatter_add(weighted_values, context_y, dim=0, out=pooled_heads)
+        att_proto = self.out_proj(pooled_heads.reshape(num_classes, self.num_heads * self.hidden_dim))
+
+        if self.residual:
+            att_proto = mean_proto + att_proto
+
+        if self.mode == 'gated_attention':
+            gate = self.gate(torch.cat([mean_proto, att_proto], dim=-1))
+            att_proto = gate * att_proto + (1.0 - gate) * mean_proto
+
+        return att_proto
+
+
 class NodeClassificationHead(nn.Module):
     """Task-specific head for node classification."""
-    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot', ridge_alpha=1.0, head_num_layers=2):
+    def __init__(self, hidden_dim, dropout=0.2, norm=True, norm_affine=True, sim='dot',
+                 ridge_alpha=1.0, head_num_layers=2, prototype_pooling='mean',
+                 prototype_pooling_heads=4, prototype_pooling_dropout=None,
+                 prototype_pooling_residual=True):
         super(NodeClassificationHead, self).__init__()
         self.hidden_dim = hidden_dim
         self.sim = sim
         self.ridge_alpha = ridge_alpha
+        self.prototype_pooling = prototype_pooling
 
         # Input normalization layers to stabilize features from transformer
         # Separate norms for target and context since they may have different statistics
@@ -1389,6 +1479,17 @@ class NodeClassificationHead(nn.Module):
         )
         # Initialize to approximate identity to avoid disrupting embeddings
         self.proj._init_identity_like()
+
+        proto_dropout = dropout if prototype_pooling_dropout is None else prototype_pooling_dropout
+        self.prototype_pooler = NCPrototypePooler(
+            hidden_dim=hidden_dim,
+            mode=prototype_pooling,
+            num_heads=prototype_pooling_heads,
+            dropout=proto_dropout,
+            norm=norm,
+            norm_affine=norm_affine,
+            residual=prototype_pooling_residual
+        )
 
         # Optional MLP for similarity computation
         if sim == 'mlp':
@@ -1466,14 +1567,30 @@ class NodeClassificationHead(nn.Module):
             class_emb = None  # Not used in ridge regression
         else:
             # Compute class prototypes using shared pooling logic (for non-ridge methods)
-            class_emb = process_node_features(
-                context_label_emb,
-                data,
-                degree_normalize=degree_normalize,
-                attention_pool_module=attention_pool_module,
-                mlp_module=mlp_module,
-                normalize=normalize
-            )
+            if self.prototype_pooling == 'mean':
+                class_emb = process_node_features(
+                    context_label_emb,
+                    data,
+                    degree_normalize=degree_normalize,
+                    attention_pool_module=attention_pool_module,
+                    mlp_module=mlp_module,
+                    normalize=normalize
+                )
+            else:
+                if degree_normalize:
+                    dev = context_label_emb.device
+                    deg = data.adj_t.sum(dim=1).to(dtype=context_label_emb.dtype, device=dev)
+                    degree_inv = (deg + 1e-9).pow(-1)
+                    degree_inv[deg == 0] = 0
+                    context_label_emb = context_label_emb * degree_inv[data.context_sample].view(-1, 1)
+
+                num_classes = int(data.y.max().item() + 1)
+                class_emb = self.prototype_pooler(context_label_emb, context_y, num_classes)
+
+                if mlp_module is not None:
+                    class_emb = mlp_module(class_emb)
+                if normalize:
+                    class_emb = F.normalize(class_emb, p=2, dim=-1)
 
             # Compute logits using similarity
             if self.sim == 'dot':
@@ -2424,6 +2541,8 @@ class PFNPredictorNodeCls(nn.Module):
                  matching_network_temperature=1.0, matching_network_learnable_temp=True,
                  # Node classification ridge regression
                  nc_sim='dot', nc_ridge_alpha=1.0,
+                 nc_proto_pooling='mean', nc_proto_pooling_heads=4,
+                 nc_proto_pooling_dropout=None, nc_proto_pooling_residual=True,
                  # Link prediction ridge regression
                  lp_sim='dot', lp_ridge_alpha=1.0,
                  # Graph classification ridge regression
@@ -2480,6 +2599,7 @@ class PFNPredictorNodeCls(nn.Module):
         # Use explicit task-specific parameters - they have proper defaults from config
         self.nc_sim = nc_sim
         self.nc_ridge_alpha = nc_ridge_alpha
+        self.nc_proto_pooling = nc_proto_pooling
         self.lp_sim = lp_sim
         self.lp_ridge_alpha = lp_ridge_alpha
         self.gc_sim = gc_sim
@@ -2571,7 +2691,11 @@ class PFNPredictorNodeCls(nn.Module):
             norm_affine=norm_affine,
             sim=self.nc_sim,
             ridge_alpha=self.nc_ridge_alpha,
-            head_num_layers=self.nc_head_num_layers
+            head_num_layers=self.nc_head_num_layers,
+            prototype_pooling=nc_proto_pooling,
+            prototype_pooling_heads=nc_proto_pooling_heads,
+            prototype_pooling_dropout=nc_proto_pooling_dropout,
+            prototype_pooling_residual=nc_proto_pooling_residual
         )
 
         lp_head_input_dim = head_hidden_dim + (1 if self.lp_concat_common_neighbors else 0)

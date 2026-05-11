@@ -299,6 +299,10 @@ def override_args_from_checkpoint(args, checkpoint_args, rank=0, predictor_state
         'matching_network_learnable_temp',
         'nc_sim',
         'nc_ridge_alpha',
+        'nc_proto_pooling',
+        'nc_proto_pooling_heads',
+        'nc_proto_pooling_dropout',
+        'nc_proto_pooling_residual',
         'lp_sim',
         'lp_ridge_alpha',
         'gc_sim',
@@ -532,6 +536,13 @@ def create_model_from_args(args, input_dim, device):
             matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
             matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
             matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
+            nc_proto_pooling=getattr(args, 'nc_proto_pooling', 'mean'),
+            nc_proto_pooling_heads=getattr(args, 'nc_proto_pooling_heads', 4),
+            nc_proto_pooling_dropout=(
+                None if getattr(args, 'nc_proto_pooling_dropout', -1.0) < 0
+                else getattr(args, 'nc_proto_pooling_dropout', -1.0)
+            ),
+            nc_proto_pooling_residual=getattr(args, 'nc_proto_pooling_residual', True),
             lp_use_linear_predictor=getattr(args, 'lp_use_linear_predictor', False),
             lp_head_type=getattr(args, 'lp_head_type', 'standard'),
             mplp_signature_dim=getattr(args, 'mplp_signature_dim', 64),
@@ -608,6 +619,13 @@ def recreate_model_from_checkpoint(checkpoint_path, input_dim, device):
         matching_network_projection=getattr(args, 'matching_network_projection', 'linear'),
         matching_network_temperature=getattr(args, 'matching_network_temperature', 0.1),
         matching_network_learnable_temp=getattr(args, 'matching_network_learnable_temp', True),
+        nc_proto_pooling=getattr(args, 'nc_proto_pooling', 'mean'),
+        nc_proto_pooling_heads=getattr(args, 'nc_proto_pooling_heads', 4),
+        nc_proto_pooling_dropout=(
+            None if getattr(args, 'nc_proto_pooling_dropout', -1.0) < 0
+            else getattr(args, 'nc_proto_pooling_dropout', -1.0)
+        ),
+        nc_proto_pooling_residual=getattr(args, 'nc_proto_pooling_residual', True),
         lp_use_linear_predictor=getattr(args, 'lp_use_linear_predictor', False),
         lp_head_type=getattr(args, 'lp_head_type', 'standard'),
         mplp_signature_dim=getattr(args, 'mplp_signature_dim', 64),

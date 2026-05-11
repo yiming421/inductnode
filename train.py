@@ -1277,6 +1277,13 @@ def create_unified_model(args, input_dim, device):
         print(f"GraphPFN PE mode: {graphpfn_config.feature_positional_embedding}")
     elif args.predictor == 'PFN':
         # Original PFN predictor
+        if getattr(args, 'nc_proto_pooling', 'mean') != 'mean':
+            print(
+                "NC prototype pooling ablation: "
+                f"{args.nc_proto_pooling} "
+                f"(heads={getattr(args, 'nc_proto_pooling_heads', 4)}, "
+                f"residual={getattr(args, 'nc_proto_pooling_residual', True)})"
+            )
         predictor = PFNPredictorNodeCls(
             hidden, args.nhead, args.transformer_layers, args.mlp_layers,
             args.dp, args.norm, args.seperate, False, None, None, args.sim,
@@ -1293,6 +1300,13 @@ def create_unified_model(args, input_dim, device):
             # Task-specific ridge regression configuration
             nc_sim=args.nc_sim,  # Use explicit config values (have proper defaults)
             nc_ridge_alpha=args.nc_ridge_alpha,
+            nc_proto_pooling=getattr(args, 'nc_proto_pooling', 'mean'),
+            nc_proto_pooling_heads=getattr(args, 'nc_proto_pooling_heads', 4),
+            nc_proto_pooling_dropout=(
+                None if getattr(args, 'nc_proto_pooling_dropout', -1.0) < 0
+                else getattr(args, 'nc_proto_pooling_dropout', -1.0)
+            ),
+            nc_proto_pooling_residual=getattr(args, 'nc_proto_pooling_residual', True),
             lp_sim=args.lp_sim,
             lp_ridge_alpha=args.lp_ridge_alpha,
             gc_sim=args.gc_sim,
@@ -3795,6 +3809,8 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                             'normalize_views': getattr(args, 'gc_tta_normalize_views', False),
                             'use_batchnorm': getattr(args, 'use_batchnorm', False),
                             'linear_projection': getattr(args, 'gc_tta_linear_projection', False),
+                            'feature_projection': getattr(args, 'gc_tta_feature_projection', True),
+                            'edge_dropout_rate': getattr(args, 'gc_tta_edge_dropout_rate', 0.0),
                         }
 
                     task_eval_results = gc_vec_eval_fn(
@@ -3908,6 +3924,8 @@ def evaluate_graph_classification_task(model, predictor, gc_data, args, split='v
                                     'normalize_views': getattr(args, 'gc_tta_normalize_views', False),
                                     'use_batchnorm': getattr(args, 'use_batchnorm', False),
                                     'linear_projection': getattr(args, 'gc_tta_linear_projection', False),
+                                    'feature_projection': getattr(args, 'gc_tta_feature_projection', True),
+                                    'edge_dropout_rate': getattr(args, 'gc_tta_edge_dropout_rate', 0.0),
                                 }
                             task_eval_results = gc_eval_fn(
                                 gc_encoder, predictor, dataset_info, task_eval_loaders, task_idx,

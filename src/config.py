@@ -33,16 +33,16 @@ def parse_joint_training_args():
                        choices=['PureGCN_v1', 'GCN', 'UnifiedGNN', 'GraphGPS', 'FAGCN', 'SIGN'])
     parser.add_argument('--predictor', type=str, default='PFN', choices=['PFN', 'MPLP'])
     parser.add_argument('--hidden', type=int, default=128, help='Hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=4, help='Number of GNN layers')
+    parser.add_argument('--num_layers', type=int, default=6, help='Number of GNN layers')
     parser.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
-    parser.add_argument('--transformer_layers', type=int, default=3, help='Number of transformer layers')
+    parser.add_argument('--transformer_layers', type=int, default=2, help='Number of transformer layers')
     parser.add_argument('--transformer_norm_type', type=str, default='pre', choices=['pre', 'post'],
                         help='Transformer normalization type: pre-norm (default, more stable) or post-norm')
     parser.add_argument('--mlp_layers', type=int, default=2, help='Number of MLP layers')
     parser.add_argument('--ffn_expansion_ratio', type=int, default=4,
                         choices=[1, 2, 4, 8],
                         help='FFN expansion ratio: hidden_dim * expansion_ratio')
-    parser.add_argument('--dp', type=float, default=0, help='Dropout rate')
+    parser.add_argument('--dp', type=float, default=0.2, help='Dropout rate')
     parser.add_argument('--norm', type=str2bool, default=True, help='Use normalization')
     parser.add_argument('--res', type=str2bool, default=False, help='Use residual connections')
     parser.add_argument('--activation', type=str, default='relu', choices=['relu', 'gelu', 'silu'],
@@ -51,7 +51,7 @@ def parse_joint_training_args():
                         help='Legacy on/off switch for nonlinear activation in GNN layers: true applies --activation between layers, false keeps the GNN linear')
     parser.add_argument('--gnn_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in GNN norm')
     parser.add_argument('--mlp_norm_affine', type=str2bool, default=True, help='Learnable affine parameters in MLP norm')
-    parser.add_argument('--multilayer', type=str2bool, default=True, help='Use multilayer structure for GCN')
+    parser.add_argument('--multilayer', type=str2bool, default=False, help='Use multilayer structure for GCN')
     parser.add_argument('--use_gin', type=str2bool, default=False, help='Use GIN variant for GCN')
 
     # === UnifiedGNN Specific Arguments ===
@@ -100,7 +100,7 @@ def parse_joint_training_args():
     parser.add_argument('--weight_decay', type=float, default=0.0001, help='Weight decay')
     parser.add_argument('--eps', type=float, default=1e-8, help='Epsilon for optimizer (term added to denominator for numerical stability)')
     parser.add_argument('--schedule', type=str, default='cosine', choices=['cosine', 'step', 'warmup', 'none'])
-    parser.add_argument('--nc_batch_size', type=int, default=1024, help='Node classification batch size')
+    parser.add_argument('--nc_batch_size', type=int, default=2048, help='Node classification batch size')
     parser.add_argument('--lp_batch_size', type=int, default=16384, help='Link prediction batch size')
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--unseen_test_context_samples', type=int, default=3,
@@ -145,7 +145,7 @@ def parse_joint_training_args():
                         help='Optional graph-task GraphGPS attention type override')
 
     # Separate optimizers option
-    parser.add_argument('--use_separate_optimizers', type=str2bool, default=False,
+    parser.add_argument('--use_separate_optimizers', type=str2bool, default=True,
                         help='Use separate optimizers for each task with task-specific learning rates')
 
     # Task-specific learning rates (only used when use_separate_optimizers=True)
@@ -221,6 +221,15 @@ def parse_joint_training_args():
                         help='Similarity function for node classification')
     parser.add_argument('--nc_ridge_alpha', type=float, default=1.0,
                         help='Ridge regression regularization strength for node classification')
+    parser.add_argument('--nc_proto_pooling', type=str, default='mean',
+                        choices=['mean', 'attention', 'gated_attention'],
+                        help='NC-only final prototype pooling ablation after PFN refinement')
+    parser.add_argument('--nc_proto_pooling_heads', type=int, default=4,
+                        help='Number of heads for NC attention/gated-attention prototype pooling')
+    parser.add_argument('--nc_proto_pooling_dropout', type=float, default=-1.0,
+                        help='Dropout for NC prototype pooling; negative means use --dp')
+    parser.add_argument('--nc_proto_pooling_residual', type=str2bool, default=True,
+                        help='Initialize NC attention prototype pooling as a residual correction to mean pooling')
     parser.add_argument('--lp_sim', type=str, default='dot', choices=['dot', 'cos', 'euclidean', 'mlp', 'ridge'],
                         help='Similarity function for link prediction')
     parser.add_argument('--lp_ridge_alpha', type=float, default=1.0,
@@ -231,8 +240,8 @@ def parse_joint_training_args():
                         help='Ridge regression regularization strength for graph classification')
 
     parser.add_argument('--head_num_layers', type=int, default=0, help='Number of MLP layers in task-specific heads')
-    parser.add_argument('--nc_head_num_layers', type=int, default=None,
-                        help='Override head_num_layers for node classification head (default: use --head_num_layers)')
+    parser.add_argument('--nc_head_num_layers', type=int, default=0,
+                        help='Override head_num_layers for node classification head')
     parser.add_argument('--lp_head_num_layers', type=int, default=2,
                         help='Override head_num_layers for link prediction head (default: use --head_num_layers)')
     parser.add_argument('--gc_head_num_layers', type=int, default=None,
@@ -384,8 +393,9 @@ def parse_joint_training_args():
                        help='Include original graph in TTA aggregation (True) or only use augmented versions (False)')
     parser.add_argument('--tta_gate_by_valid', type=str2bool, default=True,
                        help='When TTA is enabled, only trust TTA if it improves the validation metric (per dataset)')
-    parser.add_argument('--tta_apply_input_normalization_to_views', type=str2bool, default=False,
+    parser.add_argument('--tta_apply_input_normalization_to_views', type=str2bool, default=True,
                        help='Apply the same final input normalization step as the main NC path to augmented TTA views after PCA/padding')
+    parser.add_argument('--tta_normalize_views', type=str2bool, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--tta_linear_projection', type=str2bool, default=False,
                        help='Use linear-only NC TTA projections by disabling the random activation after XW+b')
     parser.add_argument('--tta_distribution_debug', type=str2bool, default=False,
@@ -450,27 +460,27 @@ def parse_joint_training_args():
     parser.add_argument('--lp_metric', type=str, default='auto', choices=['auto', 'auc', 'acc', 'hits@20', 'hits@50', 'hits@100', 'mrr'],
                        help='Metric to use for link prediction evaluation (auto=dataset default, auc, acc, or hits@K/mrr)')
     parser.add_argument('--lp_head_type', type=str, default='mplp', choices=['standard', 'mplp', 'ncn', 'hybrid3'], help='Type of link prediction head')
-    parser.add_argument('--lp_use_test_time_augmentation', type=str2bool, default=False,
+    parser.add_argument('--lp_use_test_time_augmentation', type=str2bool, default=True,
                        help='Apply LP test-time augmentation by averaging per-edge scores across augmented feature views')
     parser.add_argument('--lp_tta_num_augmentations', type=int, default=None,
                        help='Number of LP TTA augmented views; None uses --tta_num_augmentations')
-    parser.add_argument('--lp_tta_normalize_views', type=str2bool, default=False,
+    parser.add_argument('--lp_tta_normalize_views', type=str2bool, default=True,
                        help='Normalize LP TTA augmented views after PCA using the same final normalization mode as input preprocessing')
-    parser.add_argument('--lp_tta_linear_projection', type=str2bool, default=False,
+    parser.add_argument('--lp_tta_linear_projection', type=str2bool, default=True,
                        help='Use linear-only LP TTA projections by disabling the random activation after XW+b')
     parser.add_argument('--lp_tta_context_gate', type=str2bool, default=False,
                        help='Keep only LP TTA views whose context-edge dot AUC is no worse than the original view')
     parser.add_argument('--lp_tta_context_gate_tolerance', type=float, default=0.0,
                        help='Tolerance for LP TTA context gate: keep view if context AUC + tolerance >= original context AUC')
-    parser.add_argument('--lp_tta_train_gate', type=str2bool, default=False,
+    parser.add_argument('--lp_tta_train_gate', type=str2bool, default=True,
                        help='Keep only LP TTA views that preserve Hits@K on a sampled train-edge gate set')
-    parser.add_argument('--lp_tta_train_gate_pos_samples', type=int, default=256,
+    parser.add_argument('--lp_tta_train_gate_pos_samples', type=int, default=4096,
                        help='Number of positive train edges sampled for LP TTA train gate')
     parser.add_argument('--lp_tta_train_gate_neg_ratio', type=float, default=1.0,
                        help='Negative-to-positive sample ratio for LP TTA train gate')
     parser.add_argument('--lp_tta_train_gate_hits_k', type=int, default=20,
                        help='Hits@K used by LP TTA train gate')
-    parser.add_argument('--lp_tta_train_gate_tolerance', type=float, default=0.0,
+    parser.add_argument('--lp_tta_train_gate_tolerance', type=float, default=-0.01,
                        help='Tolerance for LP TTA train gate: keep view if train-gate Hits@K + tolerance >= original')
     parser.add_argument('--lp_edge_probe_debug', type=str2bool, default=False,
                        help='Print same-view ridge probes over multiple LP edge feature maps (hadamard/invariant/symmetric/dot)')
@@ -527,16 +537,20 @@ def parse_joint_training_args():
     parser.add_argument('--graph_pooling', type=str, default='max', choices=['mean', 'max', 'sum'], help='Graph pooling method')
     parser.add_argument('--gc_metric', type=str, default='auc', choices=['auto', 'auc', 'ap', 'accuracy'],
                        help='Graph classification metric override (auto=dataset default)')
-    parser.add_argument('--gc_use_test_time_augmentation', type=str2bool, default=False,
+    parser.add_argument('--gc_use_test_time_augmentation', type=str2bool, default=True,
                        help='Apply graph classification TTA by averaging logits across augmented node-feature views')
     parser.add_argument('--gc_tta_num_augmentations', type=int, default=None,
                        help='Number of GC TTA augmented views; None uses --tta_num_augmentations')
-    parser.add_argument('--gc_tta_normalize_views', type=str2bool, default=False,
+    parser.add_argument('--gc_tta_normalize_views', type=str2bool, default=True,
                        help='Normalize GC TTA augmented node-feature views after PCA using the same final normalization mode')
     parser.add_argument('--gc_tta_linear_projection', type=str2bool, default=False,
                        help='Use linear-only GC TTA projections by disabling the random activation after XW+b')
+    parser.add_argument('--gc_tta_feature_projection', type=str2bool, default=True,
+                       help='Use random feature-projection views in GC TTA. Disable for edge-drop-only GC TTA')
+    parser.add_argument('--gc_tta_edge_dropout_rate', type=float, default=0.0,
+                       help='Per-edge dropout rate for augmented GC TTA views. The original view is unchanged')
     parser.add_argument('--lambda_gc', type=float, default=1.0, help='Weight for graph classification loss')
-    parser.add_argument('--context_graph_num', type=int, default=50, help='Number of context graphs for graph classification')
+    parser.add_argument('--context_graph_num', type=int, default=5, help='Number of context graphs for graph classification')
     parser.add_argument('--gc_multitask_vectorized', type=str2bool, default=True,
                        help='Enable vectorized multi-task prototypical GC (single BCEWithLogits over all tasks, e.g., PCBA)')
     parser.add_argument('--gc_supervised_mlp', type=str2bool, default=False,
@@ -703,6 +717,9 @@ def parse_joint_training_args():
     parser.add_argument('--graphpfn_cache_trainset', type=str2bool, default=True,
                         help='GraphPFN cache K,V for context nodes during inference (major speedup)')
     args = parser.parse_args()
+
+    if args.tta_normalize_views is not None:
+        args.tta_apply_input_normalization_to_views = args.tta_normalize_views
 
     # === Validation: Check for incompatible flag combinations ===
     if args.use_dynamic_encoder:

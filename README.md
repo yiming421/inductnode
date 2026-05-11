@@ -44,13 +44,8 @@ conda activate gnn
 # Activate conda environment
 conda activate gnn
 
-# Train GILT from scratch
-python train.py \
-  --enable_nc true \
-  --enable_lp true \
-  --enable_gc true \
-  --epochs 50 \
-  --gpu 0
+# Train GILT from scratch with the default review configuration
+python train.py
 ```
 
 ### Few-Shot Evaluation
@@ -59,17 +54,15 @@ GILT requires no tuning for new tasks. Simply provide a few labeled examples at 
 
 #### Evaluation with a Pre-trained Model
 
-If a checkpoint is available, pass its path with `--load_checkpoint`.
+Download the released checkpoint from Hugging Face, then pass its local path with `--load_checkpoint`.
 
 ```bash
-# Multi-task evaluation (all tasks)
-python train.py \
-  --use_pretrained_model true \
-  --load_checkpoint checkpoints/gilt_model.pt \
-  --enable_nc true \
-  --enable_lp true \
-  --enable_gc true \
-  --gpu 0
+# Download checkpoint
+mkdir -p checkpoints
+hf download fdsajkshf/gilt-checkpoint gilt_model.pt --local-dir checkpoints
+
+# Multi-task evaluation
+python train.py --use_pretrained_model true --load_checkpoint checkpoints/gilt_model.pt
 ```
 
 The model performs in-context learning without any parameter updates, directly inferring from few-shot examples.

@@ -342,6 +342,59 @@ def _get_node_embedding_table(dataset, task_idx, device, dataset_info=None):
     print(f"[ERROR] No node_embs found in dataset - expected under unified setting")
     return None
 
+
+def _apply_gc_tta_edge_dropout_if_needed(batch_data, dataset_info):
+    """Apply deterministic per-view undirected edge-pair dropout for GC TTA only."""
+    if not dataset_info:
+        return batch_data
+    dropout_rate = float(dataset_info.get('_gc_tta_edge_dropout_rate', 0.0) or 0.0)
+    if dropout_rate <= 0.0 or not hasattr(batch_data, 'edge_index') or batch_data.edge_index is None:
+        return batch_data
+    dropout_rate = min(max(dropout_rate, 0.0), 1.0)
+
+    edge_index = batch_data.edge_index
+    num_edges = edge_index.size(1)
+    if num_edges == 0:
+        return batch_data
+
+    row, col = edge_index[0], edge_index[1]
+    lo = torch.minimum(row, col)
+    hi = torch.maximum(row, col)
+    pair_key = lo * int(batch_data.num_nodes) + hi
+    unique_key, inverse = torch.unique(pair_key, sorted=False, return_inverse=True)
+    num_pairs = unique_key.numel()
+    if num_pairs == 0:
+        return batch_data
+
+    base_seed = int(dataset_info.get('_gc_tta_edge_dropout_seed', 0) or 0)
+    counter = int(dataset_info.get('_gc_tta_edge_dropout_counter', 0) or 0)
+    dataset_info['_gc_tta_edge_dropout_counter'] = counter + 1
+    seed = base_seed + counter
+
+    devices = []
+    if edge_index.is_cuda:
+        devices = [edge_index.device.index if edge_index.device.index is not None else torch.cuda.current_device()]
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        pair_keep = torch.rand(num_pairs, device=edge_index.device) > dropout_rate
+        if not pair_keep.any():
+            pair_keep[torch.randint(num_pairs, (1,), device=edge_index.device)] = True
+        keep_mask = pair_keep[inverse]
+
+    stats = dataset_info.setdefault('_gc_tta_edge_dropout_stats', [])
+    stats.append((
+        int(num_pairs),
+        int(pair_keep.sum().item()),
+        int(num_edges),
+        int(keep_mask.sum().item()),
+    ))
+
+    batch_data = batch_data.clone()
+    batch_data.edge_index = edge_index[:, keep_mask]
+    if hasattr(batch_data, 'edge_attr') and batch_data.edge_attr is not None:
+        batch_data.edge_attr = batch_data.edge_attr[keep_mask]
+    return batch_data
+
 # ---- ADDED: safe lookup helper to prevent silent CUDA device-side asserts ----
 def _safe_lookup_node_embeddings_micro_optimized(node_emb_table: torch.Tensor, x: torch.Tensor, context: str="",
                                                 batch_data=None, dataset_info=None) -> torch.Tensor:
@@ -799,6 +852,7 @@ def _create_context_embeddings_computed(model, context_structure, dataset, task_
         else:
             x_input = batch_data.x
         
+        batch_data = _apply_gc_tta_edge_dropout_if_needed(batch_data, dataset_info)
         batch_data.adj_t = SparseTensor.from_edge_index(
             batch_data.edge_index,
             sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
@@ -960,6 +1014,7 @@ def _create_all_task_context_embeddings(model, context_structure, dataset, pooli
         else:
             x_input = batch_data.x
 
+        batch_data = _apply_gc_tta_edge_dropout_if_needed(batch_data, dataset_info)
         batch_data.adj_t = SparseTensor.from_edge_index(
             batch_data.edge_index,
             sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
@@ -1283,6 +1338,7 @@ def _create_multitask_context_embeddings(model, context_structure, dataset, pool
         else:
             x_input = batch_data.x
 
+        batch_data = _apply_gc_tta_edge_dropout_if_needed(batch_data, dataset_info)
         batch_data.adj_t = SparseTensor.from_edge_index(
             batch_data.edge_index,
             sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
@@ -2086,6 +2142,7 @@ def evaluate_graph_classification_multitask_vectorized(model, predictor, dataset
             else:
                 x_input = batch_data.x
 
+            batch_data = _apply_gc_tta_edge_dropout_if_needed(batch_data, dataset_info)
             batch_data.adj_t = SparseTensor.from_edge_index(
                 batch_data.edge_index,
                 sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
@@ -2183,7 +2240,7 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
     pooling_method='mean', device='cuda', normalize_class_h=True,
     dataset_name=None, identity_projection=None, args=None,
     num_augmentations=5, normalize_views=False, use_batchnorm=False,
-    linear_projection=False,
+    linear_projection=False, feature_projection=True, edge_dropout_rate=0.0,
 ):
     """
     Minimal vectorized GC TTA for multitask datasets such as PCBA.
@@ -2195,6 +2252,14 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
     original_override = dataset_info.get('_gc_tta_node_embs_override', None)
     dataset_name = dataset_name or getattr(dataset, 'name', 'unknown')
     num_augmentations = 5 if num_augmentations is None else int(num_augmentations)
+    edge_dropout_rate = min(max(float(edge_dropout_rate or 0.0), 0.0), 1.0)
+    feature_projection = bool(feature_projection)
+    edge_override_keys = (
+        '_gc_tta_edge_dropout_rate',
+        '_gc_tta_edge_dropout_seed',
+        '_gc_tta_edge_dropout_counter',
+    )
+    original_edge_overrides = {k: dataset_info[k] for k in edge_override_keys if k in dataset_info}
 
     def _select_source_table():
         if 'fug_mapping' in dataset_info and dataset_info['fug_mapping'] and 'node_embs' in dataset_info['fug_mapping']:
@@ -2204,7 +2269,7 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
         return None
 
     source_table = _select_source_table()
-    if source_table is None:
+    if feature_projection and source_table is None:
         print(f"[GC_TTA_VEC] {dataset_name}: no node embedding table found, falling back to vectorized eval")
         return evaluate_graph_classification_multitask_vectorized(
             model, predictor, dataset_info, data_loaders,
@@ -2213,31 +2278,34 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
             identity_projection=identity_projection, args=args,
         )
 
-    source_table = source_table.detach().cpu()
-    target_dim = source_table.size(1)
-    view_tables = [None]
+    source_table = source_table.detach().cpu() if source_table is not None else None
+    target_dim = source_table.size(1) if source_table is not None else None
+    view_specs = [{'table': None, 'edge_rate': 0.0, 'seed': 0}]
     for aug_idx in range(num_augmentations):
         seed = 999000 + aug_idx
-        aug_data = apply_random_projection_augmentation(
-            Data(x=source_table),
-            activation_pool=['identity'] if linear_projection else None,
-            seed=seed,
-            verbose=False,
-            rank=0,
-            max_hidden_dim=target_dim,
-        )
-        q = min(target_dim, aug_data.x.size(0), aug_data.x.size(1))
-        U, S, _ = torch.pca_lowrank(aug_data.x, q=q)
-        x_aug = torch.mm(U, torch.diag(S))
-        if x_aug.size(1) < target_dim:
-            pad = torch.zeros(x_aug.size(0), target_dim - x_aug.size(1), dtype=x_aug.dtype)
-            x_aug = torch.cat([x_aug, pad], dim=1)
-        if normalize_views:
-            if use_batchnorm:
-                x_aug = (x_aug - x_aug.mean(dim=0, keepdim=True)) / (x_aug.std(dim=0, keepdim=True, unbiased=False) + 1e-5)
-            else:
-                x_aug = F.normalize(x_aug, p=2, dim=1)
-        view_tables.append(x_aug.detach().cpu())
+        table = None
+        if feature_projection:
+            aug_data = apply_random_projection_augmentation(
+                Data(x=source_table),
+                activation_pool=['identity'] if linear_projection else None,
+                seed=seed,
+                verbose=False,
+                rank=0,
+                max_hidden_dim=target_dim,
+            )
+            q = min(target_dim, aug_data.x.size(0), aug_data.x.size(1))
+            U, S, _ = torch.pca_lowrank(aug_data.x, q=q)
+            x_aug = torch.mm(U, torch.diag(S))
+            if x_aug.size(1) < target_dim:
+                pad = torch.zeros(x_aug.size(0), target_dim - x_aug.size(1), dtype=x_aug.dtype)
+                x_aug = torch.cat([x_aug, pad], dim=1)
+            if normalize_views:
+                if use_batchnorm:
+                    x_aug = (x_aug - x_aug.mean(dim=0, keepdim=True)) / (x_aug.std(dim=0, keepdim=True, unbiased=False) + 1e-5)
+                else:
+                    x_aug = F.normalize(x_aug, p=2, dim=1)
+            table = x_aug.detach().cpu()
+        view_specs.append({'table': table, 'edge_rate': edge_dropout_rate, 'seed': seed})
 
     sample_graph = dataset[0]
     num_tasks = sample_graph.y.numel()
@@ -2250,11 +2318,16 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
 
     try:
         view_results = []
-        for table in view_tables:
+        for view_idx, view_spec in enumerate(view_specs):
+            table = view_spec['table']
             if table is None:
                 dataset_info.pop('_gc_tta_node_embs_override', None)
             else:
                 dataset_info['_gc_tta_node_embs_override'] = table
+            dataset_info['_gc_tta_edge_dropout_rate'] = view_spec['edge_rate']
+            dataset_info['_gc_tta_edge_dropout_seed'] = int(view_spec['seed']) + 7919 * view_idx
+            dataset_info['_gc_tta_edge_dropout_counter'] = 0
+            dataset_info['_gc_tta_edge_dropout_stats'] = []
             view_results.append(evaluate_graph_classification_multitask_vectorized(
                 model, predictor, dataset_info, data_loaders,
                 pooling_method=pooling_method, device=device,
@@ -2262,6 +2335,16 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
                 identity_projection=identity_projection, args=args,
                 return_logits=True,
             ))
+            stats = dataset_info.get('_gc_tta_edge_dropout_stats', [])
+            if stats and view_spec['edge_rate'] > 0:
+                pairs_total = sum(s[0] for s in stats)
+                pairs_kept = sum(s[1] for s in stats)
+                edges_total = sum(s[2] for s in stats)
+                edges_kept = sum(s[3] for s in stats)
+                if pairs_total > 0:
+                    view_results[-1]['_edge_pair_keep_frac'] = pairs_kept / pairs_total
+                if edges_total > 0:
+                    view_results[-1]['_edge_entry_keep_frac'] = edges_kept / edges_total
 
         results = {}
         for split_name in ['train', 'val', 'test']:
@@ -2299,12 +2382,15 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
             ]
             agg_metric = results[shown_split]
             agg_display = agg_metric.get('auc', agg_metric.get('ap', next(iter(agg_metric.values())))) if isinstance(agg_metric, dict) else agg_metric
+            edge_keeps = [r.get('_edge_pair_keep_frac') for r in view_results[1:] if r.get('_edge_pair_keep_frac') is not None]
+            edge_keep_text = f" edge_pair_keep={sum(edge_keeps) / len(edge_keeps):.3f}" if edge_keeps else ""
             print(
                 f"[GC_TTA_VEC] {dataset_name} split={shown_split}: "
                 f"original={display_metrics[0]:.4f} "
                 f"mean_view={sum(display_metrics) / len(display_metrics):.4f} "
                 f"agg={agg_display:.4f} views={len(view_results)} "
-                f"norm_views={normalize_views} linear_proj={linear_projection}"
+                f"norm_views={normalize_views} linear_proj={linear_projection} "
+                f"feature_proj={feature_projection} edge_drop={edge_dropout_rate:.3f}{edge_keep_text}"
             )
         return results
     finally:
@@ -2312,6 +2398,12 @@ def evaluate_graph_classification_multitask_vectorized_with_tta(
             dataset_info['_gc_tta_node_embs_override'] = original_override
         else:
             dataset_info.pop('_gc_tta_node_embs_override', None)
+        for key in edge_override_keys:
+            if key in original_edge_overrides:
+                dataset_info[key] = original_edge_overrides[key]
+            else:
+                dataset_info.pop(key, None)
+        dataset_info.pop('_gc_tta_edge_dropout_stats', None)
 
 
 def prepare_pfn_data_structure(context_embeddings, context_labels, num_classes, device='cuda'):
@@ -3090,6 +3182,7 @@ def evaluate_graph_classification_single_task(model, predictor, dataset_info, da
             # Apply feature dropout AFTER projection (evaluation doesn't need dropout but kept for consistency)
             # x_input = apply_feature_dropout_if_enabled(x_input, args, rank=0)  # Commented out for evaluation
 
+            batch_data = _apply_gc_tta_edge_dropout_if_needed(batch_data, dataset_info)
             batch_data.adj_t = SparseTensor.from_edge_index(
                 batch_data.edge_index,
                 sparse_sizes=(batch_data.num_nodes, batch_data.num_nodes)
@@ -3279,7 +3372,7 @@ def evaluate_graph_classification_single_task_with_tta(
     pooling_method='mean', device='cuda', normalize_class_h=True,
     dataset_name=None, identity_projection=None, context_k=None, args=None,
     num_augmentations=5, normalize_views=False, use_batchnorm=False,
-    linear_projection=False,
+    linear_projection=False, feature_projection=True, edge_dropout_rate=0.0,
 ):
     """
     Minimal regular-path GC TTA for a single task.
@@ -3291,6 +3384,14 @@ def evaluate_graph_classification_single_task_with_tta(
     original_override = dataset_info.get('_gc_tta_node_embs_override', None)
     dataset_name = dataset_name or getattr(dataset, 'name', 'unknown')
     num_augmentations = 5 if num_augmentations is None else int(num_augmentations)
+    edge_dropout_rate = min(max(float(edge_dropout_rate or 0.0), 0.0), 1.0)
+    feature_projection = bool(feature_projection)
+    edge_override_keys = (
+        '_gc_tta_edge_dropout_rate',
+        '_gc_tta_edge_dropout_seed',
+        '_gc_tta_edge_dropout_counter',
+    )
+    original_edge_overrides = {k: dataset_info[k] for k in edge_override_keys if k in dataset_info}
 
     def _select_source_table():
         if 'fug_mapping' in dataset_info and dataset_info['fug_mapping'] and 'node_embs' in dataset_info['fug_mapping']:
@@ -3300,7 +3401,7 @@ def evaluate_graph_classification_single_task_with_tta(
         return None
 
     source_table = _select_source_table()
-    if source_table is None:
+    if feature_projection and source_table is None:
         print(f"[GC_TTA] {dataset_name}: no node embedding table found, falling back to regular eval")
         return evaluate_graph_classification_single_task(
             model, predictor, dataset_info, data_loaders, task_idx,
@@ -3309,31 +3410,34 @@ def evaluate_graph_classification_single_task_with_tta(
             identity_projection=identity_projection, context_k=context_k, args=args
         )
 
-    source_table = source_table.detach().cpu()
-    target_dim = source_table.size(1)
-    view_tables = [None]
+    source_table = source_table.detach().cpu() if source_table is not None else None
+    target_dim = source_table.size(1) if source_table is not None else None
+    view_specs = [{'table': None, 'edge_rate': 0.0, 'seed': 0}]
     for aug_idx in range(num_augmentations):
         seed = 999000 + task_idx * 1000 + aug_idx
-        aug_data = apply_random_projection_augmentation(
-            Data(x=source_table),
-            activation_pool=['identity'] if linear_projection else None,
-            seed=seed,
-            verbose=False,
-            rank=0,
-            max_hidden_dim=target_dim,
-        )
-        q = min(target_dim, aug_data.x.size(0), aug_data.x.size(1))
-        U, S, _ = torch.pca_lowrank(aug_data.x, q=q)
-        x_aug = torch.mm(U, torch.diag(S))
-        if x_aug.size(1) < target_dim:
-            pad = torch.zeros(x_aug.size(0), target_dim - x_aug.size(1), dtype=x_aug.dtype)
-            x_aug = torch.cat([x_aug, pad], dim=1)
-        if normalize_views:
-            if use_batchnorm:
-                x_aug = (x_aug - x_aug.mean(dim=0, keepdim=True)) / (x_aug.std(dim=0, keepdim=True, unbiased=False) + 1e-5)
-            else:
-                x_aug = F.normalize(x_aug, p=2, dim=1)
-        view_tables.append(x_aug.detach().cpu())
+        table = None
+        if feature_projection:
+            aug_data = apply_random_projection_augmentation(
+                Data(x=source_table),
+                activation_pool=['identity'] if linear_projection else None,
+                seed=seed,
+                verbose=False,
+                rank=0,
+                max_hidden_dim=target_dim,
+            )
+            q = min(target_dim, aug_data.x.size(0), aug_data.x.size(1))
+            U, S, _ = torch.pca_lowrank(aug_data.x, q=q)
+            x_aug = torch.mm(U, torch.diag(S))
+            if x_aug.size(1) < target_dim:
+                pad = torch.zeros(x_aug.size(0), target_dim - x_aug.size(1), dtype=x_aug.dtype)
+                x_aug = torch.cat([x_aug, pad], dim=1)
+            if normalize_views:
+                if use_batchnorm:
+                    x_aug = (x_aug - x_aug.mean(dim=0, keepdim=True)) / (x_aug.std(dim=0, keepdim=True, unbiased=False) + 1e-5)
+                else:
+                    x_aug = F.normalize(x_aug, p=2, dim=1)
+            table = x_aug.detach().cpu()
+        view_specs.append({'table': table, 'edge_rate': edge_dropout_rate, 'seed': seed})
 
     sample_graph = dataset[0]
     metric_type = get_dataset_metric(
@@ -3345,11 +3449,16 @@ def evaluate_graph_classification_single_task_with_tta(
 
     try:
         view_results = []
-        for table in view_tables:
+        for view_idx, view_spec in enumerate(view_specs):
+            table = view_spec['table']
             if table is None:
                 dataset_info.pop('_gc_tta_node_embs_override', None)
             else:
                 dataset_info['_gc_tta_node_embs_override'] = table
+            dataset_info['_gc_tta_edge_dropout_rate'] = view_spec['edge_rate']
+            dataset_info['_gc_tta_edge_dropout_seed'] = int(view_spec['seed']) + 7919 * view_idx
+            dataset_info['_gc_tta_edge_dropout_counter'] = 0
+            dataset_info['_gc_tta_edge_dropout_stats'] = []
             view_results.append(evaluate_graph_classification_single_task(
                 model, predictor, dataset_info, data_loaders, task_idx,
                 pooling_method=pooling_method, device=device,
@@ -3357,6 +3466,16 @@ def evaluate_graph_classification_single_task_with_tta(
                 identity_projection=identity_projection, context_k=context_k,
                 args=args, return_logits=True
             ))
+            stats = dataset_info.get('_gc_tta_edge_dropout_stats', [])
+            if stats and view_spec['edge_rate'] > 0:
+                pairs_total = sum(s[0] for s in stats)
+                pairs_kept = sum(s[1] for s in stats)
+                edges_total = sum(s[2] for s in stats)
+                edges_kept = sum(s[3] for s in stats)
+                if pairs_total > 0:
+                    view_results[-1]['_edge_pair_keep_frac'] = pairs_kept / pairs_total
+                if edges_total > 0:
+                    view_results[-1]['_edge_entry_keep_frac'] = edges_kept / edges_total
 
         results = {}
         for split_name in data_loaders.keys():
@@ -3383,12 +3502,15 @@ def evaluate_graph_classification_single_task_with_tta(
             ]
             agg_metric = results[shown_split]
             agg_display = agg_metric.get('auc', agg_metric.get('ap', next(iter(agg_metric.values())))) if isinstance(agg_metric, dict) else agg_metric
+            edge_keeps = [r.get('_edge_pair_keep_frac') for r in view_results[1:] if r.get('_edge_pair_keep_frac') is not None]
+            edge_keep_text = f" edge_pair_keep={sum(edge_keeps) / len(edge_keeps):.3f}" if edge_keeps else ""
             print(
                 f"[GC_TTA] {dataset_name} task={task_idx} split={shown_split}: "
                 f"original={display_metrics[0]:.4f} "
                 f"mean_view={sum(display_metrics) / len(display_metrics):.4f} "
                 f"agg={agg_display:.4f} views={len(view_results)} "
-                f"norm_views={normalize_views} linear_proj={linear_projection}"
+                f"norm_views={normalize_views} linear_proj={linear_projection} "
+                f"feature_proj={feature_projection} edge_drop={edge_dropout_rate:.3f}{edge_keep_text}"
             )
         return results
     finally:
@@ -3396,6 +3518,12 @@ def evaluate_graph_classification_single_task_with_tta(
             dataset_info['_gc_tta_node_embs_override'] = original_override
         else:
             dataset_info.pop('_gc_tta_node_embs_override', None)
+        for key in edge_override_keys:
+            if key in original_edge_overrides:
+                dataset_info[key] = original_edge_overrides[key]
+            else:
+                dataset_info.pop(key, None)
+        dataset_info.pop('_gc_tta_edge_dropout_stats', None)
 
 
 def train_and_evaluate_graph_classification(model, predictor, train_datasets, train_processed_data_list, args, 
