@@ -105,9 +105,13 @@ def parse_joint_training_args():
     parser.add_argument('--test_batch_size', type=int, default=16384, help='Test batch size')
     parser.add_argument('--unseen_test_context_samples', type=int, default=3,
                         help='Average unseen NC test metrics over N random few-shot context resamples (>=1)')
-    parser.add_argument('--unseen_test_context_seed_mode', type=str, default='per_run',
+    parser.add_argument('--unseen_test_context_seed_mode', type=str, default='fixed',
                         choices=['per_run', 'fixed'],
-                        help='Seed policy for unseen-test context resampling: per_run=independent each run, fixed=reuse --seed')
+                        help='Seed policy for unseen-test context resampling: per_run=independent each run, fixed=deterministic per run from --seed')
+    parser.add_argument('--unseen_test_context_seed_base', type=int, default=None,
+                        help='Explicit seed base for unseen-test context resampling; overrides --unseen_test_context_seed_mode when set')
+    parser.add_argument('--unseen_test_context_seed_bases', type=str, default=None,
+                        help='Comma-separated seed bases, one per run, for exact unseen-test context reproduction; overridden by --unseen_test_context_seed_base')
     parser.add_argument('--clip_grad', type=float, default=1.0, help='Gradient clipping')
     
     # === Joint Training Specific ===
@@ -396,7 +400,7 @@ def parse_joint_training_args():
     parser.add_argument('--tta_apply_input_normalization_to_views', type=str2bool, default=True,
                        help='Apply the same final input normalization step as the main NC path to augmented TTA views after PCA/padding')
     parser.add_argument('--tta_normalize_views', type=str2bool, default=None, help=argparse.SUPPRESS)
-    parser.add_argument('--tta_linear_projection', type=str2bool, default=False,
+    parser.add_argument('--tta_linear_projection', type=str2bool, default=True,
                        help='Use linear-only NC TTA projections by disabling the random activation after XW+b')
     parser.add_argument('--tta_distribution_debug', type=str2bool, default=False,
                        help='Print concise terminal diagnostics explaining how NC TTA aggregation changes true-class probability distributions')

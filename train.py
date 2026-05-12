@@ -57,6 +57,14 @@ from src.config import parse_joint_training_args
 from src.checkpoint_utils import load_checkpoint_config, override_args_from_checkpoint, load_checkpoint_states, save_checkpoint
 
 
+REPORTED_CONTEXT_SEED_BASES = "378323818,1058536330,665380492,915013419,1634403476"
+
+
+def _cli_option_supplied(option_name):
+    prefix = f"{option_name}="
+    return any(arg == option_name or arg.startswith(prefix) for arg in sys.argv[1:])
+
+
 def _select_primary_metric(metric_dict, override=None, prefer='auc'):
     if not isinstance(metric_dict, dict):
         return metric_dict
@@ -69,15 +77,54 @@ def _select_primary_metric(metric_dict, override=None, prefer='auc'):
     return metric_dict.get('auc', metric_dict.get('ap', next(iter(metric_dict.values()))))
 
 
+def _parse_unseen_test_context_seed_bases(args):
+    raw = getattr(args, 'unseen_test_context_seed_bases', None)
+    if raw is None or str(raw).strip() == '':
+        return None
+
+    cached = getattr(args, '_unseen_test_context_seed_bases_parsed', None)
+    if cached is not None:
+        return cached
+
+    try:
+        seeds = [int(part.strip()) for part in str(raw).split(',') if part.strip()]
+    except ValueError as exc:
+        raise ValueError(
+            "--unseen_test_context_seed_bases must be a comma-separated list of integers"
+        ) from exc
+
+    if not seeds:
+        return None
+
+    setattr(args, '_unseen_test_context_seed_bases_parsed', seeds)
+    return seeds
+
+
 def _get_unseen_test_context_seed_base(args):
     """
     Return a seed base for unseen-test context resampling.
-    - fixed: reuse args.seed (fully reproducible across runs)
+    - explicit override: use args.unseen_test_context_seed_base when provided
+    - explicit list: use the run-indexed seed from args.unseen_test_context_seed_bases
+    - fixed: reuse the deterministic seed for the current run
     - per_run: derive once from OS entropy and cache on args (different each run)
     """
+    explicit_seed = getattr(args, 'unseen_test_context_seed_base', None)
+    if explicit_seed is not None:
+        return int(explicit_seed)
+
+    explicit_seed_list = _parse_unseen_test_context_seed_bases(args)
+    if explicit_seed_list is not None:
+        run_idx = int(getattr(args, '_current_run_idx', 0))
+        if run_idx >= len(explicit_seed_list):
+            raise ValueError(
+                f"--unseen_test_context_seed_bases provides {len(explicit_seed_list)} seeds "
+                f"but run index {run_idx + 1} was requested"
+            )
+        return int(explicit_seed_list[run_idx])
+
     mode = str(getattr(args, 'unseen_test_context_seed_mode', 'per_run')).lower()
     if mode == 'fixed':
-        return int(getattr(args, 'seed', 42))
+        return int(getattr(args, '_current_run_seed', getattr(args, 'seed', 42)))
     if mode != 'per_run':
         print(f"[Unseen Test Context] Unknown seed mode '{mode}', defaulting to 'per_run'")
 
@@ -5429,6 +5476,23 @@ def main():
     # Parse arguments
     args = parse_joint_training_args()
 
+    # Keep the public checkpoint-evaluation command short while preserving the
+    # exact context samples used for the reported review numbers. Explicit CLI
+    # values always win.
+    if args.use_pretrained_model and args.load_checkpoint is not None:
+        if not _cli_option_supplied('--runs'):
+            args.runs = len(REPORTED_CONTEXT_SEED_BASES.split(','))
+        seed_options_supplied = any(
+            _cli_option_supplied(option_name)
+            for option_name in (
+                '--unseen_test_context_seed_base',
+                '--unseen_test_context_seed_bases',
+                '--unseen_test_context_seed_mode',
+            )
+        )
+        if not seed_options_supplied:
+            args.unseen_test_context_seed_bases = REPORTED_CONTEXT_SEED_BASES
+
     # Set all random seeds for reproducible results
     set_all_random_seeds(args.seed)
     
@@ -5524,6 +5588,8 @@ def main():
 
         # Set different seed for each run with all generators
         run_seed = args.seed + run
+        args._current_run_idx = run
+        args._current_run_seed = run_seed
         set_all_random_seeds(run_seed)
 
         nc_result, lp_result, gc_result, nc_individual, lp_individual, gc_individual = run_joint_training(args, device)
