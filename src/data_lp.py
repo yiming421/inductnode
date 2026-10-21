@@ -1,66 +1,32 @@
-from torch_geometric.datasets import Planetoid, Coauthor, Amazon, Flickr, Airports, AttributedGraphDataset, CitationFull, FacebookPagePage, WikiCS, Reddit, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, Twitch
-from src.dataset_twitch import TwitchFixed
+from torch_geometric.datasets import Planetoid, Coauthor, Amazon, Flickr, Airports, AttributedGraphDataset, CitationFull, FacebookPagePage, WikiCS, Actor, DeezerEurope, LastFMAsia
 from torch_geometric.utils import to_undirected
 from torch_geometric import transforms
 from torch_sparse import SparseTensor
 from ogb.linkproppred import PygLinkPropPredDataset
 from ogb.nodeproppred import PygNodePropPredDataset
-from src.projection_methods import generate_orthogonal_noise_features
 import torch
 import numpy as np
 import os
-
-# Fix for PyTorch 2.6+ weights_only=True default
-# Add PyTorch Geometric data classes and numpy functions to safe globals for torch.load
 try:
     from torch_geometric.data.data import Data as TorchGeometricData
-    torch.serialization.add_safe_globals([
-        TorchGeometricData,
-        np.core.multiarray._reconstruct,
-        np.ndarray,
-        np.dtype
-    ])
+    torch.serialization.add_safe_globals([TorchGeometricData, np.core.multiarray._reconstruct, np.ndarray, np.dtype])
 except (ImportError, AttributeError):
-    # Fallback for older PyTorch versions or if add_safe_globals doesn't exist
     pass
-
-# Get the absolute path to the dataset directory
-# This file is in inductnode/src/, so we go up two levels to get to the inductnode root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATASET_ROOT = os.path.join(PROJECT_ROOT, 'dataset')
-ORTHOGONAL_NOISE_DEFAULT_DIM = 128
-ORTHOGONAL_NOISE_OGBL_DATASETS = {'ogbl-ddi', 'ogbl-ppa'}
-
-
-def _init_orthogonal_noise_features(data, dataset_name, device='cpu', feature_dim=ORTHOGONAL_NOISE_DEFAULT_DIM):
-    """Initialize node features with orthogonal noise for featureless/ablation LP datasets."""
-    target_device = torch.device(device)
-    data.x = generate_orthogonal_noise_features(
-        num_nodes=int(data.num_nodes),
-        target_dim=int(feature_dim),
-        seed=42,
-        device=target_device,
-        dtype=torch.float32,
-        rank=0,
-    )
-    data.uses_orthogonal_noise_init = True
-    data.orthogonal_noise_dataset = dataset_name
-    data.orthogonal_noise_dim = int(feature_dim)
+DATASET_ROOT = os.environ.get('GILT_DATA_ROOT', os.path.join(PROJECT_ROOT, 'dataset'))
 
 def safe_load_dataset(dataset_class, **kwargs):
     """Safely load PyTorch Geometric datasets with proper error handling."""
     try:
         return dataset_class(**kwargs)
     except Exception as e:
-        if "weights_only" in str(e) or "WeightsUnpickler" in str(e):
-            # For PyTorch 2.6+ compatibility, we need to allow PyG data types
-            # Try to temporarily patch torch.load if needed
+        if 'weights_only' in str(e) or 'WeightsUnpickler' in str(e):
             original_load = torch.load
+
             def patched_load(*args, **kwargs):
                 if 'weights_only' not in kwargs:
                     kwargs['weights_only'] = False
                 return original_load(*args, **kwargs)
-            
             torch.load = patched_load
             try:
                 result = dataset_class(**kwargs)
@@ -75,14 +41,13 @@ def safe_get_edge_split(dataset):
     try:
         return dataset.get_edge_split()
     except Exception as e:
-        if "weights_only" in str(e) or "WeightsUnpickler" in str(e):
-            # For PyTorch 2.6+ compatibility, patch torch.load temporarily
+        if 'weights_only' in str(e) or 'WeightsUnpickler' in str(e):
             original_load = torch.load
+
             def patched_load(*args, **kwargs):
                 if 'weights_only' not in kwargs:
                     kwargs['weights_only'] = False
                 return original_load(*args, **kwargs)
-            
             torch.load = patched_load
             try:
                 result = dataset.get_edge_split()
@@ -93,25 +58,11 @@ def safe_get_edge_split(dataset):
             raise e
 
 def random_split_edges(data, val_ratio=0.1, test_ratio=0.2):
-    # Ensure data is on the correct device before split
     device = data.x.device if hasattr(data, 'x') and data.x is not None else 'cpu'
-    
-    # Move edge_index to the same device as node features
     if hasattr(data, 'edge_index'):
         data.edge_index = to_undirected(data.edge_index).to(device)
-    
-    # Use RandomLinkSplit transform
-    transform = transforms.RandomLinkSplit(
-        num_val=val_ratio, 
-        num_test=test_ratio,
-        is_undirected=True,
-        add_negative_train_samples=False,  # We don't need negative training samples here
-        neg_sampling_ratio=1.0  # 1:1 ratio for validation and test negative samples
-    )
-    
-    # Apply the transform
+    transform = transforms.RandomLinkSplit(num_val=val_ratio, num_test=test_ratio, is_undirected=True, add_negative_train_samples=False, neg_sampling_ratio=1.0)
     train_data, val_data, test_data = transform(data)
-
     split_edge = {'train': {}, 'valid': {}, 'test': {}}
     split_edge['train']['edge'] = train_data.edge_label_index.t()[train_data.edge_label == 1]
     split_edge['valid']['edge'] = val_data.edge_label_index.t()[val_data.edge_label == 1]
@@ -142,36 +93,20 @@ def load_data(dataset, device='cpu', is_pretraining=False):
         dataset = safe_load_dataset(PygNodePropPredDataset, name=dataset, root=DATASET_ROOT)
     elif dataset == 'WikiCS':
         dataset = safe_load_dataset(WikiCS, root=os.path.join(DATASET_ROOT, 'WikiCS'))
-    elif dataset == 'Reddit':
-        dataset = safe_load_dataset(Reddit, root=os.path.join(DATASET_ROOT, 'Reddit'))
-    elif dataset in ['Cornell', 'Texas', 'Wisconsin']:
-        dataset = safe_load_dataset(WebKB, root=os.path.join(DATASET_ROOT, 'WebKB'), name=dataset)
-    elif dataset in ['Chameleon', 'Squirrel']:
-        dataset = safe_load_dataset(WikipediaNetwork, root=os.path.join(DATASET_ROOT, 'WikipediaNetwork'), name=dataset)
     elif dataset == 'Actor':
         dataset = safe_load_dataset(Actor, root=os.path.join(DATASET_ROOT, 'Actor'))
     elif dataset == 'DeezerEurope':
         dataset = safe_load_dataset(DeezerEurope, root=os.path.join(DATASET_ROOT, 'DeezerEurope'))
     elif dataset == 'LastFMAsia':
         dataset = safe_load_dataset(LastFMAsia, root=os.path.join(DATASET_ROOT, 'LastFMAsia'))
-    elif dataset.startswith('Twitch'):
-        region = dataset.split('-')[1]
-        # Load Twitch dataset with the specified region using local SNAP-based loader
-        dataset = safe_load_dataset(TwitchFixed, root=os.path.join(DATASET_ROOT, 'Twitch'), name=region)
     else:
-        raise ValueError(f"Dataset {dataset} not supported in load_data")
-    
+        raise ValueError(f'Dataset {dataset} not supported in load_data')
     data = dataset[0]
-    
-    # Move data to device before calling random_split_edges
     if hasattr(data, 'x') and data.x is not None:
         data.x = data.x.to(device)
     if hasattr(data, 'edge_index'):
         data.edge_index = data.edge_index.to(device)
-    
     split_edge = random_split_edges(data)
-    
-    # Only combine train and test edges during pretraining for maximum data utilization
     if is_pretraining:
         train_edges = split_edge['train']['edge']
         test_edges = split_edge['test']['edge']
@@ -179,80 +114,43 @@ def load_data(dataset, device='cpu', is_pretraining=False):
         split_edge['train']['edge'] = combined_edges
         data.edge_index = to_undirected(combined_edges.t())
     else:
-        # Use only training edges for regular training
         data.edge_index = to_undirected(split_edge['train']['edge'].t())
-    #data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
     data.num_nodes = data.x.shape[0]
     data.edge_weight = None
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce().to(device)
     data.name = name
-    data.default_metric = "hits@100"
-    return data, split_edge
+    data.default_metric = 'hits@100'
+    return (data, split_edge)
 
-def load_ogbl_data(dataset_name, device='cpu'): 
+def load_ogbl_data(dataset_name, device='cpu'):
     name_d = dataset_name
     dataset = safe_load_dataset(PygLinkPropPredDataset, name=dataset_name, root=DATASET_ROOT)
     data = dataset[0]
-    # data.edge_index = add_self_loops(data.edge_index, num_nodes=data.num_nodes)[0]
     data.edge_weight = None
-    
-    # Move data to device
     if hasattr(data, 'x') and data.x is not None:
         data.x = data.x.to(device)
     if hasattr(data, 'edge_index'):
         data.edge_index = data.edge_index.to(device)
-
     data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes))
     data.adj_t = data.adj_t.to_symmetric().coalesce().to(device)
     split_edge = safe_get_edge_split(dataset)
     if dataset_name == 'ogbl-collab':
-        selected_year_index = torch.reshape(
-            (split_edge['train']['year'] >= 2011).nonzero(as_tuple=False), (-1,))
+        selected_year_index = torch.reshape((split_edge['train']['year'] >= 2011).nonzero(as_tuple=False), (-1,))
         split_edge['train']['edge'] = split_edge['train']['edge'][selected_year_index]
         split_edge['train']['weight'] = split_edge['train']['weight'][selected_year_index]
         split_edge['train']['year'] = split_edge['train']['year'][selected_year_index]
-
         data.edge_index = to_undirected(split_edge['train']['edge'].t()).to(device)
-        # data.edge_index = add_self_loops(edge, num_nodes=data.num_nodes)[0]
         data.adj_t = SparseTensor.from_edge_index(data.edge_index, sparse_sizes=(data.num_nodes, data.num_nodes)).to(device)
-
         full_edge_index = torch.cat([split_edge['valid']['edge'].t(), split_edge['train']['edge'].t()], dim=-1)
         full_edge_index = to_undirected(full_edge_index).to(device)
-        # full_edge_index = add_self_loops(full_edge_index, num_nodes=data.num_nodes)[0]
         data.full_adj_t = SparseTensor.from_edge_index(full_edge_index, sparse_sizes=(data.num_nodes, data.num_nodes)).to(device)
-    if dataset_name == 'ogbl-citation2':
-        for name in ['train','valid','test']:
-            u=split_edge[name]["source_node"]
-            v=split_edge[name]["target_node"]
-            split_edge[name]['edge']=torch.stack((u,v),dim=0).t()
-        for name in ['valid','test']:
-            u=split_edge[name]["source_node"].repeat(1, 1000).view(-1)
-            v=split_edge[name]["target_node_neg"].view(-1)
-            split_edge[name]['edge_neg']=torch.stack((u,v),dim=0).t()   
-    if dataset_name in ORTHOGONAL_NOISE_OGBL_DATASETS:
-        _init_orthogonal_noise_features(
-            data,
-            dataset_name,
-            device=device,
-            feature_dim=ORTHOGONAL_NOISE_DEFAULT_DIM,
-        )
-
-    # Set default metric based on dataset
-    if dataset_name == 'ogbl-ddi':
-        data.default_metric = "hits@20"
-    elif dataset_name == 'ogbl-collab':
-        data.default_metric = "hits@50"
-    elif dataset_name == 'ogbl-citation2':
-        data.default_metric = "mrr"
-    elif dataset_name == 'ogbl-ppa':
-        data.default_metric = "hits@100"
+    if dataset_name == 'ogbl-collab':
+        data.default_metric = 'hits@50'
     else:
-        raise ValueError("Unknown OGB dataset: {}".format(dataset_name))
-
+        raise ValueError('Unknown OGB dataset: {}'.format(dataset_name))
     data.name = name_d
-        
-    return data, split_edge
+    return (data, split_edge)
 
 def load_all_data_link(train_datasets, device='cpu', is_pretraining=False):
     data_list = []
@@ -263,29 +161,19 @@ def load_all_data_link(train_datasets, device='cpu', is_pretraining=False):
             data, split_edge = load_ogbl_data(dataset, device=device)
         else:
             data, split_edge = load_data(dataset, device=device, is_pretraining=is_pretraining)
-        
-        # Move data to the specified device (additional safety check)
         if not hasattr(data, 'x') or data.x is None:
-            _init_orthogonal_noise_features(
-                data,
-                getattr(data, 'name', dataset),
-                device=device,
-                feature_dim=ORTHOGONAL_NOISE_DEFAULT_DIM,
-            )
+            raise ValueError('This release requires numerical node features')
         data.x = data.x.to(device)
         data.adj_t = data.adj_t.to(device)
         if hasattr(data, 'edge_index'):
             data.edge_index = data.edge_index.to(device)
         if hasattr(data, 'full_adj_t') and data.full_adj_t is not None:
             data.full_adj_t = data.full_adj_t.to(device)
-            
-        # Move split_edge data to device as well
         for split_name, split_data in split_edge.items():
             if isinstance(split_data, dict):
                 for key, tensor_data in split_data.items():
                     if isinstance(tensor_data, torch.Tensor):
                         split_edge[split_name][key] = tensor_data.to(device)
-        
         data_list.append(data)
         split_edge_list.append(split_edge)
-    return data_list, split_edge_list
+    return (data_list, split_edge_list)

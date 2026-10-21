@@ -1,162 +1,33 @@
-# Python cache and compiled files
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
 .pytest_cache/
-
-# Environments
+.venv/
 .env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Data and datasets
+.env.*
 dataset/
 data/
-datasets/
-*.csv
-*.tsv
-*.json
-*.pkl
-*.pickle
-*.h5
-*.hdf5
-*.npz
-*.npy
-
-# Model checkpoints and outputs
+pca_cache/
+cache/
 checkpoints/
-checkpoint/
-models/
-model/
 results/
-result/
-output/
+runs/
 outputs/
+logs/
 *.pt
 *.pth
 *.ckpt
+*.npy
+*.npz
 *.pkl
-*.yaml
+*.csv
+*.tsv
+*.json
 *.pdf
-
-# Logs and monitoring
-logs/
-log/
 *.log
 *.out
 *.err
-wandb/
-mlruns/
-tensorboard/
-tb_logs/
-
-# Configuration files (keep templates, ignore actual configs)
-*.config
-.env
-.env.*
-.netrc
-*.netrc
-*.token
-
-# Local credentials / private keys
+*.tmp
 *.pem
 *.key
-*.crt
-*.csr
-id_rsa*
-id_ed25519*
-*_rsa
-*_ed25519
-
-# OS specific
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
-
-# Temporary files
-*.tmp
-*.temp
-*.bak
-*.backup
-
-# SLURM job files
-slurm-*.out
-*.sbatch
-*.job
-
-# Cache directories
-.cache/
-cache/
-
-*.gz
-*.sh
-TAGDataset
-/fug
-
-# Allow important documentation
-!README.md
-CLAUDE.md
-!legacy/README.md
-!docs/*.md
-
-scripts/
-pca_cache/
-setup/

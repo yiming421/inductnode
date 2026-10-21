@@ -1,176 +1,25 @@
 from __future__ import annotations
-
-from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Reddit, Reddit2, Flickr, AmazonProducts, Airports, WebKB, WikipediaNetwork, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, EllipticBitcoinDataset, CitationFull, FacebookPagePage
-from src.dataset_twitch import TwitchFixed
-from src.dataset_heterophilous import HeterophilousGraphDataset
+from torch_geometric.datasets import Planetoid, WikiCS, Coauthor, Amazon, Flickr, Airports, Actor, DeezerEurope, LastFMAsia, AttributedGraphDataset, CitationFull, FacebookPagePage
 from torch_geometric.data import Data
 from ogb.nodeproppred import PygNodePropPredDataset
 from torch_sparse import SparseTensor
 import torch
 from collections import defaultdict
-from pathlib import Path
-import numpy as np
-# Fix for PyTorch 2.6+ weights_only compatibility with PyG
 import torch.serialization
 from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr, TensorAttr
 from torch_geometric.data.storage import GlobalStorage, NodeStorage, EdgeStorage
-import pickle
 import os
-
-from .dataset_config import get_gdrive_download_url, is_dataset_complete
-from .dataset_downloader import download_and_extract_dataset, install_gdown
-
-# Legacy download_dataset function for compatibility
-def download_dataset(dataset_name, force_redownload=False):
-    """Legacy function for compatibility - now uses auto_download_complete_dataset"""
-    return auto_download_complete_dataset()
-
-# Add safe globals for PyTorch 2.6+ compatibility
 try:
-    torch.serialization.add_safe_globals([
-        torch.Tensor,
-        torch.Size,
-        torch.dtype,
-        torch.device,
-        Data,
-        DataEdgeAttr,
-        DataTensorAttr,
-        TensorAttr,
-        GlobalStorage,
-        NodeStorage,
-        EdgeStorage,
-        SparseTensor,
-        defaultdict,
-        type(None),
-        tuple,
-        list,
-        dict,
-        int,
-        float,
-        str,
-        bool,
-    ])
+    torch.serialization.add_safe_globals([torch.Tensor, torch.Size, torch.dtype, torch.device, Data, DataEdgeAttr, DataTensorAttr, TensorAttr, GlobalStorage, NodeStorage, EdgeStorage, SparseTensor, defaultdict, type(None), tuple, list, dict, int, float, str, bool])
 except (ImportError, AttributeError):
-    # Fallback for older PyTorch versions or if add_safe_globals doesn't exist
     pass
-
-def ensure_dataset_available(dataset_name: str, dataset_root: str) -> bool:
-    """
-    Ensure a dataset is available locally, downloading if necessary.
-    
-    Args:
-        dataset_name: Name of the dataset
-        dataset_root: Root directory where dataset should be located
-    
-    Returns:
-        True if dataset is available, False otherwise
-    """
-    dataset_path = os.path.join(dataset_root, dataset_name)
-    
-    # Check if dataset already exists and has content
-    if os.path.exists(dataset_path) and os.listdir(dataset_path):
-        return True
-    
-    print(f"Dataset {dataset_name} not found locally. Attempting to download...")
-    
-    # First try the complete dataset download (covers all datasets)
-    try:
-        if auto_download_complete_dataset():
-            # Check again if the specific dataset is now available
-            if os.path.exists(dataset_path) and os.listdir(dataset_path):
-                print(f"Successfully downloaded {dataset_name} as part of complete dataset")
-                return True
-    except Exception as e:
-        print(f"Complete dataset download failed: {e}")
-    
-    # Fallback to individual dataset download
-    try:
-        success = download_dataset(dataset_name, force_redownload=False)
-        if success:
-            print(f"Successfully downloaded {dataset_name}")
-            return True
-        else:
-            print(f"Failed to download {dataset_name}")
-            return False
-    except Exception as e:
-        print(f"Error downloading {dataset_name}: {e}")
-        return False
-
-def auto_download_flickr_files(flickr_root):
-    """
-    Automatically download Flickr dataset files using gdown if they don't exist or are corrupted.
-    """
-    
-    raw_dir = os.path.join(flickr_root, 'raw')
-    os.makedirs(raw_dir, exist_ok=True)
-    
-    # File mappings: filename -> Google Drive file ID
-    flickr_files = {
-        'adj_full.npz': '1crmsTbd1-2sEXsGwa2IKnIB7Zd3TmUsy',
-        'feats.npy': '1join-XdvX3anJU_MLVtick7MgeAQiWIZ',
-        'class_map.json': '1uxIkbtg5drHTsKt-PAsZZ4_yJmgFmle9',
-        'role.json': '1htXCtuktuCW8TR8KiKfrFDAxUgekQoV7'
-    }
-    
-    # Expected file sizes (approximately, for validation)
-    expected_sizes = {
-        'adj_full.npz': 2000000,  # ~2MB
-        'feats.npy': 300000000,   # ~300MB
-        'class_map.json': 1000000, # ~1MB
-        'role.json': 500000       # ~500KB
-    }
-    
-    # Use unified gdown installation
-    if not install_gdown():
-        print("Failed to install gdown for Flickr download")
-        return False
-    
-    try:
-        import gdown
-    except ImportError:
-        print("gdown import failed after installation")
-        return False
-    
-    downloaded_any = False
-    
-    for filename, file_id in flickr_files.items():
-        file_path = os.path.join(raw_dir, filename)
-        needs_download = False
-        
-        if not os.path.exists(file_path):
-            print(f"Flickr file {filename} not found, downloading...")
-            needs_download = True
-        else:
-            # Check if file is corrupted (too small, likely HTML page)
-            file_size = os.path.getsize(file_path)
-            if file_size < expected_sizes[filename] * 0.1:  # Less than 10% of expected size
-                print(f"Flickr file {filename} appears corrupted (size: {file_size}), re-downloading...")
-                needs_download = True
-        
-        if needs_download:
-            try:
-                print(f"Downloading {filename} from Google Drive...")
-                gdown.download(f'https://drive.google.com/uc?id={file_id}', file_path, quiet=False)
-                downloaded_any = True
-                
-                # Verify download
-                new_size = os.path.getsize(file_path)
-                if new_size < expected_sizes[filename] * 0.1:
-                    print(f"Warning: Downloaded {filename} still appears small ({new_size} bytes)")
-                else:
-                    print(f"Successfully downloaded {filename} ({new_size} bytes)")
-                    
-            except Exception as e:
-                print(f"Failed to download {filename}: {e}")
-                print("You may need to download this file manually.")
-    
-    return downloaded_any
 
 def get_project_root():
     """Get the project root directory"""
-    # The root is 'inductnode', which is one level up from 'inductnode/src'
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
+def get_data_root():
+    return os.environ.get('GILT_DATA_ROOT', os.path.join(get_project_root(), 'dataset'))
 
 def build_adj_t(edge_index, num_nodes, make_undirected=True):
     """Build SparseTensor adjacency with optional symmetrization."""
@@ -179,284 +28,59 @@ def build_adj_t(edge_index, num_nodes, make_undirected=True):
         adj_t = adj_t.to_symmetric()
     return adj_t.coalesce()
 
-
-def _is_graphpfn_xy_name(name: str) -> bool:
-    return name.lower() in {"graphpfn-xy", "graphpfn_xy", "graphpfnxy"}
-
-
-def _get_graphpfn_xy_root(graphpfn_xy_dir: str = "") -> str:
-    """Resolve default path for GraphPFN XY exports."""
-    if graphpfn_xy_dir:
-        return os.path.abspath(os.path.expanduser(graphpfn_xy_dir))
-
-    env = os.getenv("GRAPHPFN_XY_DIR")
-    if env:
-        return env
-    # default: sibling repo ../graphpfn/data/graphpfn-xy
-    root = os.path.abspath(os.path.join(get_project_root(), "..", "graphpfn", "data", "graphpfn-xy"))
-    if os.path.exists(root):
-        return root
-    # fallback: inductnode/dataset/graphpfn-xy
-    return os.path.join(get_project_root(), "dataset", "graphpfn-xy")
-
-
-def _select_graphpfn_xy_files(
-    root: Path,
-    split: str,
-    num_graphs: int | None = None,
-) -> list[Path]:
-    """
-    Deterministic graph-level split:
-      - train split: first 90%
-      - eval split: last 10%
-    """
-    files = sorted(root.glob("graph_*.npz"))
-    if num_graphs is not None and num_graphs > 0:
-        files = files[:num_graphs]
-
-    total = len(files)
-    if total < 2:
-        raise FileNotFoundError(
-            f"Need at least 2 graph_*.npz files in {root} for 90/10 split, found {total}"
-        )
-    split_point = max(1, int(total * 0.9))
-    split_point = min(split_point, total - 1)
-
-    if split == "train":
-        selected = files[:split_point]
-    elif split == "eval":
-        selected = files[split_point:]
-    else:
-        raise ValueError(f"Unknown split={split}, expected 'train' or 'eval'")
-
-    if not selected:
-        raise FileNotFoundError(
-            f"No graph_*.npz files selected from {root} with split={split}"
-        )
-    return selected
-
-
-def _load_graphpfn_xy_files(
-    files: list[Path],
-    root: Path,
-    make_undirected: bool = True,
-    train_all_nodes: bool = False,
-):
-    """
-    Load GraphPFN synthetic graphs exported by graphpfn/bin/prior/export_xy.py.
-
-    Expects files named graph_*.npz containing:
-      edge_index (2, E), x (N, F), y (N,), train_size (int).
-    Returns list of PyG Data objects and split_idx list.
-    """
-    data_list = []
-    split_idx_list = []
-
-    for f in files:
-        npz = np.load(f)
-        edge_index = torch.from_numpy(npz["edge_index"]).long()
-        x = torch.from_numpy(npz["x"]).float()
-        y = torch.from_numpy(npz["y"]).long()
-        train_size = int(npz["train_size"])
-
-        num_nodes = x.size(0)
-        if train_size <= 0 or train_size >= num_nodes:
-            raise ValueError(f"Invalid train_size {train_size} for {f} (num_nodes={num_nodes})")
-
-        if train_all_nodes:
-            # For GraphPFN-XY training graphs, use all nodes for training.
-            # Seen valid/test on these graphs is intentionally skipped in evaluate_node_classification.
-            train_idx = torch.arange(0, num_nodes, dtype=torch.long)
-            empty_idx = torch.empty(0, dtype=torch.long)
-            split_idx = {"train": train_idx, "valid": empty_idx, "test": empty_idx}
-        else:
-            train_idx = torch.arange(0, train_size, dtype=torch.long)
-            test_idx = torch.arange(train_size, num_nodes, dtype=torch.long)
-            split_idx = {"train": train_idx, "valid": test_idx, "test": test_idx}
-
-        data = Data(x=x, edge_index=edge_index, y=y)
-        data.adj_t = build_adj_t(edge_index, num_nodes, make_undirected=make_undirected)
-        data.name = f"graphpfn_xy_{f.stem}"
-        data.is_synthetic = True
-
-        data_list.append(data)
-        split_idx_list.append(split_idx)
-
-    return data_list, split_idx_list
-
-
-def load_graphpfn_xy_dataset_train(
-    root_dir: str,
-    make_undirected: bool = True,
-    num_graphs: int | None = None,
-):
-    root = Path(root_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
-    files = _select_graphpfn_xy_files(root, split="train", num_graphs=num_graphs)
-    print("[graphpfn_xy] Train mode: using all nodes as train; seen valid/test nodes are disabled for training graphs")
-    return _load_graphpfn_xy_files(
-        files,
-        root,
-        make_undirected=make_undirected,
-        train_all_nodes=True,
-    )
-
-
-def load_graphpfn_xy_dataset_eval(
-    root_dir: str,
-    make_undirected: bool = True,
-    num_graphs: int | None = None,
-):
-    root = Path(root_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"GraphPFN XY dir not found: {root}")
-    files = _select_graphpfn_xy_files(root, split="eval", num_graphs=num_graphs)
-    return _load_graphpfn_xy_files(
-        files,
-        root,
-        make_undirected=make_undirected,
-        train_all_nodes=False,
-    )
-
 def rebalance_splits_for_pretraining(split_idx, strategy='smallest_for_valid'):
-    """
-    Rebalance splits for pretraining data efficiency.
-
-    Args:
-        split_idx: Dict with 'train', 'valid', 'test' keys
-        strategy:
-            - 'smallest_for_valid': Use smallest split for validation, rest for training (NEW, recommended)
-            - 'legacy': Use train+valid for training, test for validation (OLD, problematic for large test sets)
-            - 'original': Keep original splits unchanged
-
-    Returns:
-        Rebalanced split_idx dict
-    """
     if strategy == 'original':
         return split_idx
-
     train_size = len(split_idx['train'])
     valid_size = len(split_idx['valid'])
     test_size = len(split_idx['test'])
-
     if strategy == 'smallest_for_valid':
-        # Find smallest split
         sizes = {'train': train_size, 'valid': valid_size, 'test': test_size}
         smallest_split = min(sizes, key=sizes.get)
-
-        print(f"  [Split Rebalance] Original - Train: {train_size:,} | Valid: {valid_size:,} | Test: {test_size:,}")
+        print(f'  [Split Rebalance] Original - Train: {train_size:,} | Valid: {valid_size:,} | Test: {test_size:,}')
         print(f"  [Split Rebalance] Using '{smallest_split}' ({sizes[smallest_split]:,} nodes) for validation")
-
-        # Use smallest for validation, combine others for training
         valid_idx = split_idx[smallest_split]
-
-        # Combine all non-validation indices for training
         all_idx = torch.cat([split_idx['train'], split_idx['valid'], split_idx['test']])
         all_set = set(all_idx.tolist())
         valid_set = set(valid_idx.tolist())
         train_set = all_set - valid_set
         train_idx = torch.tensor(sorted(list(train_set)))
-
-        new_split = {
-            'train': train_idx,
-            'valid': valid_idx,
-            'test': valid_idx  # Use same as valid (not used in pretraining)
-        }
-
-        print(f"  [Split Rebalance] New      - Train: {len(train_idx):,} | Valid: {len(valid_idx):,}")
+        new_split = {'train': train_idx, 'valid': valid_idx, 'test': valid_idx}
+        print(f'  [Split Rebalance] New      - Train: {len(train_idx):,} | Valid: {len(valid_idx):,}')
         return new_split
-
     elif strategy == 'legacy':
-        # Old behavior: train+valid for training, test for validation
         train_idx = torch.cat([split_idx['train'], split_idx['valid']])
         valid_idx = split_idx['test']
         test_idx = split_idx['test']
-
-        print(f"  [Split Rebalance] Legacy mode - Train: {len(train_idx):,} (train+valid) | Valid: {len(valid_idx):,} (test)")
-
+        print(f'  [Split Rebalance] Legacy mode - Train: {len(train_idx):,} (train+valid) | Valid: {len(valid_idx):,} (test)')
         return {'train': train_idx, 'valid': valid_idx, 'test': test_idx}
-
     else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
+        raise ValueError(f'Unknown strategy: {strategy}')
 
 def load_ogbn_data(dataset, make_undirected=True):
     name = dataset
-    dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
+    dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_data_root()))
     data = dataset[0]
     data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
     split_idx = dataset.get_idx_split()
     data.name = name
     data.y = data.y.squeeze()
-    return data, split_idx
+    return (data, split_idx)
 
 def load_ogbn_data_train(dataset, split_strategy='smallest_for_valid', make_undirected=True):
-    """
-    Load OGB node dataset for pretraining.
-
-    Args:
-        dataset: Dataset name (e.g., 'ogbn-products')
-        split_strategy: How to rebalance splits for pretraining
-            - 'smallest_for_valid': Use smallest split for validation, rest for training (recommended)
-            - 'legacy': Use train+valid for training, test for validation (old behavior)
-            - 'original': Keep original splits
-    """
     name = dataset
-    dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_project_root(), 'dataset'))
+    dataset = PygNodePropPredDataset(name=dataset, root=os.path.join(get_data_root()))
     data = dataset[0]
     data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
     split_idx = dataset.get_idx_split()
     data.name = name
     data.y = data.y.squeeze()
-
-    # Rebalance splits using the specified strategy
     split_idx = rebalance_splits_for_pretraining(split_idx, strategy=split_strategy)
+    return (data, split_idx)
 
-    return data, split_idx
-
-def load_text_enhanced_dataset(dataset_name: str):
-    """Load text-enhanced datasets with Qwen-generated node features"""
-    dataset_path = os.path.join(os.path.join(get_project_root(), 'dataset'), dataset_name)
-    
-    if not os.path.exists(dataset_path):
-        raise ValueError(f"Text-enhanced dataset {dataset_name} not found at {dataset_path}")
-    
-    # Try to load from raw .pt file first
-    pt_file = os.path.join(dataset_path, 'raw', f'{dataset_name}.pt')
-    if os.path.exists(pt_file):
-        print(f"Loading text-enhanced dataset {dataset_name} from {pt_file}")
-        data = torch.load(pt_file, map_location='cpu', weights_only=False)
-        
-        # Convert masks from lists to tensors if needed
-        if hasattr(data, 'train_masks') and isinstance(data.train_masks, list):
-            # Use the first mask (index 0) if multiple masks exist
-            data.train_mask = data.train_masks[0].clone().detach() if len(data.train_masks) > 0 else torch.zeros(data.num_nodes, dtype=torch.bool)
-        if hasattr(data, 'val_masks') and isinstance(data.val_masks, list):
-            data.val_mask = data.val_masks[0].clone().detach() if len(data.val_masks) > 0 else torch.zeros(data.num_nodes, dtype=torch.bool)
-        if hasattr(data, 'test_masks') and isinstance(data.test_masks, list):
-            data.test_mask = data.test_masks[0].clone().detach() if len(data.test_masks) > 0 else torch.zeros(data.num_nodes, dtype=torch.bool)
-        
-        print(f"Loaded text-enhanced {dataset_name}: {data.num_nodes} nodes, {data.num_edges} edges, feature dim: {data.x.shape[1] if data.x is not None else 'None'}")
-        return data
-    else:
-        raise ValueError(f"Data file not found for text-enhanced dataset {dataset_name} at {pt_file}")
-
-def load_data_train(dataset_name: str, make_undirected: bool = True):
-    
-    # --- 1. Check if this is a text-enhanced dataset (lowercase or LLaMA variants) ---
-    if dataset_name in ['cora', 'wikics', 'pubmed', 'cora_llama_8b', 'cora_llama_13b']:
-        data = load_text_enhanced_dataset(dataset_name)
-        # Text-enhanced datasets already have proper splits, return directly
-        split_idx = {
-            'train': data.train_mask.nonzero(as_tuple=False).reshape(-1),
-            'valid': data.val_mask.nonzero(as_tuple=False).reshape(-1),
-            'test': data.test_mask.nonzero(as_tuple=False).reshape(-1)
-        }
-        return data, split_idx
-    # --- 2. Load the dataset using its specific loader ---
-    root = os.path.join(get_project_root(), 'dataset')
-    print(f"Loading dataset {dataset_name} from root {root}", flush=True)
+def load_data_train(dataset_name: str, make_undirected: bool=True):
+    root = os.path.join(get_data_root())
+    print(f'Loading dataset {dataset_name} from root {root}', flush=True)
     if dataset_name in ['Cora', 'Citeseer', 'Pubmed']:
         dataset = Planetoid(root=root, name=dataset_name)
     elif dataset_name == 'WikiCS':
@@ -465,28 +89,11 @@ def load_data_train(dataset_name: str, make_undirected: bool = True):
         dataset = Coauthor(root=os.path.join(root, 'Coauthor'), name=dataset_name)
     elif dataset_name in ['Computers', 'Photo']:
         dataset = Amazon(root=os.path.join(root, 'Amazon'), name=dataset_name)
-    elif dataset_name == 'Reddit':
-        dataset = Reddit(root=os.path.join(root, 'Reddit'))
     elif dataset_name == 'Flickr':
         flickr_root = os.path.join(root, 'Flickr')
-        
-        # Try the new universal downloader first, fallback to old method
-        if not ensure_dataset_available('Flickr', root):
-            try:
-                auto_download_flickr_files(flickr_root)
-            except Exception as e:
-                print(f"Warning: Auto-download failed: {e}")
-                print("Proceeding with standard PyTorch Geometric download...")
-        
         dataset = Flickr(root=flickr_root)
-    elif dataset_name == 'AmazonProducts':
-        dataset = AmazonProducts(root=os.path.join(root, 'AmazonProducts'))
-    elif dataset_name in ['USA','Brazil', 'Europe']:
+    elif dataset_name in ['USA', 'Brazil', 'Europe']:
         dataset = Airports(root=os.path.join(root, 'Airports'), name=dataset_name)
-    elif dataset_name in ['Cornell', 'Texas', 'Wisconsin']:
-        dataset = WebKB(root=os.path.join(root, 'WebKB'), name=dataset_name)
-    elif dataset_name in ['Chameleon', 'Squirrel']:
-        dataset = WikipediaNetwork(root=os.path.join(root, 'WikipediaNetwork'), name=dataset_name, geom_gcn_preprocess=True)
     elif dataset_name == 'Actor':
         dataset = Actor(root=os.path.join(root, 'Actor'))
     elif dataset_name == 'DeezerEurope':
@@ -495,205 +102,85 @@ def load_data_train(dataset_name: str, make_undirected: bool = True):
         dataset = LastFMAsia(root=os.path.join(root, 'LastFMAsia'))
     elif dataset_name in ['Wiki', 'BlogCatalog', 'Facebook', 'TWeibo']:
         dataset = AttributedGraphDataset(root=os.path.join(root, 'AttributedGraph'), name=dataset_name)
-    elif dataset_name == 'EllipticBitcoin':
-        dataset = EllipticBitcoinDataset(root=os.path.join(root, 'EllipticBitcoin'))
     elif dataset_name in ['DBLP']:
         dataset = CitationFull(root=os.path.join(root, 'CitationFull'), name=dataset_name)
-    elif dataset_name in ['Cora-ML', 'core_ml', 'core-ml']:
-        # CitationFull expects lowercase name 'cora_ml'
-        dataset = CitationFull(root=os.path.join(root, 'CitationFull'), name='cora_ml')
-    elif dataset_name == 'Reddit2':
-        dataset = Reddit2(root=os.path.join(root, 'Reddit2'))
-    elif dataset_name.startswith('Twitch-'):
-        # Extract region from dataset name (e.g., 'Twitch-DE' -> 'DE')
-        region = dataset_name.split('-')[1]
-        dataset = TwitchFixed(root=os.path.join(root, 'Twitch'), name=region)
     elif dataset_name == 'FacebookPagePage':
         dataset = FacebookPagePage(root=os.path.join(root, 'FacebookPagePage'))
-    elif dataset_name in ['Roman-empire', 'Amazon-ratings', 'Minesweeper', 'Tolokers', 'Questions']:
-        dataset = HeterophilousGraphDataset(
-            root=os.path.join(root, 'HeterophilousGraphs'),
-            name=dataset_name,
-            make_undirected=make_undirected,
-        )
-    elif dataset_name == 'MAG240M':
-        # Load MAG240M subset directly
-        data, split_idx = load_mag240m_subset()
-        data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
-        data.name = dataset_name
-        return data, split_idx
-    elif dataset_name == 'Products':
-        # Load Products subset directly
-        data, split_idx = load_products_subset()
-        data.name = dataset_name
-        return data, split_idx
     else:
-        raise ValueError(f"Dataset {dataset_name} not supported.")
-        
+        raise ValueError(f'Dataset {dataset_name} not supported.')
     data = dataset[0]
-
-    # --- 2. Create the new 90/10 stratified split ---
     num_nodes = data.num_nodes
-    print(f"Number of nodes: {num_nodes}", flush=True)
-    print(f"Number of edges: {data.num_edges}", flush=True)
+    print(f'Number of nodes: {num_nodes}', flush=True)
+    print(f'Number of edges: {data.num_edges}', flush=True)
     labels = data.y
-
-    # Group nodes by their class label
     nodes_by_class = defaultdict(list)
     for node_idx, label in enumerate(labels):
         nodes_by_class[label.item()].append(node_idx)
-
     train_idx = []
     valid_idx = []
-
-    # Perform stratified sampling for each class
     for class_label, indices in nodes_by_class.items():
         class_indices = torch.tensor(indices)
         num_class_nodes = len(class_indices)
-        
-        # Shuffle indices within the class
         shuffled_indices = class_indices[torch.randperm(num_class_nodes)]
-        
-        # Split according to the 90/10 ratio
         train_end = int(num_class_nodes * 0.9)
-        
         train_idx.extend(shuffled_indices[:train_end])
         valid_idx.extend(shuffled_indices[train_end:])
-
-    # Shuffle the combined training and validation indices
     train_idx = torch.tensor(train_idx)[torch.randperm(len(train_idx))]
     valid_idx = torch.tensor(valid_idx)[torch.randperm(len(valid_idx))]
-
-    # Create new boolean masks and attach them to the data object
     data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
     data.train_mask[train_idx] = True
-
     data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
     data.val_mask[valid_idx] = True
-
-    # Create an empty test mask to prevent downstream errors
     data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
-
-    # --- 3. Perform other processing (e.g., creating adjacency tensor) ---
     data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
-
-    # --- 4. Create the split_idx dictionary with the correct indices ---
-    split_idx = {
-        'train': train_idx,
-        'valid': valid_idx,
-        'test': valid_idx  
-    }
-
+    split_idx = {'train': train_idx, 'valid': valid_idx, 'test': valid_idx}
     data.name = dataset_name
-    return data, split_idx
+    return (data, split_idx)
 
-def load_data(dataset, make_undirected: bool = True, split_id: int | None = None):
+def load_data(dataset, make_undirected: bool=True, split_id: int | None=None):
     name = dataset
-
-    # Dataset name aliases for compatibility
-    dataset_aliases = {
-        'AmzComp': 'Computers',
-        'AmzPhoto': 'Photo',
-        'AmzRatings': 'Amazon-ratings',
-        'CoCS': 'CS',
-        'CoPhysics': 'Physics',
-        'Roman': 'Roman-empire',
-        'Deezer': 'DeezerEurope',
-        'AirBrazil': 'Brazil',
-        'AirEU': 'Europe',
-        'AirUS': 'USA',
-        'FullCora': 'Cora-ML',
-    }
-
-    # Apply alias if exists
+    dataset_aliases = {'AmzComp': 'Computers', 'AmzPhoto': 'Photo', 'AmzRatings': 'Amazon-ratings', 'CoCS': 'CS', 'CoPhysics': 'Physics', 'Roman': 'Roman-empire', 'Deezer': 'DeezerEurope', 'AirBrazil': 'Brazil', 'AirEU': 'Europe', 'AirUS': 'USA', 'FullCora': 'Cora-ML'}
     if dataset in dataset_aliases:
         dataset = dataset_aliases[dataset]
-
-    # Check if this is a text-enhanced dataset (including LLaMA variants)
-    if dataset in ['cora', 'wikics', 'pubmed', 'cora_llama_8b', 'cora_llama_13b']:
-        data = load_text_enhanced_dataset(dataset)
-        dataset = [data]
-    elif dataset in ['Cora', 'Citeseer', 'Pubmed']:
-        dataset = Planetoid(root=os.path.join(get_project_root(), 'dataset'), name=dataset)
-    elif dataset in ['Cora-ML']:
-        dataset = CitationFull(root=os.path.join(get_project_root(), 'dataset', 'CitationFull'), name='cora_ml')
+    if dataset in ['Cora', 'Citeseer', 'Pubmed']:
+        dataset = Planetoid(root=os.path.join(get_data_root()), name=dataset)
     elif dataset == 'WikiCS':
-        dataset = WikiCS(root=os.path.join(get_project_root(), 'dataset', 'WikiCS'))
+        dataset = WikiCS(root=os.path.join(get_data_root(), 'WikiCS'))
     elif dataset in ['CS', 'Physics']:
-        dataset = Coauthor(root=os.path.join(get_project_root(), 'dataset', 'Coauthor'), name=dataset)
+        dataset = Coauthor(root=os.path.join(get_data_root(), 'Coauthor'), name=dataset)
     elif dataset in ['Computers', 'Photo']:
-        dataset = Amazon(root=os.path.join(get_project_root(), 'dataset', 'Amazon'), name=dataset)
-    elif dataset == 'Reddit':
-        dataset = Reddit(root=os.path.join(get_project_root(), 'dataset', 'Reddit'))
+        dataset = Amazon(root=os.path.join(get_data_root(), 'Amazon'), name=dataset)
     elif dataset in ['USA', 'Brazil', 'Europe']:
-        dataset = Airports(root=os.path.join(get_project_root(), 'dataset', 'Airports'), name=dataset)
-    elif dataset in ['Cornell', 'Texas', 'Wisconsin']:
-        dataset = WebKB(root=os.path.join(get_project_root(), 'dataset', 'WebKB'), name=dataset)
-    elif dataset in ['Chameleon', 'Squirrel']:
-        dataset = WikipediaNetwork(root=os.path.join(get_project_root(), 'dataset', 'WikipediaNetwork'), name=dataset, geom_gcn_preprocess=True)
+        dataset = Airports(root=os.path.join(get_data_root(), 'Airports'), name=dataset)
     elif dataset == 'Actor':
-        dataset = Actor(root=os.path.join(get_project_root(), 'dataset', 'Actor'))
+        dataset = Actor(root=os.path.join(get_data_root(), 'Actor'))
     elif dataset == 'DeezerEurope':
-        dataset = DeezerEurope(root=os.path.join(get_project_root(), 'dataset', 'DeezerEurope'))
+        dataset = DeezerEurope(root=os.path.join(get_data_root(), 'DeezerEurope'))
     elif dataset == 'LastFMAsia':
-        dataset = LastFMAsia(root=os.path.join(get_project_root(), 'dataset', 'LastFMAsia'))
+        dataset = LastFMAsia(root=os.path.join(get_data_root(), 'LastFMAsia'))
     elif dataset in ['Wiki', 'BlogCatalog', 'Facebook', 'TWeibo']:
-        dataset = AttributedGraphDataset(root=os.path.join(get_project_root(), 'dataset', 'AttributedGraph'), name=dataset)
+        dataset = AttributedGraphDataset(root=os.path.join(get_data_root(), 'AttributedGraph'), name=dataset)
     elif dataset in ['DBLP']:
-        dataset = CitationFull(root=os.path.join(get_project_root(), 'dataset', 'CitationFull'), name=dataset)
-    elif dataset in ['Cora-ML', 'core_ml', 'core-ml']:
-        # CitationFull expects lowercase name 'cora_ml'
-        dataset = CitationFull(root=os.path.join(get_project_root(), 'dataset', 'CitationFull'), name='cora_ml')
-    elif dataset == 'Reddit2':
-        dataset = Reddit2(root=os.path.join(get_project_root(), 'dataset', 'Reddit2'))
-    elif dataset == 'Products':
-        # Load Products subset directly
-        data, split_idx = load_products_subset()
-        data.name = name
-        return data, split_idx
+        dataset = CitationFull(root=os.path.join(get_data_root(), 'CitationFull'), name=dataset)
     elif dataset == 'FacebookPagePage':
-        dataset = FacebookPagePage(root=os.path.join(get_project_root(), 'dataset', 'FacebookPagePage'))
-    elif dataset in ['Roman-empire', 'Amazon-ratings', 'Minesweeper', 'Tolokers', 'Questions']:
-        dataset = HeterophilousGraphDataset(
-            root=os.path.join(get_project_root(), 'dataset', 'HeterophilousGraphs'),
-            name=dataset,
-            make_undirected=make_undirected,
-        )
-    elif dataset == 'MAG240M':
-        # Load MAG240M subset directly
-        data, split_idx = load_mag240m_subset()
-        data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
-        data.name = name
-        return data, split_idx
+        dataset = FacebookPagePage(root=os.path.join(get_data_root(), 'FacebookPagePage'))
     else:
-        raise ValueError(f"Dataset {dataset} not supported.")
+        raise ValueError(f'Dataset {dataset} not supported.')
     data = dataset[0]
     data.adj_t = build_adj_t(data.edge_index, data.num_nodes, make_undirected=make_undirected)
-
-    # Check if dataset has predefined splits
     if hasattr(data, 'train_mask') and data.train_mask is not None:
         split_idx = dict()
-
-        # Handle 2D masks (e.g., WikiCS has 20 predefined splits as columns)
-        # Use selected split (default: column 0) in such cases
         train_mask = data.train_mask
         val_mask = data.val_mask
         test_mask = data.test_mask
-
         if train_mask.dim() == 2:
             num_splits = int(train_mask.shape[1])
             selected_split = 0 if split_id is None else int(split_id)
             if selected_split < 0 or selected_split >= num_splits:
-                raise ValueError(
-                    f"Invalid split_id={selected_split} for dataset {name}. "
-                    f"Valid range: [0, {num_splits - 1}]"
-                )
+                raise ValueError(f'Invalid split_id={selected_split} for dataset {name}. Valid range: [0, {num_splits - 1}]')
             data.predefined_num_splits = num_splits
             data.predefined_split_id = selected_split
-            print(
-                f"[load_data] Dataset has 2D train_mask with {num_splits} splits, "
-                f"using split {selected_split}"
-            )
+            print(f'[load_data] Dataset has 2D train_mask with {num_splits} splits, using split {selected_split}')
             train_mask = train_mask[:, selected_split]
         if val_mask.dim() == 2:
             selected_split = 0 if split_id is None else int(split_id)
@@ -701,493 +188,100 @@ def load_data(dataset, make_undirected: bool = True, split_id: int | None = None
         if test_mask is not None and test_mask.dim() == 2:
             selected_split = 0 if split_id is None else int(split_id)
             test_mask = test_mask[:, selected_split]
-
         split_idx['train'] = train_mask.nonzero(as_tuple=False).reshape(-1)
         split_idx['valid'] = val_mask.nonzero(as_tuple=False).reshape(-1)
         split_idx['test'] = test_mask.nonzero(as_tuple=False).reshape(-1) if test_mask is not None else torch.tensor([])
-
-        # CORRUPTION CHECK: Validate split indices
         num_nodes = data.num_nodes
         for split_name, split_indices in split_idx.items():
             if len(split_indices) > 0:
                 if split_indices.max().item() >= num_nodes:
-                    print(f"[CORRUPTION] {name} {split_name}_idx has invalid indices! Max: {split_indices.max().item()}, valid: [0, {num_nodes-1}]")
+                    print(f'[CORRUPTION] {name} {split_name}_idx has invalid indices! Max: {split_indices.max().item()}, valid: [0, {num_nodes - 1}]')
                 if split_indices.min().item() < 0:
-                    print(f"[CORRUPTION] {name} {split_name}_idx has negative indices! Min: {split_indices.min().item()}")
+                    print(f'[CORRUPTION] {name} {split_name}_idx has negative indices! Min: {split_indices.min().item()}')
                 if len(split_indices) != len(split_indices.unique()):
                     duplicates = len(split_indices) - len(split_indices.unique())
-                    print(f"[CORRUPTION] {name} {split_name}_idx has {duplicates} duplicate indices!")
+                    print(f'[CORRUPTION] {name} {split_name}_idx has {duplicates} duplicate indices!')
     else:
-        # Create standard 20 per class train split for datasets without predefined splits
         from collections import defaultdict
         num_nodes = data.num_nodes
         labels = data.y
         nodes_by_class = defaultdict(list)
         for node_idx, label in enumerate(labels):
             nodes_by_class[label.item()].append(node_idx)
-
         train_idx = []
         valid_idx = []
         test_idx = []
-
         for class_label, indices in nodes_by_class.items():
             class_indices = torch.tensor(indices)
             num_class_nodes = len(class_indices)
-
-            # Shuffle
             perm = torch.randperm(num_class_nodes)
             class_indices = class_indices[perm]
-
-            # Use 20 per class for train (like Planetoid)
             train_size = min(20, num_class_nodes // 2)
             valid_size = min(30, (num_class_nodes - train_size) // 2)
-
             train_idx.extend(class_indices[:train_size].tolist())
-            valid_idx.extend(class_indices[train_size:train_size+valid_size].tolist())
-            test_idx.extend(class_indices[train_size+valid_size:].tolist())
-
+            valid_idx.extend(class_indices[train_size:train_size + valid_size].tolist())
+            test_idx.extend(class_indices[train_size + valid_size:].tolist())
         split_idx = dict()
         split_idx['train'] = torch.tensor(train_idx)
         split_idx['valid'] = torch.tensor(valid_idx)
         split_idx['test'] = torch.tensor(test_idx)
-
-        # Also create masks on data object
         data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
         data.train_mask[split_idx['train']] = True
         data.val_mask = torch.zeros(num_nodes, dtype=torch.bool)
         data.val_mask[split_idx['valid']] = True
         data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
         data.test_mask[split_idx['test']] = True
-
     data.name = name
-    return data, split_idx
+    return (data, split_idx)
 
-def load_all_data(
-    train_datasets,
-    make_undirected: bool = True,
-    expand_webkb_splits: bool = False,
-    graphpfn_xy_num_graphs: int = 0,
-    graphpfn_xy_dir: str = "",
-):
+def load_all_data(train_datasets, make_undirected: bool=True, expand_webkb_splits: bool=False):
     data_list = []
     split_idx_list = []
     webkb_datasets = {'Cornell', 'Texas', 'Wisconsin'}
-
     for dataset in train_datasets:
         print(dataset, flush=True)
-        if _is_graphpfn_xy_name(dataset):
-            root = _get_graphpfn_xy_root(graphpfn_xy_dir)
-            if graphpfn_xy_num_graphs > 0:
-                print(f"[graphpfn_xy] Limiting to first {graphpfn_xy_num_graphs} files before 90/10 split (eval branch)")
-            data_ext, split_ext = load_graphpfn_xy_dataset_eval(
-                root,
-                make_undirected=make_undirected,
-                num_graphs=graphpfn_xy_num_graphs if graphpfn_xy_num_graphs > 0 else None,
-            )
-            data_list.extend(data_ext)
-            split_idx_list.extend(split_ext)
-            continue
-
         if expand_webkb_splits and dataset in webkb_datasets:
-            # Expand WebKB datasets to all official predefined splits (10 splits).
-            data_first, split_first = load_data(
-                dataset,
-                make_undirected=make_undirected,
-                split_id=0
-            )
+            data_first, split_first = load_data(dataset, make_undirected=make_undirected, split_id=0)
             num_splits = int(getattr(data_first, 'predefined_num_splits', 1))
-
             if num_splits <= 1:
                 data_list.append(data_first)
                 split_idx_list.append(split_first)
             else:
-                data_first.name = f"{data_first.name}_split0"
+                data_first.name = f'{data_first.name}_split0'
                 data_list.append(data_first)
                 split_idx_list.append(split_first)
-
                 for split_idx in range(1, num_splits):
-                    data_split, split_edge = load_data(
-                        dataset,
-                        make_undirected=make_undirected,
-                        split_id=split_idx
-                    )
-                    data_split.name = f"{data_split.name}_split{split_idx}"
+                    data_split, split_edge = load_data(dataset, make_undirected=make_undirected, split_id=split_idx)
+                    data_split.name = f'{data_split.name}_split{split_idx}'
                     data_list.append(data_split)
                     split_idx_list.append(split_edge)
-                print(f"[load_all_data] Expanded {dataset} into {num_splits} official splits")
+                print(f'[load_all_data] Expanded {dataset} into {num_splits} official splits')
             continue
-
         if dataset.startswith('ogbn-'):
             data, split_edge = load_ogbn_data(dataset, make_undirected=make_undirected)
         else:
             data, split_edge = load_data(dataset, make_undirected=make_undirected)
         data_list.append(data)
         split_idx_list.append(split_edge)
-    return data_list, split_idx_list
+    return (data_list, split_idx_list)
 
 def expand_dataset_names(train_datasets):
     """Expand special dataset names like 'Twitch' into all regions"""
     expanded_datasets = []
     for dataset in train_datasets:
-        if dataset == 'Twitch':
-            # Expand Twitch into all 6 regions
-            twitch_regions = ['Twitch-DE', 'Twitch-EN', 'Twitch-ES', 'Twitch-FR', 'Twitch-PT', 'Twitch-RU']
-            expanded_datasets.extend(twitch_regions)
-            print(f"Expanded 'Twitch' into: {', '.join(twitch_regions)}")
-        else:
-            expanded_datasets.append(dataset)
+        expanded_datasets.append(dataset)
     return expanded_datasets
 
-def load_all_data_train(train_datasets, split_strategy='smallest_for_valid',
-                        use_augmentation=False, num_augmentations=1,
-                        augmentation_mode='preprocessing',
-                        augmentation_hidden_dim_range=None, augmentation_activation_pool=None,
-                        augmentation_activation='random', augmentation_max_depth=1,
-                        augmentation_verbose=False, augmentation_use_random_noise=False,
-                        augmentation_dropout_rate=0.0, augmentation_use_feature_mixing=False,
-                        augmentation_mix_ratio=0.3, augmentation_mix_alpha=0.5,
-                        make_undirected: bool = True,
-                        graphpfn_xy_num_graphs: int = 0,
-                        graphpfn_xy_dir: str = ""):
-    """
-    Load training datasets with optional split rebalancing and data augmentation.
-
-    Args:
-        train_datasets: List of dataset names
-        split_strategy: Strategy for rebalancing splits (passed to load_ogbn_data_train)
-        use_augmentation: Whether to apply random projection augmentation
-        num_augmentations: Number of augmented copies to create per graph (1, 2, 3, etc.)
-        augmentation_hidden_dim_range: Range for random hidden dimension (min, max) tuple
-        augmentation_activation_pool: List of activation functions for augmentation
-        augmentation_verbose: Print augmentation details
-        make_undirected: If True, symmetrize adjacency; if False, keep directed edges
-    """
-    # Expand any special dataset names first
+def load_all_data_train(train_datasets, split_strategy='smallest_for_valid', make_undirected: bool=True):
     expanded_datasets = expand_dataset_names(train_datasets)
-
     data_list = []
     split_idx_list = []
     for dataset in expanded_datasets:
         print(dataset, flush=True)
-        if _is_graphpfn_xy_name(dataset):
-            root = _get_graphpfn_xy_root(graphpfn_xy_dir)
-            if graphpfn_xy_num_graphs > 0:
-                print(f"[graphpfn_xy] Limiting to first {graphpfn_xy_num_graphs} files before 90/10 split (train branch)")
-            data_ext, split_ext = load_graphpfn_xy_dataset_train(
-                root,
-                make_undirected=make_undirected,
-                num_graphs=graphpfn_xy_num_graphs if graphpfn_xy_num_graphs > 0 else None,
-            )
-            data_list.extend(data_ext)
-            split_idx_list.extend(split_ext)
-            continue
         if dataset.startswith('ogbn-'):
-            data, split_edge = load_ogbn_data_train(
-                dataset,
-                split_strategy=split_strategy,
-                make_undirected=make_undirected,
-            )
+            data, split_edge = load_ogbn_data_train(dataset, split_strategy=split_strategy, make_undirected=make_undirected)
         else:
             data, split_edge = load_data_train(dataset, make_undirected=make_undirected)
         data_list.append(data)
         split_idx_list.append(split_edge)
-
-    # Apply data augmentation if enabled
-    # Preprocessing mode: defer augmentation to training-time regeneration using a fixed seed pool to avoid duplicating data in memory.
-    # Per-epoch mode: augmentation also happens in the training loop.
-    if use_augmentation:
-        if augmentation_mode == 'preprocessing':
-            print(f"\n[Data Augmentation - Preprocessing Mode]")
-            print(f"  Deferring augmentation to training-time regeneration with a fixed seed pool "
-                  f"(num_augmentations={num_augmentations}); keeping only originals in memory.")
-            print(f"  Original dataset size: {len(data_list)}")
-        else:  # per_epoch
-            print(f"\n[Data Augmentation - Per-Epoch Mode]")
-            print(f"  Augmentations will be regenerated each epoch during training "
-                  f"(num_augmentations={num_augmentations})")
-
-    return data_list, split_idx_list
-
-
-def attach_gpse_embeddings(data_list, dataset_names, gpse_dir='../GPSE/datasets', verbose=False,
-                          use_gpse=False, use_lappe=False, use_rwse=False):
-    """
-    Attach GPSE, LapPE, and/or RWSE embeddings to loaded datasets.
-
-    Args:
-        data_list: List of PyG Data objects
-        dataset_names: List of dataset names corresponding to data_list
-        gpse_dir: Directory containing GPSE/LapPE/RWSE embeddings
-        verbose: Print loading information
-        use_gpse: Whether to load GPSE embeddings
-        use_lappe: Whether to load LapPE embeddings
-        use_rwse: Whether to load RWSE embeddings
-
-    Returns:
-        Number of datasets successfully enhanced
-    """
-    from .data_gpse import GPSEEmbeddingLoader
-
-    loader = GPSEEmbeddingLoader(gpse_dir, verbose=verbose)
-    success_count = 0
-
-    for data, dataset_name in zip(data_list, dataset_names):
-        enhanced = False
-
-        # GPSE
-        if use_gpse:
-            try:
-                loader.attach_gpse_to_data(data, dataset_name)
-                enhanced = True
-                if verbose:
-                    print(f"  [GPSE] ✓ Enhanced {dataset_name}")
-            except FileNotFoundError:
-                if verbose:
-                    print(f"  [GPSE] ⚠ Skipping {dataset_name} (embeddings not found)")
-            except Exception as e:
-                print(f"  [GPSE] ✗ Error loading {dataset_name}: {e}")
-
-        # LapPE
-        if use_lappe:
-            try:
-                loader.attach_lappe_to_data(data, dataset_name)
-                enhanced = True
-                if verbose:
-                    print(f"  [LapPE] ✓ Enhanced {dataset_name}")
-            except FileNotFoundError:
-                if verbose:
-                    print(f"  [LapPE] ⚠ Skipping {dataset_name} (embeddings not found)")
-            except Exception as e:
-                print(f"  [LapPE] ✗ Error loading {dataset_name}: {e}")
-
-        # RWSE
-        if use_rwse:
-            try:
-                loader.attach_rwse_to_data(data, dataset_name)
-                enhanced = True
-                if verbose:
-                    print(f"  [RWSE] ✓ Enhanced {dataset_name}")
-            except FileNotFoundError:
-                if verbose:
-                    print(f"  [RWSE] ⚠ Skipping {dataset_name} (embeddings not found)")
-            except Exception as e:
-                print(f"  [RWSE] ✗ Error loading {dataset_name}: {e}")
-
-        if enhanced:
-            success_count += 1
-
-    if verbose:
-        pe_types = []
-        if use_gpse: pe_types.append('GPSE')
-        if use_lappe: pe_types.append('LapPE')
-        if use_rwse: pe_types.append('RWSE')
-        pe_str = '+'.join(pe_types) if pe_types else 'None'
-        print(f"  [{pe_str}] Enhanced {success_count}/{len(data_list)} datasets")
-
-    return success_count
-
-def load_products_subset():
-    """Load Products subset dataset"""
-    print("Loading Products subset...")
-    
-    try:
-        product_path = os.path.join(get_project_root(), 'dataset', 'products', 'raw', 'ogbn-products_subset.pt')
-        dict_products = torch.load(product_path, map_location='cpu', weights_only=False)
-        data = Data(
-            x=dict_products['x'],
-            y=dict_products['y'].squeeze(),
-            train_mask=dict_products['train_mask'],
-            val_mask=dict_products['val_mask'],
-            test_mask=dict_products['test_mask'],
-            adj_t=dict_products['adj_t'],
-        )
-        data.edge_index = torch.stack([data.adj_t.coo()[0], data.adj_t.coo()[1]], dim=0)
-        
-        print(f"Products subset loaded: {data.num_nodes} nodes, {data.num_edges} edges")
-        print(f"Feature dimension: {data.x.shape[1] if data.x is not None else 'None'}")
-        print(f"Train nodes: {data.train_mask.sum().item()}")
-        print(f"Val nodes: {data.val_mask.sum().item()}")
-        print(f"Test nodes: {data.test_mask.sum().item()}")
-        print(f"Number of classes: {data.y.max().item() + 1}")
-        
-        # Create split_idx dictionary
-        split_idx = {
-            'train': data.train_mask.nonzero(as_tuple=False).reshape(-1),
-            'valid': data.val_mask.nonzero(as_tuple=False).reshape(-1),
-            'test': data.test_mask.nonzero(as_tuple=False).reshape(-1)
-        }
-        
-        return data, split_idx
-        
-    except Exception as e:
-        print(f"Error loading Products subset: {e}")
-        raise e
-
-def load_mag240m_subset():
-    """Load MAG240M subset dataset with ~5.9M nodes and ~52.8M edges"""
-    base_path = os.path.join(get_project_root(), 'dataset', 'mag240m')
-    processed_path = os.path.join(base_path, 'processed')
-    raw_path = os.path.join(base_path, 'raw')
-    
-    print("Loading MAG240M subset...")
-    
-    try:
-        # Load edge index - try torch.load first, then pickle
-        try:
-            edge_index = torch.load(os.path.join(processed_path, 'edge_index_subset.pkl'), map_location='cpu', weights_only=False)
-        except:
-            with open(os.path.join(processed_path, 'edge_index_subset.pkl'), 'rb') as f:
-                edge_index = pickle.load(f)
-        
-        # Load node mapping to understand which nodes are in the subset
-        try:
-            node_map = torch.load(os.path.join(processed_path, 'node_map_subset.pkl'), map_location='cpu', weights_only=False)
-        except:
-            with open(os.path.join(processed_path, 'node_map_subset.pkl'), 'rb') as f:
-                node_map = pickle.load(f)
-        
-        # Load label mapping
-        try:
-            label_map = torch.load(os.path.join(processed_path, 'label_map_subset.pkl'), map_location='cpu', weights_only=False)
-        except:
-            with open(os.path.join(processed_path, 'label_map_subset.pkl'), 'rb') as f:
-                label_map = pickle.load(f)
-        
-        # Load the actual processed numeric features from the original dataset
-        print("Loading processed 768-dim embeddings...")
-        import numpy as np
-        
-        # Load full features and extract subset
-        full_features = np.load(os.path.join(raw_path, 'processed/paper/node_feat.npy'), mmap_mode='r')
-        
-        # Extract features for nodes in our subset
-        subset_features = []
-        for node_id in node_map:
-            if node_id.item() < len(full_features):
-                subset_features.append(full_features[node_id.item()])
-            else:
-                # For non-paper nodes (authors, institutions), create zero features
-                subset_features.append(np.zeros(768, dtype=np.float16))
-        
-        # Convert to tensor
-        x = torch.from_numpy(np.stack(subset_features)).float()
-        print(f"Loaded {x.shape[0]} node features with dimension {x.shape[1]}")
-        
-        # Load split indices
-        split_dict = torch.load(os.path.join(raw_path, 'split_dict.pt'), map_location='cpu', weights_only=False)
-        
-        # Create labels tensor - MAG240M has 153 classes
-        # We need to map the global indices to subset indices
-        y = torch.full((len(node_map),), -1, dtype=torch.long)  # Initialize with -1 (unlabeled)
-        
-        # Map split indices to subset indices
-        subset_node_to_idx = {node_map[i].item(): i for i in range(len(node_map))}
-        
-        train_mask = torch.zeros(len(node_map), dtype=torch.bool)
-        val_mask = torch.zeros(len(node_map), dtype=torch.bool)
-        test_mask = torch.zeros(len(node_map), dtype=torch.bool)
-        
-        train_idx = []
-        val_idx = []
-        test_idx = []
-        
-        # Map original splits to subset indices
-        for orig_idx in split_dict['train']:
-            if orig_idx.item() in subset_node_to_idx:
-                subset_idx = subset_node_to_idx[orig_idx.item()]
-                train_mask[subset_idx] = True
-                train_idx.append(subset_idx)
-                # Set label for this node
-                y[subset_idx] = label_map[subset_idx]
-        
-        for orig_idx in split_dict['valid']:
-            if orig_idx.item() in subset_node_to_idx:
-                subset_idx = subset_node_to_idx[orig_idx.item()]
-                val_mask[subset_idx] = True
-                val_idx.append(subset_idx)
-                y[subset_idx] = label_map[subset_idx]
-        
-        for orig_idx in split_dict['test']:
-            if orig_idx.item() in subset_node_to_idx:
-                subset_idx = subset_node_to_idx[orig_idx.item()]
-                test_mask[subset_idx] = True
-                test_idx.append(subset_idx)
-                y[subset_idx] = label_map[subset_idx]
-        
-        # Features are already processed as tensor from numpy array
-        # No additional processing needed
-        
-        # Create the data object
-        data = Data(
-            x=x,
-            edge_index=edge_index,
-            y=y,
-            train_mask=train_mask,
-            val_mask=val_mask,
-            test_mask=test_mask,
-            num_nodes=len(node_map)
-        )
-        
-        # Store metadata about the features
-        data.feature_type = "processed_embeddings"  # 768-dim embeddings from language model
-        
-        print(f"MAG240M subset loaded: {data.num_nodes} nodes, {data.num_edges} edges")
-        print(f"Feature dimension: {data.x.shape[1] if data.x.dim() > 1 else 'None'}")
-        print(f"Train nodes: {train_mask.sum().item()}")
-        print(f"Val nodes: {val_mask.sum().item()}")
-        print(f"Test nodes: {test_mask.sum().item()}")
-        print(f"Labeled nodes: {(y >= 0).sum().item()}")
-        print(f"Number of classes: {y.max().item() + 1 if y.max() >= 0 else 'Unknown'}")
-        
-        # Create split_idx dictionary
-        split_idx = {
-            'train': torch.tensor(train_idx),
-            'valid': torch.tensor(val_idx),
-            'test': torch.tensor(test_idx)
-        }
-        
-        return data, split_idx
-        
-    except Exception as e:
-        print(f"Error loading MAG240M subset: {e}")
-        raise e
-
-def auto_download_complete_dataset():
-    """
-    Automatically download the complete inductnode dataset from Google Drive if not available.
-    """
-    project_root = get_project_root()
-    dataset_dir = os.path.join(project_root, 'dataset')
-    
-    # Check if dataset already exists and is complete
-    if is_dataset_complete(dataset_dir):
-        print("Dataset appears complete.")
-        return True
-    
-    # Get download URL from configuration
-    download_url = get_gdrive_download_url()
-    if not download_url:
-        print("Auto-download not configured yet. Dataset file ID not set.")
-        print("Please run scripts/prepare_dataset_for_upload.py to prepare dataset for upload,")
-        print("then update GDRIVE_DATASET_FILE_ID in src/dataset_config.py.")
-        return False
-    
-    print("Dataset not found or incomplete. Attempting to download from Google Drive...")
-    
-    # Extract file ID from URL
-    file_id = download_url.split('id=')[1] if 'id=' in download_url else None
-    if not file_id:
-        print("Invalid download URL format")
-        return False
-    
-    try:
-        # Use unified download function
-        success = download_and_extract_dataset(file_id, project_root, cleanup=True)
-        if success:
-            print("Dataset download and extraction complete!")
-        return success
-        
-    except Exception as e:
-        print(f"Auto-download failed: {e}")
-        print("Please download the dataset manually using scripts/download_dataset_from_gdrive.py")
-        return False
+    return (data_list, split_idx_list)
