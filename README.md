@@ -66,6 +66,10 @@ python scripts/download_checkpoint.py
 
 Evaluate GILT on the main benchmarks:
 
+By default, TTA is enabled for NC, LP, and GC with five augmented views plus the original. NC and LP always use the TTA aggregate: `tta_gate_by_valid=false`, `lp_tta_train_gate=false`, and `lp_tta_context_gate=false`. Correct & Smooth is disabled (`use_cs=false`). LP support remains balanced at 5 positive and 5 negative edges.
+
+The NC/LP table values above were obtained with the earlier gated-TTA configuration (and optional validation-selected C&S for NC). They have not been recomputed across all reported runs with these new defaults; the commands below now use the new defaults.
+
 ```bash
 # Node classification: 1-shot
 python scripts/reproduce.py --setting nc1 --checkpoint checkpoints/gilt_model.pt --runs 10
