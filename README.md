@@ -36,10 +36,10 @@ Results reported in the paper (%; mean ± standard deviation).
 | GraphCL | 76.99 ± 1.79 | 73.63 ± 0.40 | 51.75 ± 0.98 | 38.87 ± 2.08 |
 | AnyGraph | 59.58 ± 13.26 | 61.80 ± 14.40 | 51.39 ± 12.25 | 50.05 ± 13.30 |
 | UniLP | 52.91 ± 4.62 | 50.40 ± 7.49 | 54.44 ± 1.34 | 58.00 ± 3.10 |
-| GILT-InTask | 85.92 ± 1.65 | 87.92 ± 1.06 | 72.57 ± 1.87 | 66.11 ± 0.45 |
-| **GILT** | **85.34 ± 1.54** | **87.04 ± 0.94** | **72.23 ± 2.06** | **67.96 ± 0.45** |
+| GILT-InTask | 86.36 ± 2.42 | 87.88 ± 0.98 | 72.93 ± 1.33 | 65.34 ± 0.51 |
+| **GILT** | **85.34 ± 1.75** | **86.70 ± 1.13** | **73.37 ± 1.19** | **66.83 ± 0.29** |
 
-GILT uses 5-shot support. GCN, SAGE, SEAL, and MaskGAE are fully supervised references. K = 100 for Cora/Citeseer/Pubmed and 50 for ogbl-collab.
+GILT uses 5-shot support. Link prediction defaults to 1:1 positive/negative support (5 positive and 5 negative examples). GCN, SAGE, SEAL, and MaskGAE are fully supervised references. K = 100 for Cora/Citeseer/Pubmed and 50 for ogbl-collab.
 
 ### Graph classification — Table 3b (5-shot)
 

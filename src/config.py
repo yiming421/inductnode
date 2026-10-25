@@ -87,7 +87,7 @@ def parse_joint_training_args():
     parser.add_argument('--tta_apply_input_normalization_to_views', type=str2bool, default=True, help='Apply the same final input normalization step as the main NC path to augmented TTA views after PCA/padding')
     parser.add_argument('--tta_linear_projection', type=str2bool, default=True, help='Use linear-only NC TTA projections by disabling the random activation after XW+b')
     parser.add_argument('--split_rebalance_strategy', type=str, default='legacy', choices=['smallest_for_valid', 'legacy', 'original'], help='How to rebalance dataset splits for pretraining: smallest_for_valid (use smallest split for validation), legacy (train+valid for training, test for validation), original (keep original splits)')
-    parser.add_argument('--context_neg_ratio', type=int, default=3, help='Negative sampling ratio for context')
+    parser.add_argument('--context_neg_ratio', type=int, default=1, help='LP context negatives per positive (default: 1:1)')
     parser.add_argument('--train_neg_ratio', type=int, default=3, help='Negative sampling ratio for training')
     parser.add_argument('--context_k', type=int, default=5, help='Number of context samples for link prediction')
     parser.add_argument('--remove_context_from_train', type=str2bool, default=True, help='Remove context from training set')
